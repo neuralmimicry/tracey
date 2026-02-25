@@ -1,6 +1,6 @@
 # Tracey Swarm Security
 
-![NeuralMimicry](src/nm512.png) ![Tracey](src/nmtracey.png) ![AARNN](src/nmaarnn.png)
+![Tracey](src/nmtracey.png)
 
 Tracey is a swarm-style, self-learning monitoring and response system. It coordinates multiple agents to score events, reach consensus, and optionally trigger containment actions.
 Tracey runs on a non-blocking, multi-threaded async runtime and uses all available CPU cores.
@@ -312,3 +312,6 @@ Use matching base values on AARNN so both sides interpret addresses consistently
 Tracey does not self-propagate or probe exploits. Use approved deployment channels (MDM, SSH, GPO, package managers) and authorized telemetry sources.
 
 To enable active response, set `active_response` and wire actions to your own containment pipeline.
+
+## Tracey is enabled by:
+![NeuralMimicry](src/nm512.png) ![AARNN](src/nmaarnn.png)
