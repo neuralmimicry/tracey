@@ -74,6 +74,15 @@ Example:
     "host_ttl_ms": 120000,
     "unmanaged_resend_ms": 30000
   },
+  "refiner": {
+    "enabled": true,
+    "source": "refiner",
+    "service_name": "refiner",
+    "health_url": "http://127.0.0.1:5001/api/health",
+    "security_feed_path": "refiner_security_feed.jsonl",
+    "poll_interval_ms": 5000,
+    "timeout_ms": 2500
+  },
   "tuning": {
     "enabled": true,
     "target_alert_rate": 0.08,
@@ -200,7 +209,11 @@ Example:
     "max_packet_bytes": 8192
   },
   "storage": {
-    "log_path": "tracey.log.jsonl"
+    "log_path": "tracey.log.jsonl",
+    "max_bytes": 25000000,
+    "retain_lines": 5000,
+    "compact_interval_ms": 30000,
+    "summary_top_keys": 25
   }
 }
 ```
@@ -214,6 +227,21 @@ Each line is a JSON object with optional fields:
 ```
 
 For unmanaged detection, set `agent_id` to match the `host_id` used in your asset feeds.
+
+### Refiner Security Feed Format (JSONL)
+
+Tracey can tail a Refiner security feed (for example from Trivy/Falco/Snyk export transforms) and convert findings into swarm events.
+
+```json
+{"service":"refiner","image":"ghcr.io/neuralmimicry/refiner:latest","severity":"high","cvss":8.6,"cve":"CVE-2026-12345","title":"openssl vulnerable dependency","scanner":"trivy","status":"open","finding_id":"trivy-001"}
+```
+
+Refiner tracking can also be configured via environment variables:
+- `TRACEY_REFINER_ENABLED` / `NM_REFINER_ENABLED`
+- `TRACEY_REFINER_HEALTH_URL` / `NM_REFINER_HEALTH_URL`
+- `TRACEY_REFINER_SECURITY_FEED_PATH` / `NM_REFINER_SECURITY_FEED_PATH`
+- `TRACEY_REFINER_POLL_INTERVAL_MS` / `NM_REFINER_POLL_INTERVAL_MS`
+- `TRACEY_REFINER_TIMEOUT_MS` / `NM_REFINER_TIMEOUT_MS`
 
 ## OTA Update Bundle (Safe Handoff)
 

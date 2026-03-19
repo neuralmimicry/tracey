@@ -6,11 +6,13 @@ This project includes security controls that support ISO 27001 and SOC 2 alignme
 - Swarm runtime, governance, and coordination.
 - Status and telemetry interfaces.
 - OTA update verification and supervisor handoff.
+- Refiner workload health + vulnerability finding ingestion.
 
 ## Control Highlights
 - Access control: OIDC enforcement for external interfaces.
 - Integrity: signed update bundles and safe handoff.
 - Logging: JSONL audit trails for decisions and governance.
+- Security monitoring: Refiner health probe events and severity-mapped vulnerability feed events.
 
 ## ISO 27001 Alignment Notes
 - Identity and access: OIDC support and policy-based enforcement.

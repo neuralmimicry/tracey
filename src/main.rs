@@ -1,5 +1,5 @@
-mod assets;
 mod aer;
+mod assets;
 mod auth;
 mod bus;
 mod capabilities;
@@ -8,18 +8,19 @@ mod coordination;
 mod discovery;
 mod embedded;
 mod event;
-mod inventory;
 mod governance;
+mod inventory;
+mod refiner_tracking;
 mod security;
 mod sensors;
 mod shutdown;
-mod stimuli;
 mod status;
+mod stimuli;
 mod storage;
 mod supervisor;
 mod swarm;
-mod tuning;
 mod telemetry;
+mod tuning;
 mod update;
 
 use crate::bus::EventBus;
@@ -54,14 +55,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(?config, "tracey starting");
 
     if config.discovery.enabled && config.discovery.shared_key == "tracey-dev-key-change-me" {
-        tracing::warn!("discovery shared_key is using the default value; rotate it before production");
+        tracing::warn!(
+            "discovery shared_key is using the default value; rotate it before production"
+        );
     }
 
     let (shutdown, shutdown_listener) = Shutdown::new();
     shutdown::spawn_shutdown_watcher(shutdown.clone());
 
     let bus = EventBus::new(config.bus_capacity);
-    let storage = storage::Storage::new(config.storage.log_path.clone(), shutdown_listener.clone()).await?;
+    let storage = storage::Storage::new(config.storage.clone(), shutdown_listener.clone()).await?;
     let inventory = inventory::Inventory::new(
         config.inventory.clone(),
         storage.clone(),
@@ -100,7 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordination_for_election = coordination.clone();
     let coordination_governance = governance_state.clone();
     tokio::spawn(async move {
-        coordination_for_election.spawn_election(coordination_governance).await;
+        coordination_for_election
+            .spawn_election(coordination_governance)
+            .await;
     });
 
     let coordinator = Coordinator::new(
@@ -179,7 +184,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    sensors::spawn_default_sensors(bus.clone(), storage.clone(), config.clone(), shutdown_listener.clone());
+    sensors::spawn_default_sensors(
+        bus.clone(),
+        storage.clone(),
+        config.clone(),
+        shutdown_listener.clone(),
+    );
     embedded::spawn_embedded_collectors(
         bus.clone(),
         storage.clone(),
@@ -253,7 +263,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let asset_shutdown = shutdown_listener.clone();
     let asset_governance = governance_state.clone();
     tokio::spawn(async move {
-        assets::spawn_asset_feed(asset_config, asset_inventory, asset_shutdown, asset_governance).await;
+        assets::spawn_asset_feed(
+            asset_config,
+            asset_inventory,
+            asset_shutdown,
+            asset_governance,
+        )
+        .await;
+    });
+
+    let refiner_config = config.refiner.clone();
+    let refiner_bus = bus.clone();
+    let refiner_storage = storage.clone();
+    let refiner_shutdown = shutdown_listener.clone();
+    tokio::spawn(async move {
+        refiner_tracking::spawn_refiner_tracking(
+            refiner_bus,
+            refiner_storage,
+            refiner_config,
+            refiner_shutdown,
+        )
+        .await;
     });
 
     let update_manager = UpdateManager::new(

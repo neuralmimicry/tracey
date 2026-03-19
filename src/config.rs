@@ -6,12 +6,20 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct StorageConfig {
     pub log_path: PathBuf,
+    pub max_bytes: u64,
+    pub retain_lines: usize,
+    pub compact_interval_ms: u64,
+    pub summary_top_keys: usize,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             log_path: PathBuf::from("tracey.log.jsonl"),
+            max_bytes: 25_000_000,
+            retain_lines: 5000,
+            compact_interval_ms: 30_000,
+            summary_top_keys: 25,
         }
     }
 }
@@ -76,6 +84,32 @@ impl Default for InventoryConfig {
             agent_ttl_ms: 30_000,
             host_ttl_ms: 120_000,
             unmanaged_resend_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefinerTrackingConfig {
+    pub enabled: bool,
+    pub source: String,
+    pub service_name: String,
+    pub health_url: String,
+    pub security_feed_path: PathBuf,
+    pub poll_interval_ms: u64,
+    pub timeout_ms: u64,
+}
+
+impl Default for RefinerTrackingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: "refiner".to_string(),
+            service_name: "refiner".to_string(),
+            health_url: "http://127.0.0.1:5001/api/health".to_string(),
+            security_feed_path: PathBuf::from("refiner_security_feed.jsonl"),
+            poll_interval_ms: 5000,
+            timeout_ms: 2500,
         }
     }
 }
@@ -215,6 +249,7 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     pub asset_feed: AssetFeedConfig,
     pub inventory: InventoryConfig,
+    pub refiner: RefinerTrackingConfig,
     pub tuning: crate::tuning::TuningConfig,
     pub update: crate::update::UpdateConfig,
     pub telemetry: TelemetryConfig,
@@ -248,6 +283,7 @@ impl Default for Config {
             discovery: DiscoveryConfig::default(),
             asset_feed: AssetFeedConfig::default(),
             inventory: InventoryConfig::default(),
+            refiner: RefinerTrackingConfig::default(),
             tuning: crate::tuning::TuningConfig::default(),
             update: crate::update::UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
@@ -299,7 +335,13 @@ impl Config {
         self.directive_broadcast_ms = self.directive_broadcast_ms.clamp(250, 60_000);
         self.min_samples = self.min_samples.clamp(3, 10_000);
 
-        self.discovery.announce_interval_ms = self.discovery.announce_interval_ms.clamp(200, 60_000);
+        self.storage.max_bytes = self.storage.max_bytes.clamp(1_000_000, 1_000_000_000);
+        self.storage.retain_lines = self.storage.retain_lines.clamp(100, 100_000);
+        self.storage.compact_interval_ms = self.storage.compact_interval_ms.clamp(5_000, 600_000);
+        self.storage.summary_top_keys = self.storage.summary_top_keys.clamp(5, 200);
+
+        self.discovery.announce_interval_ms =
+            self.discovery.announce_interval_ms.clamp(200, 60_000);
         self.discovery.ttl_ms = self.discovery.ttl_ms.clamp(1000, 120_000);
         if self.discovery.shared_key.trim().is_empty() {
             self.discovery.enabled = false;
@@ -309,12 +351,22 @@ impl Config {
 
         self.inventory.agent_ttl_ms = self.inventory.agent_ttl_ms.clamp(5_000, 600_000);
         self.inventory.host_ttl_ms = self.inventory.host_ttl_ms.clamp(10_000, 900_000);
-        self.inventory.unmanaged_resend_ms = self.inventory.unmanaged_resend_ms.clamp(10_000, 600_000);
+        self.inventory.unmanaged_resend_ms =
+            self.inventory.unmanaged_resend_ms.clamp(10_000, 600_000);
+
+        self.refiner.poll_interval_ms = self.refiner.poll_interval_ms.clamp(500, 120_000);
+        self.refiner.timeout_ms = self.refiner.timeout_ms.clamp(250, 15_000);
+        if self.refiner.health_url.trim().is_empty() {
+            self.refiner.enabled = false;
+        }
 
         self.tuning.target_alert_rate = self.tuning.target_alert_rate.clamp(0.01, 0.5);
         self.tuning.adjustment_rate = self.tuning.adjustment_rate.clamp(0.005, 0.25);
         self.tuning.min_threshold = self.tuning.min_threshold.clamp(0.2, 0.9);
-        self.tuning.max_threshold = self.tuning.max_threshold.clamp(self.tuning.min_threshold, 0.99);
+        self.tuning.max_threshold = self
+            .tuning
+            .max_threshold
+            .clamp(self.tuning.min_threshold, 0.99);
         self.tuning.window_ms = self.tuning.window_ms.clamp(1000, 120_000);
 
         self.update.poll_interval_ms = self.update.poll_interval_ms.clamp(1000, 120_000);
@@ -344,13 +396,20 @@ impl Config {
         self.governance.decision_threshold = self.governance.decision_threshold.clamp(0.5, 0.95);
         self.governance.min_confidence = self.governance.min_confidence.clamp(0.1, 0.95);
         self.governance.relaxed_risk = self.governance.relaxed_risk.clamp(0.0, 1.0);
-        self.governance.strict_risk = self.governance.strict_risk.clamp(self.governance.relaxed_risk, 1.0);
-        self.governance.lockdown_risk = self.governance.lockdown_risk.clamp(self.governance.strict_risk, 1.0);
+        self.governance.strict_risk = self
+            .governance
+            .strict_risk
+            .clamp(self.governance.relaxed_risk, 1.0);
+        self.governance.lockdown_risk = self
+            .governance
+            .lockdown_risk
+            .clamp(self.governance.strict_risk, 1.0);
         self.governance.rebel.probability = self.governance.rebel.probability.clamp(0.0, 0.5);
         self.governance.rebel.max_streak = self.governance.rebel.max_streak.clamp(1, 10);
         self.governance.rebel.cooldown_ms = self.governance.rebel.cooldown_ms.clamp(1000, 120_000);
 
-        self.coordination.election_interval_ms = self.coordination.election_interval_ms.clamp(250, 10_000);
+        self.coordination.election_interval_ms =
+            self.coordination.election_interval_ms.clamp(250, 10_000);
         self.coordination.presence_ttl_ms = self.coordination.presence_ttl_ms.clamp(1_000, 120_000);
         self.coordination.max_coordinators = self.coordination.max_coordinators.clamp(1, 16);
         self.coordination.weight_cpu = self.coordination.weight_cpu.clamp(0.0, 10.0);
@@ -380,22 +439,82 @@ impl Config {
         if let Some(mode) = env_any(&["TRACEY_AUTH_MODE", "NM_AUTH_MODE"]) {
             self.auth.mode = mode.to_lowercase();
         }
+        if let Some(value) = env_any(&["TRACEY_STORAGE_PATH", "NM_STORAGE_PATH"]) {
+            self.storage.log_path = PathBuf::from(value);
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_STORAGE_MAX_BYTES", "NM_STORAGE_MAX_BYTES"]) {
+            self.storage.max_bytes = value;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_STORAGE_RETAIN_LINES", "NM_STORAGE_RETAIN_LINES"])
+        {
+            self.storage.retain_lines = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_STORAGE_COMPACT_INTERVAL_MS",
+            "NM_STORAGE_COMPACT_INTERVAL_MS",
+        ]) {
+            self.storage.compact_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_STORAGE_SUMMARY_TOP_KEYS",
+            "NM_STORAGE_SUMMARY_TOP_KEYS",
+        ]) {
+            self.storage.summary_top_keys = value as usize;
+        }
+        if let Some(value) = env_bool_any(&["TRACEY_REFINER_ENABLED", "NM_REFINER_ENABLED"]) {
+            self.refiner.enabled = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_REFINER_SOURCE", "NM_REFINER_SOURCE"]) {
+            self.refiner.source = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_REFINER_SERVICE", "NM_REFINER_SERVICE"]) {
+            self.refiner.service_name = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_REFINER_HEALTH_URL", "NM_REFINER_HEALTH_URL"]) {
+            self.refiner.health_url = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_REFINER_SECURITY_FEED_PATH",
+            "NM_REFINER_SECURITY_FEED_PATH",
+        ]) {
+            self.refiner.security_feed_path = PathBuf::from(value);
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_REFINER_POLL_INTERVAL_MS",
+            "NM_REFINER_POLL_INTERVAL_MS",
+        ]) {
+            self.refiner.poll_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_REFINER_TIMEOUT_MS", "NM_REFINER_TIMEOUT_MS"]) {
+            self.refiner.timeout_ms = value;
+        }
         if let Some(value) = env_bool_any(&["TRACEY_EMBEDDED_ENABLED", "NM_EMBEDDED_ENABLED"]) {
             self.embedded.enabled = value;
         }
-        if let Some(value) = env_u64_any(&["TRACEY_EMBEDDED_INTERVAL_MS", "NM_EMBEDDED_INTERVAL_MS"]) {
+        if let Some(value) =
+            env_u64_any(&["TRACEY_EMBEDDED_INTERVAL_MS", "NM_EMBEDDED_INTERVAL_MS"])
+        {
             self.embedded.interval_ms = value;
         }
-        if let Some(value) = env_bool_any(&["TRACEY_EMBEDDED_JETSON_ENABLED", "NM_EMBEDDED_JETSON_ENABLED"]) {
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_EMBEDDED_JETSON_ENABLED",
+            "NM_EMBEDDED_JETSON_ENABLED",
+        ]) {
             self.embedded.jetson_enabled = value;
         }
-        if let Some(value) = env_u64_any(&["TRACEY_EMBEDDED_MAX_THERMALS", "NM_EMBEDDED_MAX_THERMALS"]) {
+        if let Some(value) =
+            env_u64_any(&["TRACEY_EMBEDDED_MAX_THERMALS", "NM_EMBEDDED_MAX_THERMALS"])
+        {
             self.embedded.max_thermals = value as usize;
         }
         if let Some(value) = env_u64_any(&["TRACEY_EMBEDDED_MAX_DISKS", "NM_EMBEDDED_MAX_DISKS"]) {
             self.embedded.max_disks = value as usize;
         }
-        if let Some(value) = env_u64_any(&["TRACEY_EMBEDDED_MAX_INTERFACES", "NM_EMBEDDED_MAX_INTERFACES"]) {
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_MAX_INTERFACES",
+            "NM_EMBEDDED_MAX_INTERFACES",
+        ]) {
             self.embedded.max_interfaces = value as usize;
         }
         if let Some(value) = env_bool_any(&[
@@ -404,10 +523,9 @@ impl Config {
         ]) {
             self.embedded.process_enabled = value;
         }
-        if let Some(value) = env_u64_any(&[
-            "TRACEY_EMBEDDED_PROCESS_TOP_N",
-            "NM_EMBEDDED_PROCESS_TOP_N",
-        ]) {
+        if let Some(value) =
+            env_u64_any(&["TRACEY_EMBEDDED_PROCESS_TOP_N", "NM_EMBEDDED_PROCESS_TOP_N"])
+        {
             self.embedded.process_top_n = value as usize;
         }
         if let Some(value) = env_u64_any(&[
@@ -416,10 +534,9 @@ impl Config {
         ]) {
             self.embedded.process_window_ms = value;
         }
-        if let Some(value) = env_u64_any(&[
-            "TRACEY_EMBEDDED_PROCESS_MAX",
-            "NM_EMBEDDED_PROCESS_MAX",
-        ]) {
+        if let Some(value) =
+            env_u64_any(&["TRACEY_EMBEDDED_PROCESS_MAX", "NM_EMBEDDED_PROCESS_MAX"])
+        {
             self.embedded.process_max = value as usize;
         }
         if let Some(value) =
@@ -451,13 +568,18 @@ impl Config {
         ]) {
             self.embedded.gpu_max_devices = value as usize;
         }
-        if let Some(value) = env_bool_any(&["TRACEY_OIDC_PROTECT_STATUS", "NM_OIDC_PROTECT_STATUS"]) {
+        if let Some(value) = env_bool_any(&["TRACEY_OIDC_PROTECT_STATUS", "NM_OIDC_PROTECT_STATUS"])
+        {
             self.auth.protect_status = value;
         }
-        if let Some(value) = env_bool_any(&["TRACEY_OIDC_PROTECT_OTLP_HTTP", "NM_OIDC_PROTECT_OTLP_HTTP"]) {
+        if let Some(value) =
+            env_bool_any(&["TRACEY_OIDC_PROTECT_OTLP_HTTP", "NM_OIDC_PROTECT_OTLP_HTTP"])
+        {
             self.auth.protect_otlp_http = value;
         }
-        if let Some(value) = env_bool_any(&["TRACEY_OIDC_PROTECT_OTLP_GRPC", "NM_OIDC_PROTECT_OTLP_GRPC"]) {
+        if let Some(value) =
+            env_bool_any(&["TRACEY_OIDC_PROTECT_OTLP_GRPC", "NM_OIDC_PROTECT_OTLP_GRPC"])
+        {
             self.auth.protect_otlp_grpc = value;
         }
 
@@ -499,7 +621,9 @@ impl Config {
         if let Some(leeway) = env_u64_any(&["TRACEY_OIDC_LEEWAY_SEC", "NM_OIDC_LEEWAY_SEC"]) {
             self.auth.oidc.leeway_sec = leeway;
         }
-        if let Some(timeout) = env_u64_any(&["TRACEY_OIDC_HTTP_TIMEOUT_MS", "NM_OIDC_HTTP_TIMEOUT_MS"]) {
+        if let Some(timeout) =
+            env_u64_any(&["TRACEY_OIDC_HTTP_TIMEOUT_MS", "NM_OIDC_HTTP_TIMEOUT_MS"])
+        {
             self.auth.oidc.http_timeout_ms = timeout;
         }
     }
@@ -616,7 +740,8 @@ pub struct OidcAuthConfig {
 
 impl OidcAuthConfig {
     pub fn enabled(&self) -> bool {
-        !self.issuer.trim().is_empty() || self.jwks_url.as_deref().map(str::trim).unwrap_or("").len() > 0
+        !self.issuer.trim().is_empty()
+            || self.jwks_url.as_deref().map(str::trim).unwrap_or("").len() > 0
     }
 }
 

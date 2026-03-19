@@ -6,6 +6,7 @@ This repository provides security controls that support ISO 27001 and SOC 2 alig
 - Swarm agent runtime and governance logic.
 - Status and telemetry interfaces (`/status`, OTLP HTTP/gRPC ingest).
 - OTA update verification and supervisor handoff.
+- Refiner security tracking via health probes and JSONL vulnerability feed ingestion.
 
 ## Authentication and Access Control
 - OIDC enforcement is supported for `/status` and OTLP ingest endpoints.
@@ -23,6 +24,10 @@ This repository provides security controls that support ISO 27001 and SOC 2 alig
 ## Logging and Auditability
 - Operational logs and governance updates are written to JSONL for audit trails.
 - Avoid logging raw tokens or PII in production.
+
+## Refiner Tracking Controls
+- Health tracking: periodic checks against Refiner `/api/health` to detect availability and queue-pressure degradation.
+- Security feed tracking: append-only JSONL findings (for example Trivy/Falco transforms) are converted into swarm events with severity mapping.
 
 ## Operational Requirements (Outside This Repo)
 - Access reviews, least privilege, and credential rotation.

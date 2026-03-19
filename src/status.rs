@@ -43,7 +43,11 @@ pub async fn spawn_status(
     listen_addr: SocketAddr,
     mut shutdown: crate::shutdown::ShutdownListener,
 ) {
-    let app = Router::new().route("/status", get(status_handler)).with_state(service);
+    let app = Router::new()
+        .route("/status", get(status_handler))
+        .route("/health", get(status_handler))
+        .route("/ready", get(status_handler))
+        .with_state(service);
     if let Err(err) = axum::serve(tokio::net::TcpListener::bind(listen_addr).await.unwrap(), app)
         .with_graceful_shutdown(async move { shutdown.wait().await })
         .await
