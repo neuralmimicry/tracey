@@ -1387,7 +1387,7 @@ fn nvml_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
                 continue;
             }
 
-            let mut name_buf = [0i8; 96];
+            let mut name_buf = [0 as c_char; 96];
             let name = if nvml_name(device, name_buf.as_mut_ptr(), name_buf.len() as c_uint)
                 == NVML_SUCCESS
             {
@@ -1497,7 +1497,7 @@ fn rocm_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
         let mut out = Vec::new();
         let device_count = count.min(max_devices as c_uint);
         for idx in 0..device_count {
-            let mut name_buf = [0i8; 96];
+            let mut name_buf = [0 as c_char; 96];
             let name = if rsmi_name(idx, name_buf.as_mut_ptr(), name_buf.len()) == RSMI_SUCCESS {
                 let cstr = std::ffi::CStr::from_ptr(name_buf.as_ptr());
                 cstr.to_str().ok().map(|s| s.to_string())
