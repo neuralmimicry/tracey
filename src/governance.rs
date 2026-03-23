@@ -149,10 +149,12 @@ impl GovernanceState {
         };
         self.decision_threshold = threshold.clamp(0.1, 0.99);
 
-        self.active_response = cfg.active_response && matches!(posture, Posture::Strict | Posture::Lockdown);
+        self.active_response =
+            cfg.active_response && matches!(posture, Posture::Strict | Posture::Lockdown);
         self.shutdown_enabled = cfg.shutdown_enabled && posture == Posture::Lockdown;
 
-        self.update_enabled = cfg.update.enabled && !matches!(posture, Posture::Strict | Posture::Lockdown);
+        self.update_enabled =
+            cfg.update.enabled && !matches!(posture, Posture::Strict | Posture::Lockdown);
         self.telemetry_enabled = cfg.telemetry.enabled;
         self.telemetry_allow_remote = cfg.telemetry.allow_remote && posture == Posture::Relaxed;
         self.prometheus_enabled = cfg.telemetry.prometheus_enabled;
@@ -173,7 +175,12 @@ pub struct GovernanceUpdate {
 }
 
 impl GovernanceUpdate {
-    pub fn new(posture: Posture, support_ratio: f64, total_votes: usize, reason: impl Into<String>) -> Self {
+    pub fn new(
+        posture: Posture,
+        support_ratio: f64,
+        total_votes: usize,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             ts_ms: now_ms(),
             posture,

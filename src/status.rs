@@ -1,7 +1,7 @@
+use crate::auth::AuthGate;
 use crate::coordination::CoordinatorRole;
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
-use crate::auth::AuthGate;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
@@ -48,9 +48,12 @@ pub async fn spawn_status(
         .route("/health", get(status_handler))
         .route("/ready", get(status_handler))
         .with_state(service);
-    if let Err(err) = axum::serve(tokio::net::TcpListener::bind(listen_addr).await.unwrap(), app)
-        .with_graceful_shutdown(async move { shutdown.wait().await })
-        .await
+    if let Err(err) = axum::serve(
+        tokio::net::TcpListener::bind(listen_addr).await.unwrap(),
+        app,
+    )
+    .with_graceful_shutdown(async move { shutdown.wait().await })
+    .await
     {
         tracing::warn!("status server failed: {}", err);
     }
@@ -89,10 +92,7 @@ async fn forward_to_proxy(
     auth_header: Option<&str>,
 ) -> Option<StatusSnapshot> {
     let url = normalize_url(proxy_addr, "/status");
-    let mut request = service
-        .client
-        .get(url)
-        .header("x-tracey-proxy-hop", "1");
+    let mut request = service.client.get(url).header("x-tracey-proxy-hop", "1");
     if let Some(auth) = auth_header {
         request = request.header("authorization", auth);
     }

@@ -1,8 +1,8 @@
 use crate::event::{Event, EventKind, Severity, now_ms};
-use crate::security::{Action, ActionPolicy};
 use crate::governance::{GovernanceConfig, GovernanceVote, Posture};
+use crate::security::{Action, ActionPolicy};
 use crate::shutdown::ShutdownListener;
-use crate::swarm::learning::AdaptiveScorer;
+use crate::swarm::learning::{AdaptiveScorer, FuzzyTelemetry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -16,6 +16,7 @@ pub struct Assessment {
     pub signal: f64,
     pub risk: f64,
     pub confidence: f64,
+    pub telemetry: FuzzyTelemetry,
     pub recommended: Action,
 }
 
@@ -141,6 +142,7 @@ impl Agent {
             signal: event.signal,
             risk: score.risk,
             confidence: score.confidence,
+            telemetry: score.telemetry,
             recommended,
         };
         if self.assessment_tx.send(assessment).await.is_err() {

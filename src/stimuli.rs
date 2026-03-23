@@ -1,4 +1,4 @@
-use crate::aer::{decode_events, encode_events, AerEvent};
+use crate::aer::{AerEvent, decode_events, encode_events};
 use crate::bus::EventBus;
 use crate::config::StimuliConfig;
 use crate::event::{Event, EventKind, Severity};
@@ -155,20 +155,32 @@ fn aer_to_event(ev: &AerEvent, peer: &str) -> Option<Event> {
         let idx = ev.addr.saturating_sub(AARNN_OUTPUT_BASE);
         let signal = (ev.value as f64) / 255.0;
         let id = STIMULI_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let event = Event::new(id, "aarnn", EventKind::Observability, signal, Severity::Medium)
-            .with_attr("aer_addr", ev.addr.to_string())
-            .with_attr("aer_value", ev.value.to_string())
-            .with_attr("aer_peer", peer)
-            .with_attr("aarnn_output_index", idx.to_string());
+        let event = Event::new(
+            id,
+            "aarnn",
+            EventKind::Observability,
+            signal,
+            Severity::Medium,
+        )
+        .with_attr("aer_addr", ev.addr.to_string())
+        .with_attr("aer_value", ev.value.to_string())
+        .with_attr("aer_peer", peer)
+        .with_attr("aarnn_output_index", idx.to_string());
         return Some(event);
     }
 
     let id = STIMULI_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
     Some(
-        Event::new(id, "aarnn", EventKind::Observability, (ev.value as f64) / 255.0, Severity::Low)
-            .with_attr("aer_addr", ev.addr.to_string())
-            .with_attr("aer_value", ev.value.to_string())
-            .with_attr("aer_peer", peer),
+        Event::new(
+            id,
+            "aarnn",
+            EventKind::Observability,
+            (ev.value as f64) / 255.0,
+            Severity::Low,
+        )
+        .with_attr("aer_addr", ev.addr.to_string())
+        .with_attr("aer_value", ev.value.to_string())
+        .with_attr("aer_peer", peer),
     )
 }
 

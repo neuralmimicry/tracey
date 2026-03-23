@@ -34,8 +34,12 @@ impl ShutdownListener {
 pub fn spawn_shutdown_watcher(shutdown: Shutdown) {
     let path = std::env::var("TRACEY_SHUTDOWN_PATH").ok();
     let token = std::env::var("TRACEY_SHUTDOWN_TOKEN").ok();
-    let Some(path) = path else { return; };
-    let Some(token) = token else { return; };
+    let Some(path) = path else {
+        return;
+    };
+    let Some(token) = token else {
+        return;
+    };
 
     tokio::spawn(async move {
         loop {

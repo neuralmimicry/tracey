@@ -188,7 +188,8 @@ pub async fn write_update_request(
         os: os.to_string(),
         arch: arch.to_string(),
     };
-    let payload = serde_json::to_vec(&request).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let payload = serde_json::to_vec(&request)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     let request_path = update_dir.join("tracey.supervisor.request.json");
     write_atomic(&request_path, &payload).await
 }
@@ -203,7 +204,8 @@ async fn write_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
 }
 
 fn generate_token() -> String {
-    let seed = format!("{}:{}:{:?}",
+    let seed = format!(
+        "{}:{}:{:?}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

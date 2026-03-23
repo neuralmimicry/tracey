@@ -1,13 +1,15 @@
 use crate::config::Config;
 use crate::coordination::Coordination;
 use crate::event::{Event, EventKind, Severity, now_ms};
+use crate::governance::{
+    GovernanceConfig, GovernanceState, GovernanceUpdate, GovernanceVote, Posture,
+};
 use crate::security::{Action, ActionPolicy};
 use crate::shutdown::ShutdownListener;
-use crate::governance::{GovernanceConfig, GovernanceState, GovernanceUpdate, GovernanceVote, Posture};
 use crate::storage::Storage;
-use crate::tuning::AdaptiveTuner;
 use crate::swarm::agent::{Assessment, SwarmDirective};
 use crate::swarm::learning::AdaptiveScorer;
+use crate::tuning::AdaptiveTuner;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -21,9 +23,22 @@ pub struct Decision {
     pub action: Action,
     pub mean_risk: f64,
     pub mean_confidence: f64,
+    pub telemetry: DecisionTelemetry,
     pub quorum: usize,
     pub agents: usize,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DecisionTelemetry {
+    pub fuzzy_order: u8,
+    pub mean_z_abs: f64,
+    pub mean_core_risk: f64,
+    pub mean_interval_width: f64,
+    pub mean_edge_membership: f64,
+    pub mean_security_context: f64,
+    pub mean_aarnn_context: f64,
+    pub mean_learned_confidence: f64,
 }
 
 struct Pending {
@@ -103,7 +118,8 @@ impl Coordinator {
     pub async fn run(mut self, mut shutdown: ShutdownListener) {
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let mut cleanup_tick = tokio::time::interval(Duration::from_millis(200));
-        let mut governance_tick = tokio::time::interval(Duration::from_millis(self.governance_cfg.vote_interval_ms));
+        let mut governance_tick =
+            tokio::time::interval(Duration::from_millis(self.governance_cfg.vote_interval_ms));
         let mut learning_tick = tokio::time::interval(self.learning_broadcast);
         let mut directive_tick = tokio::time::interval(self.directive_broadcast);
 
@@ -143,7 +159,11 @@ impl Coordinator {
         }
     }
 
-    async fn ingest_assessment(&mut self, assessment: Assessment, pending: &mut HashMap<u64, Pending>) {
+    async fn ingest_assessment(
+        &mut self,
+        assessment: Assessment,
+        pending: &mut HashMap<u64, Pending>,
+    ) {
         let leader = self.leader_info().await;
         if !leader.is_leader {
             if self.was_leader {
@@ -200,16 +220,43 @@ impl Coordinator {
         let mut risk_sum = 0.0;
         let mut conf_sum = 0.0;
         let mut signal_sum = 0.0;
+        let mut z_abs_sum = 0.0;
+        let mut core_risk_sum = 0.0;
+        let mut interval_width_sum = 0.0;
+        let mut edge_sum = 0.0;
+        let mut security_sum = 0.0;
+        let mut aarnn_sum = 0.0;
+        let mut learned_confidence_sum = 0.0;
+        let mut fuzzy_order = 0u8;
         for assessment in &pending.assessments {
             risk_sum += assessment.risk;
             conf_sum += assessment.confidence;
             signal_sum += assessment.signal;
+            z_abs_sum += assessment.telemetry.z_abs;
+            core_risk_sum += assessment.telemetry.core_risk;
+            interval_width_sum += assessment.telemetry.interval_width;
+            edge_sum += assessment.telemetry.edge_membership;
+            security_sum += assessment.telemetry.security_context;
+            aarnn_sum += assessment.telemetry.aarnn_context;
+            learned_confidence_sum += assessment.telemetry.learned_confidence;
+            fuzzy_order = fuzzy_order.max(assessment.telemetry.order);
         }
         let mean_risk = (risk_sum / agents as f64).clamp(0.0, 1.0);
         let mean_confidence = (conf_sum / agents as f64).clamp(0.0, 1.0);
         let mean_signal = signal_sum / agents as f64;
+        let telemetry = DecisionTelemetry {
+            fuzzy_order,
+            mean_z_abs: z_abs_sum / agents as f64,
+            mean_core_risk: core_risk_sum / agents as f64,
+            mean_interval_width: interval_width_sum / agents as f64,
+            mean_edge_membership: edge_sum / agents as f64,
+            mean_security_context: security_sum / agents as f64,
+            mean_aarnn_context: aarnn_sum / agents as f64,
+            mean_learned_confidence: learned_confidence_sum / agents as f64,
+        };
 
-        let (decision_threshold, active_response, shutdown_enabled) = self.current_governance().await;
+        let (decision_threshold, active_response, shutdown_enabled) =
+            self.current_governance().await;
         let mut action = if mean_risk >= decision_threshold {
             self.policy.decide(mean_risk, mean_confidence)
         } else {
@@ -217,7 +264,15 @@ impl Coordinator {
         };
         action = enforce_response_mode(action, active_response, shutdown_enabled);
 
-        let reason = build_reason(mean_risk, mean_confidence, agents, self.quorum, action, pending.kind);
+        let reason = build_reason(
+            mean_risk,
+            mean_confidence,
+            &telemetry,
+            agents,
+            self.quorum,
+            action,
+            pending.kind,
+        );
 
         let decision = Decision {
             event_id: pending.assessments[0].event_id,
@@ -226,13 +281,15 @@ impl Coordinator {
             action,
             mean_risk,
             mean_confidence,
+            telemetry,
             quorum: self.quorum,
             agents,
             reason,
         };
 
         self.storage.record_decision(decision.clone()).await;
-        self.update_learning(pending.kind, pending.severity, mean_signal).await;
+        self.update_learning(pending.kind, pending.severity, mean_signal)
+            .await;
         self.update_directive_scores(pending.kind, mean_risk);
 
         if let Some(tuner) = self.tuner.as_mut() {
@@ -256,7 +313,11 @@ impl Coordinator {
 
     async fn current_governance(&self) -> (f64, bool, bool) {
         let state = self.governance_state.read().await;
-        (state.decision_threshold, state.active_response, state.shutdown_enabled)
+        (
+            state.decision_threshold,
+            state.active_response,
+            state.shutdown_enabled,
+        )
     }
 
     async fn leader_info(&self) -> LeaderInfo {
@@ -406,13 +467,24 @@ impl LeaderInfo {
 fn build_reason(
     mean_risk: f64,
     mean_confidence: f64,
+    telemetry: &DecisionTelemetry,
     agents: usize,
     quorum: usize,
     action: Action,
     kind: EventKind,
 ) -> String {
     format!(
-        "risk={:.2} confidence={:.2} agents={}/{} action={:?} kind={:?}",
-        mean_risk, mean_confidence, agents, quorum, action, kind
+        "risk={:.2} confidence={:.2} core={:.2} uncertainty={:.2} sec={:.2} aarnn={:.2} order={} agents={}/{} action={:?} kind={:?}",
+        mean_risk,
+        mean_confidence,
+        telemetry.mean_core_risk,
+        telemetry.mean_interval_width,
+        telemetry.mean_security_context,
+        telemetry.mean_aarnn_context,
+        telemetry.fuzzy_order,
+        agents,
+        quorum,
+        action,
+        kind
     )
 }

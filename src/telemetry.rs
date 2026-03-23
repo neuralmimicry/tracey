@@ -1,5 +1,5 @@
-use crate::bus::EventBus;
 use crate::auth::{AuthGate, AuthSystem};
+use crate::bus::EventBus;
 use crate::config::{OtlpReceiverConfig, TelemetryConfig};
 use crate::event::{Event, EventKind, Severity};
 use crate::governance::GovernanceState;
@@ -8,25 +8,25 @@ use crate::storage::Storage;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
-use axum::{body::Bytes, Router};
-use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-};
+use axum::{Router, body::Bytes};
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
     MetricsService, MetricsServiceServer,
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
     ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
     Metric, NumberDataPoint, Summary, SummaryDataPoint,
 };
-use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -260,7 +260,9 @@ async fn run_otlp_receivers(
                 auth.otlp_http_gate(),
             );
             let mut shutdown = shutdown.clone();
-            let app = Router::new().route("/v1/metrics", post(otlp_http_handler)).with_state(state);
+            let app = Router::new()
+                .route("/v1/metrics", post(otlp_http_handler))
+                .with_state(state);
             let task = tokio::spawn(async move {
                 let listener = match tokio::net::TcpListener::bind(addr).await {
                     Ok(listener) => listener,
@@ -270,7 +272,9 @@ async fn run_otlp_receivers(
                     }
                 };
                 let server = axum::serve(listener, app);
-                let _ = server.with_graceful_shutdown(async move { shutdown.wait().await }).await;
+                let _ = server
+                    .with_graceful_shutdown(async move { shutdown.wait().await })
+                    .await;
             });
             tasks.push(task);
         }
@@ -336,7 +340,8 @@ async fn ingest_otlp_request(
 ) {
     let mut emitted = 0usize;
     for resource_metrics in request.resource_metrics {
-        let (service_name, resource_attrs) = extract_resource_info(resource_metrics.resource.as_ref());
+        let (service_name, resource_attrs) =
+            extract_resource_info(resource_metrics.resource.as_ref());
         for scope_metrics in resource_metrics.scope_metrics {
             let scope_name = scope_metrics
                 .scope
@@ -388,7 +393,8 @@ async fn emit_metric_from_otlp(
             Data::Gauge(Gauge { data_points }) => {
                 for data_point in data_points {
                     if let Some(value) = number_value(&data_point) {
-                        let attrs = merge_attributes(resource_attrs, &data_point.attributes, scope_name);
+                        let attrs =
+                            merge_attributes(resource_attrs, &data_point.attributes, scope_name);
                         let key = metric_key(&name, &attrs);
                         if router.allow(&key, source).await {
                             emitted += emit_metric(
@@ -723,7 +729,10 @@ fn is_allowed(name: &str, config: &TelemetryConfig) -> bool {
         return true;
     }
     if !config.allow_prefixes.is_empty() {
-        return config.allow_prefixes.iter().any(|prefix| name.starts_with(prefix));
+        return config
+            .allow_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
     }
     true
 }
@@ -807,13 +816,23 @@ fn unquote(value: &str) -> String {
     }
 }
 
-fn any_value_to_string(value: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> Option<String> {
+fn any_value_to_string(
+    value: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>,
+) -> Option<String> {
     let value = value.as_ref()?;
     match value.value.as_ref()? {
-        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(val) => Some(val.clone()),
-        opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(val) => Some(val.to_string()),
-        opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(val) => Some(val.to_string()),
-        opentelemetry_proto::tonic::common::v1::any_value::Value::BoolValue(val) => Some(val.to_string()),
+        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(val) => {
+            Some(val.clone())
+        }
+        opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(val) => {
+            Some(val.to_string())
+        }
+        opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(val) => {
+            Some(val.to_string())
+        }
+        opentelemetry_proto::tonic::common::v1::any_value::Value::BoolValue(val) => {
+            Some(val.to_string())
+        }
         _ => None,
     }
 }
@@ -828,7 +847,11 @@ fn env_endpoints() -> Vec<String> {
             }
         }
     }
-    for key in ["PROMETHEUS_ENDPOINT", "PROMETHEUS_URL", "OTEL_PROMETHEUS_ENDPOINT"] {
+    for key in [
+        "PROMETHEUS_ENDPOINT",
+        "PROMETHEUS_URL",
+        "OTEL_PROMETHEUS_ENDPOINT",
+    ] {
         if let Ok(value) = std::env::var(key) {
             if !value.trim().is_empty() {
                 endpoints.push(value);
@@ -896,7 +919,9 @@ impl MetricsService for OtlpService {
         self.auth.authorize_grpc(request.metadata()).await?;
         let state = self.governance.read().await;
         if !state.telemetry_enabled || !state.otlp_enabled {
-            return Ok(tonic::Response::new(ExportMetricsServiceResponse { partial_success: None }));
+            return Ok(tonic::Response::new(ExportMetricsServiceResponse {
+                partial_success: None,
+            }));
         }
         let payload = request.into_inner();
         ingest_otlp_request(
@@ -909,7 +934,9 @@ impl MetricsService for OtlpService {
             "otlp_grpc",
         )
         .await;
-        Ok(tonic::Response::new(ExportMetricsServiceResponse { partial_success: None }))
+        Ok(tonic::Response::new(ExportMetricsServiceResponse {
+            partial_success: None,
+        }))
     }
 }
 
@@ -953,7 +980,8 @@ async fn otlp_http_handler(
     if !guard.telemetry_enabled || !guard.otlp_enabled {
         return Ok(StatusCode::OK);
     }
-    let request = ExportMetricsServiceRequest::decode(body.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let request =
+        ExportMetricsServiceRequest::decode(body.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
     ingest_otlp_request(
         request,
         &state.config,

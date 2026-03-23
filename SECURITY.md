@@ -28,6 +28,7 @@ This repository provides security controls that support ISO 27001 and SOC 2 alig
 ## Refiner Tracking Controls
 - Health tracking: periodic checks against Refiner `/api/health` to detect availability and queue-pressure degradation.
 - Security feed tracking: append-only JSONL findings (for example Trivy/Falco transforms) are converted into swarm events with severity mapping.
+- Type-n fuzzy anomaly scoring: edge-case events are evaluated with layered uncertainty and security context (CVE/CVSS/finding severity + AARNN spike hints) before swarm consensus.
 
 ## Operational Requirements (Outside This Repo)
 - Access reviews, least privilege, and credential rotation.

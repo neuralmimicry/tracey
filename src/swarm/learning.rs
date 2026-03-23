@@ -1,3 +1,4 @@
+use crate::config::FuzzyConfig;
 use crate::event::{Event, EventKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -54,23 +55,40 @@ pub struct LearningSnapshot {
 pub struct Score {
     pub risk: f64,
     pub confidence: f64,
+    pub telemetry: FuzzyTelemetry,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FuzzyTelemetry {
+    pub order: u8,
+    pub z_abs: f64,
+    pub core_risk: f64,
+    pub interval_width: f64,
+    pub edge_membership: f64,
+    pub security_context: f64,
+    pub aarnn_context: f64,
+    pub learned_confidence: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct AdaptiveScorer {
     stats: HashMap<EventKind, OnlineStats>,
+    last_signal: HashMap<EventKind, f64>,
     min_samples: u64,
     focus: Option<EventKind>,
     focus_boost: f64,
+    fuzzy: FuzzyConfig,
 }
 
 impl AdaptiveScorer {
-    pub fn new(min_samples: u64) -> Self {
+    pub fn new(min_samples: u64, fuzzy: FuzzyConfig) -> Self {
         Self {
             stats: HashMap::new(),
+            last_signal: HashMap::new(),
             min_samples,
             focus: None,
             focus_boost: 1.0,
+            fuzzy,
         }
     }
 
@@ -92,27 +110,307 @@ impl AdaptiveScorer {
     }
 
     pub fn score_and_update(&mut self, event: &Event) -> Score {
-        let stats = self.stats.entry(event.kind).or_default();
-        let stddev = stats.stddev().max(0.05);
-        let z = if stats.count < self.min_samples {
-            0.0
-        } else {
-            (event.signal - stats.mean) / stddev
+        let (count, mean, stddev) = {
+            let stats = self.stats.entry(event.kind).or_default();
+            (stats.count, stats.mean, stats.stddev().max(0.05))
         };
 
-        let mut risk = sigmoid(z.abs()) * event.severity.weight();
+        let learned_confidence = (count as f64 / (self.min_samples.max(1) as f64)).clamp(0.0, 1.0);
+        let raw_z = if count == 0 {
+            0.0
+        } else {
+            (event.signal - mean) / stddev
+        };
+        let z_abs = (raw_z * (0.35 + 0.65 * learned_confidence)).abs();
+
+        let previous_signal = self.last_signal.get(&event.kind).copied().unwrap_or(mean);
+        let delta_membership = right_shoulder((event.signal - previous_signal).abs(), 0.05, 0.45);
+        let edge_membership = triangle(z_abs, 0.55, 1.45, 2.45).max(delta_membership * 0.6);
+        let severity_membership = ((event.severity.weight() - 0.7) / 0.6).clamp(0.0, 1.0);
+        let security_membership = security_context(event);
+        let aarnn_membership = if is_aarnn_event(event) { 1.0 } else { 0.0 };
+
+        let (core_risk, interval_width) = if self.fuzzy.enabled {
+            let type1 = self.type1_risk(
+                z_abs,
+                edge_membership,
+                delta_membership,
+                security_membership,
+                severity_membership,
+            );
+
+            let volatility = (stddev / (mean.abs() + 0.2)).clamp(0.0, 1.0);
+            let ambiguity = 1.0 - (2.0 * type1 - 1.0).abs();
+            let uncertainty = self.fuzzy.uncertainty
+                * (0.5 * (1.0 - learned_confidence) + 0.25 * volatility + 0.25 * ambiguity);
+
+            self.type_n_refine(
+                type1,
+                uncertainty,
+                edge_membership,
+                security_membership,
+                aarnn_membership,
+            )
+        } else {
+            (sigmoid(z_abs), 0.0)
+        };
+
+        let mut risk = (core_risk * event.severity.weight()).clamp(0.0, 1.0);
         if self.focus == Some(event.kind) {
             risk *= self.focus_boost;
         }
         risk = risk.clamp(0.0, 1.0);
 
-        let confidence = (stats.count as f64 / (self.min_samples as f64)).clamp(0.0, 1.0);
-        stats.update(event.signal);
+        let confidence = if self.fuzzy.enabled {
+            let interval_confidence = (1.0 - interval_width * 1.2).clamp(0.0, 1.0);
+            (learned_confidence * 0.7 + interval_confidence * 0.3).clamp(0.0, 1.0)
+        } else {
+            learned_confidence
+        };
 
-        Score { risk, confidence }
+        let telemetry = FuzzyTelemetry {
+            order: if self.fuzzy.enabled {
+                self.fuzzy.order.max(1)
+            } else {
+                0
+            },
+            z_abs,
+            core_risk,
+            interval_width,
+            edge_membership,
+            security_context: security_membership,
+            aarnn_context: aarnn_membership,
+            learned_confidence,
+        };
+
+        let stats = self.stats.entry(event.kind).or_default();
+        stats.update(event.signal);
+        self.last_signal.insert(event.kind, event.signal);
+
+        Score {
+            risk,
+            confidence,
+            telemetry,
+        }
+    }
+
+    fn type1_risk(
+        &self,
+        z_abs: f64,
+        edge_membership: f64,
+        novelty_membership: f64,
+        security_membership: f64,
+        severity_membership: f64,
+    ) -> f64 {
+        let normal = left_shoulder(z_abs, 0.25, 1.0);
+        let suspicious = triangle(z_abs, 0.70, 1.70, 3.00);
+        let anomalous = right_shoulder(z_abs, 1.80, 3.30);
+
+        let anomaly_strength = anomalous.max((suspicious * 0.72) + (edge_membership * 0.28));
+        let contextual =
+            (0.45 * novelty_membership + 0.35 * security_membership + 0.20 * severity_membership)
+                .clamp(0.0, 1.0);
+        let suppressed = anomaly_strength * (1.0 - normal * 0.35);
+
+        let security_pull =
+            (self.fuzzy.security_weight * security_membership * 0.25).clamp(0.0, 0.25);
+        (suppressed * (0.78 + security_pull) + contextual * (0.22 + security_pull)).clamp(0.0, 1.0)
+    }
+
+    fn type_n_refine(
+        &self,
+        base_risk: f64,
+        uncertainty: f64,
+        edge_membership: f64,
+        security_membership: f64,
+        aarnn_membership: f64,
+    ) -> (f64, f64) {
+        let order = self.fuzzy.order.max(1);
+        if order <= 1 {
+            return (base_risk.clamp(0.0, 1.0), 0.0);
+        }
+
+        let mut center = base_risk.clamp(0.0, 1.0);
+        let mut span = uncertainty.clamp(0.0, 1.0) * 0.5;
+        let mut interval_width = 0.0;
+        let context_bias = (edge_membership * self.fuzzy.edge_bias
+            + security_membership * self.fuzzy.security_weight
+            + aarnn_membership * self.fuzzy.aarnn_weight)
+            .clamp(0.0, 1.0);
+
+        for layer in 2..=order {
+            let decay = 1.0 / layer as f64;
+            let layer_span = (span * decay).clamp(0.0, 0.49);
+            let lower = (center - layer_span * (1.0 - context_bias * 0.5)).clamp(0.0, 1.0);
+            let upper = (center + layer_span * (1.0 + context_bias * 0.8)).clamp(0.0, 1.0);
+            interval_width = upper - lower;
+
+            let optimistic_pull = (0.5 + context_bias * 0.35).clamp(0.0, 1.0);
+            center = (lower * (1.0 - optimistic_pull) + upper * optimistic_pull).clamp(0.0, 1.0);
+            span = layer_span;
+        }
+
+        (center, interval_width)
     }
 }
 
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+fn is_aarnn_event(event: &Event) -> bool {
+    event.source.eq_ignore_ascii_case("aarnn")
+        || event.attributes.contains_key("aarnn_output_index")
+}
+
+fn security_context(event: &Event) -> f64 {
+    let mut score: f64 = 0.0;
+    let source_lower = event.source.to_ascii_lowercase();
+    if source_lower.contains("security") || source_lower.contains("refiner") {
+        score += 0.20;
+    }
+    if is_aarnn_event(event) {
+        score += 0.20;
+    }
+    if event.attributes.contains_key("cve") {
+        score += 0.22;
+    }
+    if event.attributes.contains_key("cvss") {
+        score += 0.20;
+    }
+    if event.attributes.contains_key("finding_id") {
+        score += 0.12;
+    }
+    if let Some(value) = event.attributes.get("finding_severity") {
+        score += match value.trim().to_ascii_lowercase().as_str() {
+            "critical" => 0.30,
+            "high" => 0.24,
+            "medium" => 0.16,
+            "low" => 0.10,
+            _ => 0.08,
+        };
+    }
+    if let Some(value) = event.attributes.get("anomaly") {
+        if value.eq_ignore_ascii_case("true") {
+            score += 0.16;
+        }
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn left_shoulder(x: f64, start: f64, end: f64) -> f64 {
+    if x <= start {
+        1.0
+    } else if x >= end {
+        0.0
+    } else {
+        (end - x) / (end - start)
+    }
+}
+
+fn right_shoulder(x: f64, start: f64, end: f64) -> f64 {
+    if x <= start {
+        0.0
+    } else if x >= end {
+        1.0
+    } else {
+        (x - start) / (end - start)
+    }
+}
+
+fn triangle(x: f64, left: f64, center: f64, right: f64) -> f64 {
+    if x <= left || x >= right {
+        0.0
+    } else if x <= center {
+        (x - left) / (center - left)
+    } else {
+        (right - x) / (right - center)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Severity;
+
+    fn scorer_with_order(order: u8) -> AdaptiveScorer {
+        let mut fuzzy = FuzzyConfig::default();
+        fuzzy.order = order;
+        AdaptiveScorer::new(8, fuzzy)
+    }
+
+    fn warmup(scorer: &mut AdaptiveScorer) {
+        for i in 0..48u64 {
+            let signal = 0.46 + ((i % 7) as f64) * 0.015;
+            let event = Event::new(
+                i + 1,
+                "baseline",
+                EventKind::Observability,
+                signal,
+                Severity::Medium,
+            );
+            let _ = scorer.score_and_update(&event);
+        }
+    }
+
+    #[test]
+    fn deeper_type_n_boosts_aarnn_edge_case_risk() {
+        let mut shallow = scorer_with_order(1);
+        let mut deep = scorer_with_order(5);
+        warmup(&mut shallow);
+        warmup(&mut deep);
+
+        let event = Event::new(
+            9_001,
+            "aarnn",
+            EventKind::Observability,
+            0.59,
+            Severity::High,
+        )
+        .with_attr("aarnn_output_index", "7");
+
+        let shallow_score = shallow.score_and_update(&event);
+        let deep_score = deep.score_and_update(&event);
+        assert!(
+            deep_score.risk > shallow_score.risk,
+            "expected deeper type-n fuzzy order to increase edge-case risk (deep={}, shallow={})",
+            deep_score.risk,
+            shallow_score.risk
+        );
+    }
+
+    #[test]
+    fn security_context_increases_risk_for_same_signal() {
+        let mut plain = scorer_with_order(3);
+        let mut enriched = scorer_with_order(3);
+        warmup(&mut plain);
+        warmup(&mut enriched);
+
+        let plain_event = Event::new(
+            9_101,
+            "refiner_security_feed",
+            EventKind::Observability,
+            0.57,
+            Severity::Medium,
+        );
+        let enriched_event = Event::new(
+            9_101,
+            "refiner_security_feed",
+            EventKind::Observability,
+            0.57,
+            Severity::Medium,
+        )
+        .with_attr("finding_severity", "critical")
+        .with_attr("cvss", "9.8")
+        .with_attr("cve", "CVE-2026-12345");
+
+        let plain_score = plain.score_and_update(&plain_event);
+        let enriched_score = enriched.score_and_update(&enriched_event);
+        assert!(
+            enriched_score.risk > plain_score.risk,
+            "expected security context to increase risk (enriched={}, plain={})",
+            enriched_score.risk,
+            plain_score.risk
+        );
+    }
 }

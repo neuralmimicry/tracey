@@ -1,7 +1,7 @@
 use crate::config::{AuthConfig, OidcAuthConfig};
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -71,7 +71,11 @@ pub struct AuthGate {
 
 impl AuthGate {
     fn new(mode: AuthMode, enabled: bool, validator: Option<Arc<OidcValidator>>) -> Self {
-        Self { mode, enabled, validator }
+        Self {
+            mode,
+            enabled,
+            validator,
+        }
     }
 
     pub async fn authorize_http(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -94,7 +98,10 @@ impl AuthGate {
         }
     }
 
-    pub async fn authorize_grpc(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
+    pub async fn authorize_grpc(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(), tonic::Status> {
         if !self.enabled || self.mode == AuthMode::Off {
             return Ok(());
         }
@@ -107,7 +114,10 @@ impl AuthGate {
             .as_ref()
             .ok_or_else(|| tonic::Status::unavailable("oidc not configured"))?;
         match token {
-            Some(token) => validator.validate(token).await.map_err(|err| err.to_tonic_status()),
+            Some(token) => validator
+                .validate(token)
+                .await
+                .map_err(|err| err.to_tonic_status()),
             None => Err(tonic::Status::unauthenticated("missing authorization")),
         }
     }
@@ -233,7 +243,8 @@ impl OidcValidator {
             validation.set_audience(&audiences);
         }
 
-        let data = decode::<Value>(token, &decoding_key, &validation).map_err(|_| OidcError::InvalidToken)?;
+        let data = decode::<Value>(token, &decoding_key, &validation)
+            .map_err(|_| OidcError::InvalidToken)?;
         if !self.cfg.required_scopes.is_empty() {
             let scopes = extract_scopes(&data.claims);
             if !has_required_scopes(&scopes, &self.cfg.required_scopes) {
@@ -277,7 +288,10 @@ impl OidcValidator {
         if !resp.status().is_success() {
             return Err(OidcError::JwksFailed);
         }
-        let jwks = resp.json::<JwkSet>().await.map_err(|_| OidcError::JwksFailed)?;
+        let jwks = resp
+            .json::<JwkSet>()
+            .await
+            .map_err(|_| OidcError::JwksFailed)?;
         cache.jwks = Some(jwks.clone());
         cache.jwks_expires_at = now + Duration::from_millis(self.cfg.cache_ttl_ms);
         Ok(jwks)
@@ -307,7 +321,10 @@ impl OidcValidator {
         if !resp.status().is_success() {
             return Err(OidcError::DiscoveryFailed);
         }
-        let payload = resp.json::<Value>().await.map_err(|_| OidcError::DiscoveryFailed)?;
+        let payload = resp
+            .json::<Value>()
+            .await
+            .map_err(|_| OidcError::DiscoveryFailed)?;
         let jwks_uri = payload
             .get("jwks_uri")
             .and_then(|v| v.as_str())

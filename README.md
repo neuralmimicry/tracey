@@ -8,7 +8,7 @@ Tracey runs on a non-blocking, multi-threaded async runtime and uses all availab
 ## Architecture
 
 - Sensors generate events and publish them to a shared event bus.
-- Agents subscribe to the bus, score events using adaptive baselines, and send assessments.
+- Agents subscribe to the bus, score events using adaptive baselines plus Type-n fuzzy inference, and send assessments.
 - The coordinator aggregates assessments, applies policy thresholds, and issues decisions.
 - Learning snapshots are broadcast so agents continuously adapt as conditions change.
 - Discovery uses authenticated gossip to detect peer agents on the local network.
@@ -53,6 +53,14 @@ Example:
   "event_rate_ms": 120,
   "assessment_quorum": 5,
   "decision_threshold": 0.72,
+  "fuzzy": {
+    "enabled": true,
+    "order": 3,
+    "uncertainty": 0.55,
+    "edge_bias": 0.70,
+    "aarnn_weight": 0.22,
+    "security_weight": 0.28
+  },
   "active_response": false,
   "shutdown_enabled": false,
   "discovery": {
@@ -217,6 +225,24 @@ Example:
   }
 }
 ```
+
+### Type-n Fuzzy Anomaly Scoring
+
+Tracey applies Type-n fuzzy logic in each swarm agent before consensus:
+
+- Type-1 fuzzy memberships map baseline deviation into normal/suspicious/anomalous sets.
+- Higher orders (`fuzzy.order > 1`) recursively model uncertainty bands for edge-case signals.
+- AARNN events and Refiner security-feed context (CVE/CVSS/finding severity) contribute to fuzzy risk weighting.
+- Swarm intelligence is preserved: fuzzy scores are still aggregated by quorum in the coordinator.
+- Decision records now include fuzzy telemetry (`telemetry.mean_core_risk`, `telemetry.mean_interval_width`, `telemetry.mean_security_context`, `telemetry.mean_aarnn_context`, `telemetry.fuzzy_order`).
+
+Environment overrides:
+- `TRACEY_FUZZY_ENABLED` / `NM_FUZZY_ENABLED`
+- `TRACEY_FUZZY_ORDER` / `NM_FUZZY_ORDER`
+- `TRACEY_FUZZY_UNCERTAINTY` / `NM_FUZZY_UNCERTAINTY`
+- `TRACEY_FUZZY_EDGE_BIAS` / `NM_FUZZY_EDGE_BIAS`
+- `TRACEY_FUZZY_AARNN_WEIGHT` / `NM_FUZZY_AARNN_WEIGHT`
+- `TRACEY_FUZZY_SECURITY_WEIGHT` / `NM_FUZZY_SECURITY_WEIGHT`
 
 ### Asset Feed Format (JSONL)
 

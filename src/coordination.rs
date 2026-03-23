@@ -112,7 +112,8 @@ impl Coordination {
             return;
         }
 
-        let mut interval = tokio::time::interval(Duration::from_millis(self.config.election_interval_ms));
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(self.config.election_interval_ms));
         loop {
             interval.tick().await;
             if !governance.read().await.coordination_enabled {
@@ -146,7 +147,10 @@ impl Coordination {
         if coordinator_count == 0 {
             tracing::debug!("no coordinators detected; electing leader");
         } else if coordinator_count > 1 {
-            tracing::warn!(count = coordinator_count, "split-brain detected; reconciling");
+            tracing::warn!(
+                count = coordinator_count,
+                "split-brain detected; reconciling"
+            );
         }
 
         let mut candidates: Vec<(f64, &PresenceRecord)> = map
@@ -201,7 +205,9 @@ fn score_agent(agent_id: &str, shared_key: &str) -> u64 {
     let seed = format!("{}::{}", shared_key, agent_id);
     let hash = blake3::hash(seed.as_bytes());
     let bytes = hash.as_bytes();
-    u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]])
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 fn weighted_score(record: &PresenceRecord, config: &CoordinationConfig) -> f64 {

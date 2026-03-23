@@ -1,7 +1,7 @@
 use crate::capabilities::Capabilities;
 use crate::config::DiscoveryConfig;
-use crate::event::now_ms;
 use crate::coordination::CoordinatorRole;
+use crate::event::now_ms;
 use crate::governance::GovernanceState;
 use crate::inventory::Inventory;
 use crate::shutdown::ShutdownListener;

@@ -242,6 +242,7 @@ pub struct Config {
     pub learning_broadcast_ms: u64,
     pub directive_broadcast_ms: u64,
     pub min_samples: u64,
+    pub fuzzy: FuzzyConfig,
     pub active_response: bool,
     pub shutdown_enabled: bool,
     pub policy: ActionPolicy,
@@ -276,6 +277,7 @@ impl Default for Config {
             learning_broadcast_ms: 2000,
             directive_broadcast_ms: 2500,
             min_samples: 12,
+            fuzzy: FuzzyConfig::default(),
             active_response: false,
             shutdown_enabled: false,
             policy: ActionPolicy::default(),
@@ -334,6 +336,11 @@ impl Config {
         self.learning_broadcast_ms = self.learning_broadcast_ms.clamp(250, 60_000);
         self.directive_broadcast_ms = self.directive_broadcast_ms.clamp(250, 60_000);
         self.min_samples = self.min_samples.clamp(3, 10_000);
+        self.fuzzy.order = self.fuzzy.order.clamp(1, 8);
+        self.fuzzy.uncertainty = self.fuzzy.uncertainty.clamp(0.0, 1.0);
+        self.fuzzy.edge_bias = self.fuzzy.edge_bias.clamp(0.0, 1.0);
+        self.fuzzy.aarnn_weight = self.fuzzy.aarnn_weight.clamp(0.0, 1.0);
+        self.fuzzy.security_weight = self.fuzzy.security_weight.clamp(0.0, 1.0);
 
         self.storage.max_bytes = self.storage.max_bytes.clamp(1_000_000, 1_000_000_000);
         self.storage.retain_lines = self.storage.retain_lines.clamp(100, 100_000);
@@ -436,6 +443,27 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
+        if let Some(value) = env_bool_any(&["TRACEY_FUZZY_ENABLED", "NM_FUZZY_ENABLED"]) {
+            self.fuzzy.enabled = value;
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_FUZZY_ORDER", "NM_FUZZY_ORDER"]) {
+            self.fuzzy.order = value as u8;
+        }
+        if let Some(value) = env_f64_any(&["TRACEY_FUZZY_UNCERTAINTY", "NM_FUZZY_UNCERTAINTY"]) {
+            self.fuzzy.uncertainty = value;
+        }
+        if let Some(value) = env_f64_any(&["TRACEY_FUZZY_EDGE_BIAS", "NM_FUZZY_EDGE_BIAS"]) {
+            self.fuzzy.edge_bias = value;
+        }
+        if let Some(value) = env_f64_any(&["TRACEY_FUZZY_AARNN_WEIGHT", "NM_FUZZY_AARNN_WEIGHT"]) {
+            self.fuzzy.aarnn_weight = value;
+        }
+        if let Some(value) =
+            env_f64_any(&["TRACEY_FUZZY_SECURITY_WEIGHT", "NM_FUZZY_SECURITY_WEIGHT"])
+        {
+            self.fuzzy.security_weight = value;
+        }
+
         if let Some(mode) = env_any(&["TRACEY_AUTH_MODE", "NM_AUTH_MODE"]) {
             self.auth.mode = mode.to_lowercase();
         }
@@ -631,6 +659,30 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct FuzzyConfig {
+    pub enabled: bool,
+    pub order: u8,
+    pub uncertainty: f64,
+    pub edge_bias: f64,
+    pub aarnn_weight: f64,
+    pub security_weight: f64,
+}
+
+impl Default for FuzzyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            order: 3,
+            uncertainty: 0.55,
+            edge_bias: 0.70,
+            aarnn_weight: 0.22,
+            security_weight: 0.28,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CoordinationConfig {
     pub enabled: bool,
     pub max_coordinators: usize,
@@ -797,6 +849,17 @@ fn env_u64_any(names: &[&str]) -> Option<u64> {
     for name in names {
         if let Ok(value) = std::env::var(name) {
             if let Ok(parsed) = value.trim().parse::<u64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn env_f64_any(names: &[&str]) -> Option<f64> {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            if let Ok(parsed) = value.trim().parse::<f64>() {
                 return Some(parsed);
             }
         }

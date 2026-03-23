@@ -116,7 +116,9 @@ impl UpdateManager {
         }
 
         if self.config.shared_key == "tracey-dev-key-change-me" {
-            tracing::warn!("update shared_key is using the default value; rotate it before production");
+            tracing::warn!(
+                "update shared_key is using the default value; rotate it before production"
+            );
         }
 
         let mut ticker = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
@@ -144,7 +146,9 @@ impl UpdateManager {
 
     async fn check_once(&mut self) -> Result<(), UpdateError> {
         let update_dir = &self.config.update_dir;
-        fs::create_dir_all(update_dir).await.map_err(UpdateError::Io)?;
+        fs::create_dir_all(update_dir)
+            .await
+            .map_err(UpdateError::Io)?;
 
         if self.config.remote.enabled {
             self.fetch_remote().await?;
@@ -159,7 +163,8 @@ impl UpdateManager {
         }
 
         let metadata_bytes = fs::read(&metadata_path).await.map_err(UpdateError::Io)?;
-        let metadata: UpdateMetadata = serde_json::from_slice(&metadata_bytes).map_err(UpdateError::Serde)?;
+        let metadata: UpdateMetadata =
+            serde_json::from_slice(&metadata_bytes).map_err(UpdateError::Serde)?;
 
         if metadata.os != std::env::consts::OS || metadata.arch != std::env::consts::ARCH {
             self.record(UpdateRecord {
@@ -180,7 +185,9 @@ impl UpdateManager {
             return Err(UpdateError::Metadata("bundle hash mismatch".to_string()));
         }
 
-        let signature = fs::read_to_string(&signature_path).await.map_err(UpdateError::Io)?;
+        let signature = fs::read_to_string(&signature_path)
+            .await
+            .map_err(UpdateError::Io)?;
         let key = derive_key(&self.config.shared_key);
         let expected_sig = sign_payload(&metadata_bytes, &bundle_bytes, &key);
         if !constant_time_eq(signature.trim(), &expected_sig) {
@@ -263,10 +270,9 @@ impl UpdateManager {
             .ca_cert_path
             .as_ref()
             .ok_or_else(|| UpdateError::Metadata("remote ca_cert_path missing".to_string()))?;
-        let identity_path = remote
-            .client_identity_path
-            .as_ref()
-            .ok_or_else(|| UpdateError::Metadata("remote client_identity_path missing".to_string()))?;
+        let identity_path = remote.client_identity_path.as_ref().ok_or_else(|| {
+            UpdateError::Metadata("remote client_identity_path missing".to_string())
+        })?;
 
         let ca_bytes = fs::read(ca_path).await.map_err(UpdateError::Io)?;
         let identity_bytes = fs::read(identity_path).await.map_err(UpdateError::Io)?;
@@ -317,9 +323,15 @@ impl UpdateManager {
         let bundle_path = update_dir.join(&self.config.bundle_name);
         let signature_path = update_dir.join(&self.config.signature_name);
 
-        write_atomic(&metadata_path, &metadata_bytes).await.map_err(UpdateError::Io)?;
-        write_atomic(&bundle_path, &bundle_bytes).await.map_err(UpdateError::Io)?;
-        write_atomic(&signature_path, &signature_bytes).await.map_err(UpdateError::Io)?;
+        write_atomic(&metadata_path, &metadata_bytes)
+            .await
+            .map_err(UpdateError::Io)?;
+        write_atomic(&bundle_path, &bundle_bytes)
+            .await
+            .map_err(UpdateError::Io)?;
+        write_atomic(&signature_path, &signature_bytes)
+            .await
+            .map_err(UpdateError::Io)?;
 
         Ok(())
     }
@@ -328,8 +340,12 @@ impl UpdateManager {
 pub async fn signal_handoff_ready() {
     let path = std::env::var("TRACEY_HANDOFF_PATH").ok();
     let token = std::env::var("TRACEY_HANDOFF_TOKEN").ok();
-    let Some(path) = path else { return; };
-    let Some(token) = token else { return; };
+    let Some(path) = path else {
+        return;
+    };
+    let Some(token) = token else {
+        return;
+    };
 
     if let Err(err) = fs::write(&path, token.as_bytes()).await {
         tracing::warn!("handoff readiness write failed: {}", err);
@@ -434,13 +450,20 @@ async fn wait_for_handoff(path: &Path, token: &str, timeout_ms: u64) -> bool {
 
 async fn stage_binary(update_dir: &Path, bundle_path: &Path) -> Result<PathBuf, UpdateError> {
     let staged = update_dir.join("tracey.next");
-    fs::copy(bundle_path, &staged).await.map_err(UpdateError::Io)?;
+    fs::copy(bundle_path, &staged)
+        .await
+        .map_err(UpdateError::Io)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&staged).await.map_err(UpdateError::Io)?.permissions();
+        let mut perms = fs::metadata(&staged)
+            .await
+            .map_err(UpdateError::Io)?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&staged, perms).await.map_err(UpdateError::Io)?;
+        fs::set_permissions(&staged, perms)
+            .await
+            .map_err(UpdateError::Io)?;
     }
     Ok(staged)
 }
@@ -452,9 +475,21 @@ async fn archive_update(
     metadata_path: &Path,
 ) {
     let stamp = now_ms();
-    let _ = fs::rename(bundle_path, update_dir.join(format!("tracey.applied.{}", stamp))).await;
-    let _ = fs::rename(signature_path, update_dir.join(format!("tracey.applied.{}.sig", stamp))).await;
-    let _ = fs::rename(metadata_path, update_dir.join(format!("tracey.applied.{}.meta.json", stamp))).await;
+    let _ = fs::rename(
+        bundle_path,
+        update_dir.join(format!("tracey.applied.{}", stamp)),
+    )
+    .await;
+    let _ = fs::rename(
+        signature_path,
+        update_dir.join(format!("tracey.applied.{}.sig", stamp)),
+    )
+    .await;
+    let _ = fs::rename(
+        metadata_path,
+        update_dir.join(format!("tracey.applied.{}.meta.json", stamp)),
+    )
+    .await;
 }
 
 fn sign_payload(metadata: &[u8], bundle: &[u8], key: &[u8; 32]) -> String {
@@ -491,7 +526,12 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn generate_token() -> String {
-    let seed = format!("{}:{}:{:?}", now_ms(), std::process::id(), std::thread::current().id());
+    let seed = format!(
+        "{}:{}:{:?}",
+        now_ms(),
+        std::process::id(),
+        std::thread::current().id()
+    );
     let hash = blake3::hash(seed.as_bytes());
     to_hex(hash.as_bytes())
 }

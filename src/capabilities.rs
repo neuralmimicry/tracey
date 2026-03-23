@@ -70,7 +70,9 @@ fn read_dt_strings(path: &str) -> Option<Vec<String>> {
     for (idx, b) in bytes.iter().enumerate() {
         if *b == 0 {
             if idx > start {
-                let value = String::from_utf8_lossy(&bytes[start..idx]).trim().to_string();
+                let value = String::from_utf8_lossy(&bytes[start..idx])
+                    .trim()
+                    .to_string();
                 if !value.is_empty() {
                     out.push(value);
                 }

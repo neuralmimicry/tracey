@@ -18,7 +18,14 @@ pub struct SimulatedSensor {
 }
 
 impl SimulatedSensor {
-    pub fn new(name: impl Into<String>, kind: EventKind, base: f64, jitter: f64, anomaly_rate: f64, anomaly_boost: f64) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        kind: EventKind,
+        base: f64,
+        jitter: f64,
+        anomaly_rate: f64,
+        anomaly_boost: f64,
+    ) -> Self {
         Self {
             name: name.into(),
             kind,
@@ -29,7 +36,13 @@ impl SimulatedSensor {
         }
     }
 
-    pub async fn run(self, bus: EventBus, storage: Storage, config: Config, mut shutdown: ShutdownListener) {
+    pub async fn run(
+        self,
+        bus: EventBus,
+        storage: Storage,
+        config: Config,
+        mut shutdown: ShutdownListener,
+    ) {
         let mut prng = Prng::new(seed_from_name(&self.name));
         let mut interval = tokio::time::interval(Duration::from_millis(config.event_rate_ms));
         loop {
@@ -73,9 +86,23 @@ pub fn spawn_default_sensors(
 ) {
     let sensors = vec![
         SimulatedSensor::new("system_cpu", EventKind::SystemMetric, 0.45, 0.12, 0.04, 0.6),
-        SimulatedSensor::new("network_flow", EventKind::NetworkFlow, 0.35, 0.18, 0.05, 0.7),
+        SimulatedSensor::new(
+            "network_flow",
+            EventKind::NetworkFlow,
+            0.35,
+            0.18,
+            0.05,
+            0.7,
+        ),
         SimulatedSensor::new("user_actions", EventKind::UserAction, 0.25, 0.2, 0.03, 0.5),
-        SimulatedSensor::new("automation", EventKind::AutomationAction, 0.3, 0.15, 0.04, 0.65),
+        SimulatedSensor::new(
+            "automation",
+            EventKind::AutomationAction,
+            0.3,
+            0.15,
+            0.04,
+            0.65,
+        ),
     ];
 
     for sensor in sensors {
@@ -101,10 +128,7 @@ impl Prng {
 
     fn next_u64(&mut self) -> u64 {
         // LCG parameters from Numerical Recipes
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.state
     }
 

@@ -424,7 +424,13 @@ impl CollectorState {
                     severity_from_ratio(1.0 - ratio),
                     &[
                         ("battery", battery.name.clone()),
-                        ("status", battery.status.clone().unwrap_or_else(|| "unknown".to_string())),
+                        (
+                            "status",
+                            battery
+                                .status
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        ),
                     ],
                 )
                 .await;
@@ -534,9 +540,21 @@ impl CollectorState {
                 }
             }
 
-            cpu_rank.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
-            mem_rank.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
-            io_rank.sort_by(|a, b| b.total_bps.partial_cmp(&a.total_bps).unwrap_or(std::cmp::Ordering::Equal));
+            cpu_rank.sort_by(|a, b| {
+                b.value
+                    .partial_cmp(&a.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            mem_rank.sort_by(|a, b| {
+                b.value
+                    .partial_cmp(&a.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            io_rank.sort_by(|a, b| {
+                b.total_bps
+                    .partial_cmp(&a.total_bps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             let mem_total = self.mem_total_bytes.unwrap_or(0) as f64;
             for entry in cpu_rank.into_iter().take(self.config.process_top_n) {
@@ -637,7 +655,8 @@ impl CollectorState {
         }
 
         if self.config.gpu_sysfs_enabled {
-            let sysfs = read_gpu_sysfs(self.config.gpu_max_devices, nvml_present, rocm_present).await;
+            let sysfs =
+                read_gpu_sysfs(self.config.gpu_max_devices, nvml_present, rocm_present).await;
             samples.extend(sysfs);
         }
 
@@ -646,7 +665,10 @@ impl CollectorState {
                 ("gpu_id", gpu.id.clone()),
                 ("gpu_vendor", gpu.vendor.clone()),
                 ("gpu_source", gpu.source.clone()),
-                ("gpu_name", gpu.name.unwrap_or_else(|| "unknown".to_string())),
+                (
+                    "gpu_name",
+                    gpu.name.unwrap_or_else(|| "unknown".to_string()),
+                ),
             ];
             if let Some(util) = gpu.util_percent {
                 let ratio = (util / 100.0).clamp(0.0, 1.0);
@@ -712,7 +734,6 @@ impl CollectorState {
             }
         }
     }
-
 }
 
 fn track_rate(cache: &mut HashMap<String, f64>, key: &str, value: f64) -> f64 {
@@ -910,9 +931,15 @@ async fn read_thermals() -> Vec<ThermalReading> {
             continue;
         }
         let path = entry.path();
-        let sensor_type = read_trimmed(path.join("type")).await.unwrap_or_else(|| "unknown".to_string());
+        let sensor_type = read_trimmed(path.join("type"))
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
         if let Some(temp_raw) = read_i64(path.join("temp")).await {
-            let temp_c = if temp_raw > 1000 { temp_raw as f64 / 1000.0 } else { temp_raw as f64 };
+            let temp_c = if temp_raw > 1000 {
+                temp_raw as f64 / 1000.0
+            } else {
+                temp_raw as f64
+            };
             readings.push(ThermalReading {
                 zone: name,
                 sensor_type,
@@ -990,7 +1017,11 @@ async fn read_process_samples(max: usize, page_size: u64) -> HashMap<u32, ProcSa
         }
     }
     pids.sort_unstable();
-    let limit = if max == 0 { pids.len() } else { max.min(pids.len()) };
+    let limit = if max == 0 {
+        pids.len()
+    } else {
+        max.min(pids.len())
+    };
     for pid in pids.into_iter().take(limit) {
         if let Some(sample) = read_proc_sample(pid, page_size).await {
             samples.insert(pid, sample);
@@ -1006,7 +1037,10 @@ async fn read_proc_sample(pid: u32, page_size: u64) -> Option<ProcSample> {
     let cpu_time = utime.saturating_add(stime);
 
     let statm_path = format!("/proc/{}/statm", pid);
-    let statm_raw = fs::read_to_string(statm_path).await.ok().unwrap_or_default();
+    let statm_raw = fs::read_to_string(statm_path)
+        .await
+        .ok()
+        .unwrap_or_default();
     let rss_pages = statm_raw
         .split_whitespace()
         .nth(1)
@@ -1059,7 +1093,9 @@ async fn read_proc_io(pid: u32) -> (u64, u64) {
 
 async fn read_mounts() -> Vec<MountEntry> {
     let mut out = Vec::new();
-    let raw = fs::read_to_string("/proc/self/mounts").await.unwrap_or_default();
+    let raw = fs::read_to_string("/proc/self/mounts")
+        .await
+        .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     for line in raw.lines() {
         let mut parts = line.split_whitespace();
@@ -1121,7 +1157,11 @@ fn statvfs_usage(path: &str) -> Option<FsUsage> {
     if rc != 0 {
         return None;
     }
-    let block_size = if vfs.f_frsize == 0 { vfs.f_bsize } else { vfs.f_frsize } as u64;
+    let block_size = if vfs.f_frsize == 0 {
+        vfs.f_bsize
+    } else {
+        vfs.f_frsize
+    } as u64;
     let total_bytes = vfs.f_blocks.saturating_mul(block_size);
     let available_bytes = vfs.f_bavail.saturating_mul(block_size);
     let used_bytes = total_bytes.saturating_sub(available_bytes);
@@ -1182,11 +1222,7 @@ async fn read_batteries() -> Vec<BatteryReading> {
     out
 }
 
-async fn read_gpu_sysfs(
-    max_devices: usize,
-    skip_nvidia: bool,
-    skip_amd: bool,
-) -> Vec<GpuSample> {
+async fn read_gpu_sysfs(max_devices: usize, skip_nvidia: bool, skip_amd: bool) -> Vec<GpuSample> {
     let mut out = Vec::new();
     let Ok(mut dir) = fs::read_dir("/sys/class/drm").await else {
         return out;
@@ -1211,7 +1247,11 @@ async fn read_gpu_sysfs(
         let temp_c = read_hwmon_temp(&card_path).await;
         let gpu_name = read_trimmed(card_path.join("device/uevent"))
             .await
-            .and_then(|raw| raw.lines().find_map(|line| line.strip_prefix("DRIVER=")).map(|v| v.to_string()));
+            .and_then(|raw| {
+                raw.lines()
+                    .find_map(|line| line.strip_prefix("DRIVER="))
+                    .map(|v| v.to_string())
+            });
 
         if util_percent.is_none() && mem_used.is_none() && mem_total.is_none() && temp_c.is_none() {
             continue;
@@ -1283,7 +1323,11 @@ async fn read_hwmon_temp(card_path: &Path) -> Option<f64> {
             let name = file.file_name().to_string_lossy().to_string();
             if name.starts_with("temp") && name.ends_with("_input") {
                 if let Some(raw) = read_i64(file.path()).await {
-                    let temp = if raw > 1000 { raw as f64 / 1000.0 } else { raw as f64 };
+                    let temp = if raw > 1000 {
+                        raw as f64 / 1000.0
+                    } else {
+                        raw as f64
+                    };
                     return Some(temp);
                 }
             }
@@ -1398,13 +1442,12 @@ fn nvml_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
             };
 
             let mut util = NvmlUtilization { gpu: 0, memory: 0 };
-            let util_percent = if nvml_util(device, &mut util as *mut NvmlUtilization)
-                == NVML_SUCCESS
-            {
-                Some(util.gpu as f64)
-            } else {
-                None
-            };
+            let util_percent =
+                if nvml_util(device, &mut util as *mut NvmlUtilization) == NVML_SUCCESS {
+                    Some(util.gpu as f64)
+                } else {
+                    None
+                };
 
             let mut temp_val: c_uint = 0;
             let temp_c = if nvml_temp(device, NVML_TEMPERATURE_GPU, &mut temp_val as *mut c_uint)
@@ -1420,13 +1463,12 @@ fn nvml_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
                 free: 0,
                 used: 0,
             };
-            let (mem_total, mem_used) = if nvml_mem(device, &mut mem as *mut NvmlMemory)
-                == NVML_SUCCESS
-            {
-                (Some(mem.total), Some(mem.used))
-            } else {
-                (None, None)
-            };
+            let (mem_total, mem_used) =
+                if nvml_mem(device, &mut mem as *mut NvmlMemory) == NVML_SUCCESS {
+                    (Some(mem.total), Some(mem.used))
+                } else {
+                    (None, None)
+                };
 
             out.push(GpuSample {
                 id: format!("nvml:{}", idx),
@@ -1520,7 +1562,11 @@ fn rocm_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
                 &mut temp_val as *mut i64,
             ) == RSMI_SUCCESS
             {
-                let value = if temp_val > 1000 { temp_val as f64 / 1000.0 } else { temp_val as f64 };
+                let value = if temp_val > 1000 {
+                    temp_val as f64 / 1000.0
+                } else {
+                    temp_val as f64
+                };
                 Some(value)
             } else {
                 None
@@ -1544,7 +1590,11 @@ fn rocm_samples_sync(max_devices: usize) -> Option<Vec<GpuSample>> {
                 None
             };
 
-            if util_percent.is_none() && mem_total.is_none() && mem_used.is_none() && temp_c.is_none() {
+            if util_percent.is_none()
+                && mem_total.is_none()
+                && mem_used.is_none()
+                && temp_c.is_none()
+            {
                 continue;
             }
 
@@ -1574,11 +1624,7 @@ fn page_size() -> u64 {
     #[cfg(target_os = "linux")]
     {
         let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if value <= 0 {
-            4096
-        } else {
-            value as u64
-        }
+        if value <= 0 { 4096 } else { value as u64 }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1596,15 +1642,23 @@ fn is_ignored_disk(name: &str) -> bool {
 async fn read_trimmed(path: PathBuf) -> Option<String> {
     let raw = fs::read_to_string(path).await.ok()?;
     let value = raw.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    if value.is_empty() { None } else { Some(value.to_string()) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 async fn read_u64<P: AsRef<Path>>(path: P) -> Option<u64> {
-    read_i64(path).await.and_then(|v| if v >= 0 { Some(v as u64) } else { None })
+    read_i64(path)
+        .await
+        .and_then(|v| if v >= 0 { Some(v as u64) } else { None })
 }
 
 async fn read_u64_opt(path: &Option<String>) -> Option<u64> {
-    let Some(path) = path else { return None; };
+    let Some(path) = path else {
+        return None;
+    };
     read_u64(path).await
 }
 
@@ -1730,7 +1784,12 @@ async fn find_ina_power_sensors() -> Vec<JetsonPowerSensor> {
         };
         while let Ok(Some(sub_entry)) = sub.next_entry().await {
             let dev_path = sub_entry.path();
-            if dev_path.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("iio:device") {
+            if dev_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .starts_with("iio:device")
+            {
                 collect_iio_power(&dev_path, &mut sensors).await;
             }
         }

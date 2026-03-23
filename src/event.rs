@@ -44,7 +44,13 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(id: u64, source: impl Into<String>, kind: EventKind, signal: f64, severity: Severity) -> Self {
+    pub fn new(
+        id: u64,
+        source: impl Into<String>,
+        kind: EventKind,
+        signal: f64,
+        severity: Severity,
+    ) -> Self {
         Self {
             id,
             ts_ms: now_ms(),
