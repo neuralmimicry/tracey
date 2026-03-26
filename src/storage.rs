@@ -12,7 +12,8 @@ use crate::update::UpdateRecord;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -29,12 +30,29 @@ pub enum StorageRecord {
     Event { payload: Event },
     Decision { payload: Decision },
     Learning { payload: LearningSnapshot },
+    BanUpdate { payload: BanUpdateRecord },
     AgentPresence { payload: AgentPresence },
     HostObservation { payload: HostObservation },
     UnmanagedHost { payload: UnmanagedHost },
     TuningUpdate { payload: TuningUpdate },
     UpdateRecord { payload: UpdateRecord },
     GovernanceUpdate { payload: GovernanceUpdate },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BanUpdateRecord {
+    pub ts_ms: u64,
+    pub jail: String,
+    pub ip: String,
+    pub banned: bool,
+    pub ban_count: u32,
+    pub expires_ms: Option<u64>,
+    pub reason: String,
+    pub source: String,
+    pub fuzzy_risk: Option<f64>,
+    pub fuzzy_confidence: Option<f64>,
+    pub fuzzy_signal: Option<f64>,
+    pub fuzzy_adjusted_retry: Option<u32>,
 }
 
 impl Storage {
@@ -45,6 +63,9 @@ impl Storage {
         let (tx, mut rx) = mpsc::channel::<StorageRecord>(2048);
         let path = config.log_path.clone();
         let mut writer = open_writer(&path).await?;
+        if let Err(err) = maybe_compact(&path, &config, &mut writer).await {
+            tracing::warn!("Storage housekeeping failed: {}", err);
+        }
         let mut compact_tick =
             tokio::time::interval(Duration::from_millis(config.compact_interval_ms));
 
@@ -97,6 +118,13 @@ impl Storage {
         let _ = self
             .tx
             .send(StorageRecord::Learning { payload: snapshot })
+            .await;
+    }
+
+    pub async fn record_ban_update(&self, update: BanUpdateRecord) {
+        let _ = self
+            .tx
+            .send(StorageRecord::BanUpdate { payload: update })
             .await;
     }
 
@@ -178,16 +206,202 @@ async fn maybe_compact(
     if config.max_bytes == 0 || config.retain_lines == 0 || config.compact_interval_ms == 0 {
         return Ok(());
     }
+
+    writer.flush().await?;
+    prune_excess_archives(path, config.rotate_archives).await?;
+
     let meta = match tokio::fs::metadata(path).await {
         Ok(meta) => meta,
-        Err(_) => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
     };
-    if meta.len() <= config.max_bytes {
+    if meta.len() > config.max_bytes {
+        if config.rotate_archives > 0 {
+            rotate_logs(path, config.rotate_archives).await?;
+        } else {
+            compact_log(path, config).await?;
+        }
+        *writer = open_writer(path).await?;
+        writer.flush().await?;
+    }
+
+    prune_archives_to_total_budget(path, config.max_total_bytes).await?;
+    Ok(())
+}
+
+async fn rotate_logs(path: &PathBuf, archives: usize) -> std::io::Result<()> {
+    if archives == 0 {
         return Ok(());
     }
-    writer.flush().await?;
-    compact_log(path, config).await?;
-    *writer = open_writer(path).await?;
+
+    let oldest = archive_path(path, archives);
+    match tokio::fs::remove_file(&oldest).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    for idx in (1..archives).rev() {
+        let src = archive_path(path, idx);
+        let dst = archive_path(path, idx + 1);
+        if tokio::fs::metadata(&src).await.is_ok() {
+            match tokio::fs::rename(&src, &dst).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    let first = archive_path(path, 1);
+    tokio::fs::rename(path, &first).await?;
+    tracing::info!(
+        active = %path.display(),
+        archive = %first.display(),
+        archives,
+        "storage log rotated"
+    );
+    Ok(())
+}
+
+fn archive_path(path: &PathBuf, idx: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", path.display(), idx))
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveEntry {
+    idx: usize,
+    path: PathBuf,
+    bytes: u64,
+}
+
+async fn discover_archives(path: &PathBuf) -> std::io::Result<Vec<ArchiveEntry>> {
+    let mut archives = Vec::new();
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(base_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Ok(archives);
+    };
+    let prefix = format!("{}.", base_name);
+
+    let mut dir = tokio::fs::read_dir(parent).await?;
+    while let Some(entry) = dir.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Ok(idx) = suffix.parse::<usize>() else {
+            continue;
+        };
+        if idx == 0 {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        archives.push(ArchiveEntry {
+            idx,
+            path: entry.path(),
+            bytes: metadata.len(),
+        });
+    }
+
+    archives.sort_by_key(|entry| entry.idx);
+    Ok(archives)
+}
+
+async fn prune_excess_archives(path: &PathBuf, archives: usize) -> std::io::Result<()> {
+    let discovered = discover_archives(path).await?;
+    let mut removed = 0usize;
+    for entry in discovered {
+        if archives == 0 || entry.idx > archives {
+            match tokio::fs::remove_file(&entry.path).await {
+                Ok(_) => removed += 1,
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!(
+            active = %path.display(),
+            removed,
+            archives,
+            "storage archives pruned by retention"
+        );
+    }
+    Ok(())
+}
+
+async fn prune_archives_to_total_budget(
+    path: &PathBuf,
+    max_total_bytes: u64,
+) -> std::io::Result<()> {
+    if max_total_bytes == 0 {
+        return Ok(());
+    }
+
+    let active_bytes = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == ErrorKind::NotFound => 0,
+        Err(err) => return Err(err),
+    };
+
+    let archives = discover_archives(path).await?;
+    let mut total_bytes = active_bytes;
+    for entry in &archives {
+        total_bytes = total_bytes.saturating_add(entry.bytes);
+    }
+
+    if total_bytes <= max_total_bytes {
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for entry in archives.iter().rev() {
+        if total_bytes <= max_total_bytes {
+            break;
+        }
+        match tokio::fs::remove_file(&entry.path).await {
+            Ok(_) => {
+                removed += 1;
+                total_bytes = total_bytes.saturating_sub(entry.bytes);
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!(
+            active = %path.display(),
+            removed,
+            max_total_bytes,
+            remaining_total_bytes = total_bytes,
+            "storage archives pruned to enforce total byte budget"
+        );
+    }
+
+    if total_bytes > max_total_bytes {
+        tracing::warn!(
+            active = %path.display(),
+            max_total_bytes,
+            remaining_total_bytes = total_bytes,
+            "storage log footprint remains above budget after archive pruning"
+        );
+    }
+
     Ok(())
 }
 
@@ -401,4 +615,186 @@ fn top_counts(map: HashMap<String, u64>, limit: usize) -> Vec<SummaryCount> {
         entries.truncate(limit);
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let ts = now_ms();
+        std::env::temp_dir().join(format!(
+            "tracey-storage-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            ts
+        ))
+    }
+
+    #[tokio::test]
+    async fn rotate_logs_shifts_and_prunes_archives() {
+        let dir = test_dir("rotate");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let base = dir.join("tracey.log.jsonl");
+
+        // Base and three archives; with archives=3, the old .3 should be pruned.
+        tokio::fs::write(&base, b"base\n").await.unwrap();
+        tokio::fs::write(archive_path(&base, 1), b"one\n")
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 2), b"two\n")
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 3), b"three\n")
+            .await
+            .unwrap();
+
+        rotate_logs(&base, 3).await.unwrap();
+
+        assert!(!base.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(archive_path(&base, 1))
+                .await
+                .unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(archive_path(&base, 2))
+                .await
+                .unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(archive_path(&base, 3))
+                .await
+                .unwrap(),
+            "two\n"
+        );
+        assert!(!archive_path(&base, 4).exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_rotates_when_over_limit() {
+        let dir = test_dir("compact");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let base = dir.join("tracey.log.jsonl");
+        tokio::fs::write(&base, vec![b'x'; 2048]).await.unwrap();
+
+        let config = StorageConfig {
+            log_path: base.clone(),
+            max_bytes: 512,
+            max_total_bytes: 4_096,
+            retain_lines: 100,
+            compact_interval_ms: 30_000,
+            rotate_archives: 2,
+            summary_top_keys: 25,
+        };
+
+        let mut writer = open_writer(&base).await.unwrap();
+        writer.write_all(b"tail\n").await.unwrap();
+        writer.flush().await.unwrap();
+        maybe_compact(&base, &config, &mut writer).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let meta = tokio::fs::metadata(&base).await.unwrap();
+        assert!(meta.len() < 512, "expected fresh active log after rotate");
+        assert!(archive_path(&base, 1).exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_prunes_stale_archives_without_rotation_trigger() {
+        let dir = test_dir("stale");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let base = dir.join("tracey.log.jsonl");
+
+        tokio::fs::write(&base, b"active\n").await.unwrap();
+        tokio::fs::write(archive_path(&base, 1), b"one\n")
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 2), b"two\n")
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 3), b"three\n")
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 4), b"four\n")
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            log_path: base.clone(),
+            max_bytes: 1024 * 1024,
+            max_total_bytes: 1024 * 1024,
+            retain_lines: 100,
+            compact_interval_ms: 30_000,
+            rotate_archives: 2,
+            summary_top_keys: 25,
+        };
+
+        let mut writer = open_writer(&base).await.unwrap();
+        maybe_compact(&base, &config, &mut writer).await.unwrap();
+
+        assert!(archive_path(&base, 1).exists());
+        assert!(archive_path(&base, 2).exists());
+        assert!(!archive_path(&base, 3).exists());
+        assert!(!archive_path(&base, 4).exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_prunes_oldest_archives_to_total_budget() {
+        let dir = test_dir("budget");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let base = dir.join("tracey.log.jsonl");
+
+        tokio::fs::write(&base, vec![b'a'; 120]).await.unwrap();
+        tokio::fs::write(archive_path(&base, 1), vec![b'b'; 140])
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 2), vec![b'c'; 140])
+            .await
+            .unwrap();
+        tokio::fs::write(archive_path(&base, 3), vec![b'd'; 140])
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            log_path: base.clone(),
+            max_bytes: 1024 * 1024,
+            max_total_bytes: 400,
+            retain_lines: 100,
+            compact_interval_ms: 30_000,
+            rotate_archives: 3,
+            summary_top_keys: 25,
+        };
+
+        let mut writer = open_writer(&base).await.unwrap();
+        maybe_compact(&base, &config, &mut writer).await.unwrap();
+
+        assert!(archive_path(&base, 1).exists());
+        assert!(archive_path(&base, 2).exists());
+        assert!(!archive_path(&base, 3).exists());
+
+        let active = tokio::fs::metadata(&base).await.unwrap().len();
+        let a1 = tokio::fs::metadata(archive_path(&base, 1))
+            .await
+            .unwrap()
+            .len();
+        let a2 = tokio::fs::metadata(archive_path(&base, 2))
+            .await
+            .unwrap()
+            .len();
+        assert!(
+            active + a1 + a2 <= 400,
+            "expected total archived footprint within budget"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

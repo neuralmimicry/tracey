@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+const STATUS_BODY_PREVIEW_BYTES: usize = 256;
+const STATUS_MAX_AGENT_ID_LEN: usize = 128;
+
+enum ProxySnapshotParseError {
+    Syntax(serde_json::Error),
+    Semantics(String),
+}
+
 #[derive(Clone)]
 pub struct StatusService {
     pub agent_id: String,
@@ -17,6 +25,7 @@ pub struct StatusService {
     pub governance_state: Arc<tokio::sync::RwLock<GovernanceState>>,
     pub client: reqwest::Client,
     pub auth: AuthGate,
+    pub ban_intel: Option<crate::fail2ban::BanIntelHub>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +45,11 @@ struct StatusSnapshot {
     update_enabled: bool,
     telemetry_enabled: bool,
     discovery_enabled: bool,
+    fail2ban_local_bans: usize,
+    fail2ban_remote_bans: usize,
+    fail2ban_remote_agents: usize,
+    fail2ban_local_entries: Vec<String>,
+    fail2ban_remote_entries: Vec<String>,
 }
 
 pub async fn spawn_status(
@@ -48,12 +62,16 @@ pub async fn spawn_status(
         .route("/health", get(status_handler))
         .route("/ready", get(status_handler))
         .with_state(service);
-    if let Err(err) = axum::serve(
-        tokio::net::TcpListener::bind(listen_addr).await.unwrap(),
-        app,
-    )
-    .with_graceful_shutdown(async move { shutdown.wait().await })
-    .await
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!(addr = %listen_addr, error = %err, "status server bind failed");
+            return;
+        }
+    };
+    if let Err(err) = axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.wait().await })
+        .await
     {
         tracing::warn!("status server failed: {}", err);
     }
@@ -64,12 +82,21 @@ async fn status_handler(
     headers: HeaderMap,
 ) -> Result<Json<StatusSnapshot>, StatusCode> {
     service.auth.authorize_http(&headers).await?;
-    let hop = headers
+    let hop_raw = headers
         .get("x-tracey-proxy-hop")
         .and_then(|val| val.to_str().ok())
-        .unwrap_or("0")
-        .parse::<u8>()
-        .unwrap_or(0);
+        .unwrap_or("0");
+    let hop = match hop_raw.parse::<u8>() {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                hop_raw = %hop_raw,
+                error = %err,
+                "invalid status proxy hop header"
+            );
+            0
+        }
+    };
 
     let role = service.coordination_role.read().await.clone();
     let is_proxy = role.proxy_agent_id.as_deref() == Some(&service.agent_id);
@@ -100,16 +127,64 @@ async fn forward_to_proxy(
     match request.send().await {
         Ok(resp) => {
             if !resp.status().is_success() {
+                tracing::warn!(
+                    proxy_addr = %proxy_addr,
+                    status = %resp.status(),
+                    "proxy status request failed"
+                );
                 return None;
             }
-            resp.json::<StatusSnapshot>().await.ok()
+            let body = match resp.text().await {
+                Ok(body) => body,
+                Err(err) => {
+                    tracing::warn!(
+                        proxy_addr = %proxy_addr,
+                        error = %err,
+                        "failed reading proxy status body"
+                    );
+                    return None;
+                }
+            };
+            match parse_proxy_snapshot(&body) {
+                Ok(snapshot) => Some(snapshot),
+                Err(ProxySnapshotParseError::Syntax(err)) => {
+                    tracing::warn!(
+                        proxy_addr = %proxy_addr,
+                        error = %err,
+                        body_preview = %body_preview(&body, STATUS_BODY_PREVIEW_BYTES),
+                        "invalid proxy status payload"
+                    );
+                    None
+                }
+                Err(ProxySnapshotParseError::Semantics(reason)) => {
+                    tracing::warn!(
+                        proxy_addr = %proxy_addr,
+                        reason = %reason,
+                        "invalid proxy status semantics"
+                    );
+                    None
+                }
+            }
         }
-        Err(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                proxy_addr = %proxy_addr,
+                error = %err,
+                "proxy status request transport failed"
+            );
+            None
+        }
     }
 }
 
 async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> StatusSnapshot {
     let state = service.governance_state.read().await;
+    let ban_snapshot = if let Some(ban_intel) = &service.ban_intel {
+        ban_intel.snapshot(16).await
+    } else {
+        crate::fail2ban::BanStatusSnapshot::default()
+    };
+
     StatusSnapshot {
         ts_ms: now_ms(),
         agent_id: service.agent_id.clone(),
@@ -126,6 +201,19 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         update_enabled: state.update_enabled,
         telemetry_enabled: state.telemetry_enabled,
         discovery_enabled: state.discovery_enabled,
+        fail2ban_local_bans: ban_snapshot.local_ban_count,
+        fail2ban_remote_bans: ban_snapshot.remote_ban_count,
+        fail2ban_remote_agents: ban_snapshot.remote_agents,
+        fail2ban_local_entries: ban_snapshot
+            .local_entries
+            .into_iter()
+            .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
+            .collect(),
+        fail2ban_remote_entries: ban_snapshot
+            .remote_entries
+            .into_iter()
+            .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
+            .collect(),
     }
 }
 
@@ -136,5 +224,123 @@ fn normalize_url(addr: &str, path: &str) -> String {
         format!("{}/{}", addr, path)
     } else {
         format!("http://{}/{}", addr, path)
+    }
+}
+
+fn validate_proxy_snapshot(snapshot: &StatusSnapshot) -> Result<(), String> {
+    if snapshot.agent_id.trim().is_empty() {
+        return Err("agent_id is empty".to_string());
+    }
+    if snapshot.agent_id.len() > STATUS_MAX_AGENT_ID_LEN {
+        return Err(format!("agent_id too long (>{})", STATUS_MAX_AGENT_ID_LEN));
+    }
+    if snapshot.leader_count == 0 {
+        return Err("leader_count must be > 0".to_string());
+    }
+    if snapshot.leader_rank != usize::MAX && snapshot.leader_rank >= snapshot.leader_count {
+        return Err("leader_rank must be less than leader_count".to_string());
+    }
+    if !(0.0..=1.0).contains(&snapshot.decision_threshold) {
+        return Err("decision_threshold out of range [0,1]".to_string());
+    }
+    Ok(())
+}
+
+fn parse_proxy_snapshot(body: &str) -> Result<StatusSnapshot, ProxySnapshotParseError> {
+    let snapshot =
+        serde_json::from_str::<StatusSnapshot>(body).map_err(ProxySnapshotParseError::Syntax)?;
+    validate_proxy_snapshot(&snapshot).map_err(ProxySnapshotParseError::Semantics)?;
+    Ok(snapshot)
+}
+
+fn body_preview(body: &str, max: usize) -> String {
+    let end = body
+        .char_indices()
+        .nth(max)
+        .map(|(idx, _)| idx)
+        .unwrap_or(body.len());
+    body[..end].replace('\n', "\\n").replace('\r', "\\r")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn parse_proxy_snapshot_rejects_semantic_violations() {
+        let payload = serde_json::json!({
+            "ts_ms": 1,
+            "agent_id": "peer-a",
+            "is_coordinator": false,
+            "leader_rank": 0,
+            "leader_count": 0,
+            "proxy_agent_id": null,
+            "proxy_addr": null,
+            "proxy_latency_ms": null,
+            "posture": "Balanced",
+            "decision_threshold": 0.5,
+            "active_response": false,
+            "shutdown_enabled": false,
+            "update_enabled": true,
+            "telemetry_enabled": true,
+            "discovery_enabled": true,
+            "fail2ban_local_bans": 0,
+            "fail2ban_remote_bans": 0,
+            "fail2ban_remote_agents": 0,
+            "fail2ban_local_entries": [],
+            "fail2ban_remote_entries": []
+        })
+        .to_string();
+
+        match parse_proxy_snapshot(&payload) {
+            Err(ProxySnapshotParseError::Semantics(reason)) => {
+                assert!(reason.contains("leader_count"));
+            }
+            _ => panic!("expected semantic error for invalid leader_count"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proxy_payload_parser_is_panic_safe(body in ".{0,2048}") {
+            let _ = parse_proxy_snapshot(&body);
+        }
+
+        #[test]
+        fn proxy_payload_semantic_validator_is_panic_safe(
+            agent_id in ".{0,220}",
+            leader_rank in 0usize..20usize,
+            leader_count in 0usize..20usize,
+            decision_threshold in -5.0f64..5.0f64,
+            local_entries in prop::collection::vec(".{0,64}", 0..16),
+            remote_entries in prop::collection::vec(".{0,64}", 0..16),
+        ) {
+            let body = serde_json::json!({
+                "ts_ms": 1,
+                "agent_id": agent_id,
+                "is_coordinator": false,
+                "leader_rank": leader_rank,
+                "leader_count": leader_count,
+                "proxy_agent_id": null,
+                "proxy_addr": null,
+                "proxy_latency_ms": null,
+                "posture": "Balanced",
+                "decision_threshold": decision_threshold,
+                "active_response": false,
+                "shutdown_enabled": false,
+                "update_enabled": true,
+                "telemetry_enabled": true,
+                "discovery_enabled": true,
+                "fail2ban_local_bans": 0,
+                "fail2ban_remote_bans": 0,
+                "fail2ban_remote_agents": 0,
+                "fail2ban_local_entries": local_entries,
+                "fail2ban_remote_entries": remote_entries
+            })
+            .to_string();
+
+            let _ = parse_proxy_snapshot(&body);
+        }
     }
 }

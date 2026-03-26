@@ -49,8 +49,22 @@ pub async fn spawn_stimuli(
                 break;
             }
             recv = socket.recv_from(&mut recv_buf) => {
-                if let Ok((size, peer_addr)) = recv {
-                    handle_inbound(&recv_buf[..size], &bus, &peer_addr.to_string());
+                match recv {
+                    Ok((size, peer_addr)) => {
+                        if size == recv_buf.len() {
+                            tracing::warn!(
+                                peer = %peer_addr,
+                                size,
+                                max_packet_bytes = recv_buf.len(),
+                                "stimuli inbound packet may be truncated; dropping"
+                            );
+                            continue;
+                        }
+                        handle_inbound(&recv_buf[..size], &bus, &peer_addr.to_string());
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "stimuli receive failed");
+                    }
                 }
             }
             event = bus_rx.recv() => {
@@ -100,10 +114,21 @@ fn handle_inbound(payload: &[u8], bus: &EventBus, peer: &str) {
         }
     };
 
+    let mut unknown_count = 0usize;
     for ev in events {
+        if !is_known_aer_addr(ev.addr) {
+            unknown_count = unknown_count.saturating_add(1);
+        }
         if let Some(event) = aer_to_event(&ev, peer) {
             bus.publish(event);
         }
+    }
+    if unknown_count > 0 {
+        tracing::warn!(
+            peer = %peer,
+            unknown_count,
+            "stimuli payload contained unsupported/unknown AER addresses"
+        );
     }
 }
 
@@ -113,7 +138,9 @@ async fn flush_outbound(socket: &UdpSocket, peer: Option<&str>, pending: &mut Ve
     }
     if let Some(peer) = peer {
         let payload = encode_events(pending);
-        let _ = socket.send_to(&payload, peer).await;
+        if let Err(err) = socket.send_to(&payload, peer).await {
+            tracing::warn!(peer = %peer, error = %err, "stimuli outbound send failed");
+        }
     }
     pending.clear();
 }
@@ -233,4 +260,8 @@ fn posture_index(posture: Posture) -> u32 {
         Posture::Strict => 2,
         Posture::Lockdown => 3,
     }
+}
+
+fn is_known_aer_addr(addr: u32) -> bool {
+    addr_to_kind_severity(addr).is_some() || addr >= AARNN_OUTPUT_BASE
 }

@@ -28,6 +28,7 @@ Tracey runs on a non-blocking, multi-threaded async runtime and uses all availab
 - `src/swarm/coordinator.rs` enforces consensus and response policy.
 - `src/swarm/learning.rs` maintains online stats and merges baselines.
 - `src/discovery.rs` authenticates agent presence via UDP gossip.
+- `src/fail2ban.rs` provides Fail2Ban-compatible jails, regex filtering, action hooks, ban persistence, and cross-agent ban-intel sharing.
 - `src/embedded.rs` gathers local embedded metrics from `/proc` and `/sys`.
 - `src/assets.rs` ingests external asset observations (JSONL feed).
 - `src/storage.rs` writes JSONL records for events, decisions, learning snapshots, and inventory.
@@ -158,6 +159,53 @@ Example:
     "gpu_rocm_enabled": true,
     "gpu_max_devices": 8
   },
+  "fail2ban": {
+    "enabled": true,
+    "state_path": "tracey.fail2ban.state.json",
+    "max_advertised_ips": 64,
+    "remote_ttl_ms": 15000,
+    "unban_check_ms": 1000,
+    "persist_interval_ms": 3000,
+    "auto_elevate_root": true,
+    "sudo_program": "sudo",
+    "sudo_non_interactive": true,
+    "use_sudo_for_actions": true,
+    "inherit_global_fuzzy": true,
+    "min_samples": 12,
+    "fuzzy_min_risk": 0.62,
+    "fuzzy_min_confidence": 0.30,
+    "fuzzy_retry_reduction": 0.55,
+    "jails": [
+      {
+        "name": "ssh",
+        "enabled": true,
+        "backend": "hybrid",
+        "log_paths": ["/var/log/auth.log"],
+        "filter_files": [],
+        "fail_regex": [
+          "(?i)failed password.*from (?P<host>(?:\\d{1,3}\\.){3}\\d{1,3})"
+        ],
+        "ignore_regex": [],
+        "prefilter_regex": null,
+        "max_retry": 5,
+        "find_time_ms": 600000,
+        "ban_time_ms": 900000,
+        "ban_increment": true,
+        "ban_multiplier": 2.0,
+        "ban_max_time_ms": 7200000,
+        "ban_randomize_ms": 15000,
+        "ignore_ips": ["127.0.0.1", "::1", "10.0.0.1"],
+        "poll_interval_ms": 1000,
+        "event_ip_keys": ["ip", "src_ip", "client_ip", "remote_addr"],
+        "action_start": null,
+        "action_stop": null,
+        "action_ban": "nft add element inet filter tracey_ban { <ip> }",
+        "action_unban": "nft delete element inet filter tracey_ban { <ip> }",
+        "shell": "/bin/sh",
+        "action_timeout_ms": 5000
+      }
+    ]
+  },
   "governance": {
     "enabled": true,
     "vote_interval_ms": 1500,
@@ -219,8 +267,10 @@ Example:
   "storage": {
     "log_path": "tracey.log.jsonl",
     "max_bytes": 25000000,
+    "max_total_bytes": 100000000,
     "retain_lines": 5000,
     "compact_interval_ms": 30000,
+    "rotate_archives": 3,
     "summary_top_keys": 25
   }
 }
@@ -243,6 +293,55 @@ Environment overrides:
 - `TRACEY_FUZZY_EDGE_BIAS` / `NM_FUZZY_EDGE_BIAS`
 - `TRACEY_FUZZY_AARNN_WEIGHT` / `NM_FUZZY_AARNN_WEIGHT`
 - `TRACEY_FUZZY_SECURITY_WEIGHT` / `NM_FUZZY_SECURITY_WEIGHT`
+- `TRACEY_FAIL2BAN_ENABLED` / `NM_FAIL2BAN_ENABLED`
+- `TRACEY_FAIL2BAN_STATE_PATH` / `NM_FAIL2BAN_STATE_PATH`
+- `TRACEY_FAIL2BAN_MAX_ADVERTISED_IPS` / `NM_FAIL2BAN_MAX_ADVERTISED_IPS`
+- `TRACEY_FAIL2BAN_REMOTE_TTL_MS` / `NM_FAIL2BAN_REMOTE_TTL_MS`
+- `TRACEY_FAIL2BAN_UNBAN_CHECK_MS` / `NM_FAIL2BAN_UNBAN_CHECK_MS`
+- `TRACEY_FAIL2BAN_PERSIST_INTERVAL_MS` / `NM_FAIL2BAN_PERSIST_INTERVAL_MS`
+- `TRACEY_FAIL2BAN_AUTO_ELEVATE_ROOT` / `NM_FAIL2BAN_AUTO_ELEVATE_ROOT`
+- `TRACEY_FAIL2BAN_SUDO_PROGRAM` / `NM_FAIL2BAN_SUDO_PROGRAM`
+- `TRACEY_FAIL2BAN_SUDO_NON_INTERACTIVE` / `NM_FAIL2BAN_SUDO_NON_INTERACTIVE`
+- `TRACEY_FAIL2BAN_USE_SUDO_FOR_ACTIONS` / `NM_FAIL2BAN_USE_SUDO_FOR_ACTIONS`
+- `TRACEY_FAIL2BAN_INHERIT_GLOBAL_FUZZY` / `NM_FAIL2BAN_INHERIT_GLOBAL_FUZZY`
+- `TRACEY_FAIL2BAN_MIN_SAMPLES` / `NM_FAIL2BAN_MIN_SAMPLES`
+- `TRACEY_FAIL2BAN_FUZZY_MIN_RISK` / `NM_FAIL2BAN_FUZZY_MIN_RISK`
+- `TRACEY_FAIL2BAN_FUZZY_MIN_CONFIDENCE` / `NM_FAIL2BAN_FUZZY_MIN_CONFIDENCE`
+- `TRACEY_FAIL2BAN_FUZZY_RETRY_REDUCTION` / `NM_FAIL2BAN_FUZZY_RETRY_REDUCTION`
+- `TRACEY_FAIL2BAN_FUZZY_ENABLED` / `NM_FAIL2BAN_FUZZY_ENABLED`
+- `TRACEY_FAIL2BAN_FUZZY_ORDER` / `NM_FAIL2BAN_FUZZY_ORDER`
+- `TRACEY_FAIL2BAN_FUZZY_UNCERTAINTY` / `NM_FAIL2BAN_FUZZY_UNCERTAINTY`
+- `TRACEY_FAIL2BAN_FUZZY_EDGE_BIAS` / `NM_FAIL2BAN_FUZZY_EDGE_BIAS`
+- `TRACEY_FAIL2BAN_FUZZY_AARNN_WEIGHT` / `NM_FAIL2BAN_FUZZY_AARNN_WEIGHT`
+- `TRACEY_FAIL2BAN_FUZZY_SECURITY_WEIGHT` / `NM_FAIL2BAN_FUZZY_SECURITY_WEIGHT`
+
+### Distributed Fail2Ban Runtime
+
+Tracey now includes a native Rust Fail2Ban-compatible subsystem:
+
+- Multi-jail processing with file and event backends (`polling`, `tracey_event`, `hybrid`).
+- Regex/ignore-regex matching plus optional ingestion of upstream Fail2Ban filter files.
+- Ban lifecycle management (`max_retry`, `find_time`, `ban_time`, incremental ban duration, randomized jitter).
+- Type-n fuzzy risk scoring is applied per jail using Tracey's `AdaptiveScorer`; fuzzy risk/confidence dynamically reduce retry thresholds for high-confidence attack signals.
+- Privilege detection and optional auto-elevation (`sudo`) for root-protected logs and firewall-rule action execution.
+- Optional shell action hooks on start/stop/ban/unban.
+- Persistent ban and log offset state for restart continuity.
+- Cross-agent ban-intel propagation through signed discovery announcements so peer ban state influences local ban thresholds.
+- Status API reporting of local and remote ban counts/samples.
+
+### Storage Log Rotation
+
+Tracey protects disk and write performance for JSONL audit logs:
+
+- When `storage.max_bytes` is exceeded, logs are automatically rotated (or compacted when rotation is disabled).
+- `storage.rotate_archives` bounds archive count (`tracey.log.jsonl.1`, `.2`, etc.) and stale archives beyond the limit are pruned during housekeeping.
+- `storage.max_total_bytes` caps total bytes across the active log plus archives; oldest archives are pruned first when over budget.
+- Set `storage.rotate_archives = 0` to disable archive rotation and use in-place pruning/compaction only.
+
+Storage env override:
+- `TRACEY_STORAGE_MAX_BYTES` / `NM_STORAGE_MAX_BYTES`
+- `TRACEY_STORAGE_MAX_TOTAL_BYTES` / `NM_STORAGE_MAX_TOTAL_BYTES`
+- `TRACEY_STORAGE_ROTATE_ARCHIVES` / `NM_STORAGE_ROTATE_ARCHIVES`
 
 ### Asset Feed Format (JSONL)
 

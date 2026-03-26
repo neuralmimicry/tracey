@@ -8,6 +8,7 @@ mod coordination;
 mod discovery;
 mod embedded;
 mod event;
+mod fail2ban;
 mod governance;
 mod inventory;
 mod refiner_tracking;
@@ -25,6 +26,7 @@ mod update;
 
 use crate::bus::EventBus;
 use crate::config::Config;
+use crate::fail2ban::BanIntelHub;
 use crate::shutdown::Shutdown;
 use crate::swarm::{AdaptiveScorer, Agent, Coordinator, LearningSnapshot, SwarmDirective};
 use crate::update::UpdateManager;
@@ -53,6 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::load();
     tracing::info!(?config, "tracey starting");
+    if let Some(code) = fail2ban::maybe_elevate_for_fail2ban(&config.fail2ban) {
+        std::process::exit(code);
+    }
 
     if config.discovery.enabled && config.discovery.shared_key == "tracey-dev-key-change-me" {
         tracing::warn!(
@@ -88,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let governance_state = std::sync::Arc::new(tokio::sync::RwLock::new(
         governance::GovernanceState::from_config(&config),
     ));
+    let ban_intel = BanIntelHub::new(config.fail2ban.remote_ttl_ms);
 
     let auth_system = auth::AuthSystem::from_config(&config.auth);
 
@@ -170,6 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     governance_state: governance_state.clone(),
                     client,
                     auth: auth_system.status_gate(),
+                    ban_intel: if config.fail2ban.enabled {
+                        Some(ban_intel.clone())
+                    } else {
+                        None
+                    },
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));
@@ -232,6 +243,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
+    let mut fail2ban_config = config.fail2ban.clone();
+    if fail2ban_config.inherit_global_fuzzy {
+        fail2ban_config.fuzzy = config.fuzzy.clone();
+        fail2ban_config.min_samples = config.min_samples;
+    }
+    let fail2ban_bus = bus.clone();
+    let fail2ban_storage = storage.clone();
+    let fail2ban_shutdown = shutdown_listener.clone();
+    let fail2ban_intel = ban_intel.clone();
+    tokio::spawn(async move {
+        fail2ban::spawn_fail2ban(
+            fail2ban_config,
+            fail2ban_bus,
+            fail2ban_storage,
+            fail2ban_shutdown,
+            fail2ban_intel,
+        )
+        .await;
+    });
+
     let discovery_config = config.discovery.clone();
     let discovery_agent_id = config.agent_id.clone();
     let discovery_inventory = inventory.clone();
@@ -240,6 +271,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discovery_coordination = coordination.clone();
     let discovery_role = coordination_role.clone();
     let discovery_status_addr = status_advertise_addr.clone();
+    let discovery_ban_intel = if config.fail2ban.enabled {
+        Some(ban_intel.clone())
+    } else {
+        None
+    };
+    let discovery_ban_max = config.fail2ban.max_advertised_ips;
     tokio::spawn(async move {
         if let Err(err) = discovery::spawn_discovery(
             discovery_config,
@@ -251,6 +288,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery_coordination,
             discovery_status_addr,
             local_capabilities,
+            discovery_ban_intel,
+            discovery_ban_max,
         )
         .await
         {

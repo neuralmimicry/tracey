@@ -7,8 +7,10 @@ use std::path::PathBuf;
 pub struct StorageConfig {
     pub log_path: PathBuf,
     pub max_bytes: u64,
+    pub max_total_bytes: u64,
     pub retain_lines: usize,
     pub compact_interval_ms: u64,
+    pub rotate_archives: usize,
     pub summary_top_keys: usize,
 }
 
@@ -17,8 +19,10 @@ impl Default for StorageConfig {
         Self {
             log_path: PathBuf::from("tracey.log.jsonl"),
             max_bytes: 25_000_000,
+            max_total_bytes: 100_000_000,
             retain_lines: 5000,
             compact_interval_ms: 30_000,
+            rotate_archives: 3,
             summary_top_keys: 25,
         }
     }
@@ -229,6 +233,123 @@ impl Default for OtlpReceiverConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct Fail2BanConfig {
+    pub enabled: bool,
+    pub state_path: PathBuf,
+    pub max_advertised_ips: usize,
+    pub remote_ttl_ms: u64,
+    pub unban_check_ms: u64,
+    pub persist_interval_ms: u64,
+    pub agent_id: String,
+    pub auto_elevate_root: bool,
+    pub sudo_program: String,
+    pub sudo_non_interactive: bool,
+    pub use_sudo_for_actions: bool,
+    pub inherit_global_fuzzy: bool,
+    pub min_samples: u64,
+    pub fuzzy: FuzzyConfig,
+    pub fuzzy_min_risk: f64,
+    pub fuzzy_min_confidence: f64,
+    pub fuzzy_retry_reduction: f64,
+    pub jails: Vec<Fail2BanJailConfig>,
+}
+
+impl Default for Fail2BanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_path: PathBuf::from("tracey.fail2ban.state.json"),
+            max_advertised_ips: 64,
+            remote_ttl_ms: 15_000,
+            unban_check_ms: 1_000,
+            persist_interval_ms: 3_000,
+            agent_id: String::new(),
+            auto_elevate_root: true,
+            sudo_program: "sudo".to_string(),
+            sudo_non_interactive: true,
+            use_sudo_for_actions: true,
+            inherit_global_fuzzy: true,
+            min_samples: 12,
+            fuzzy: FuzzyConfig::default(),
+            fuzzy_min_risk: 0.62,
+            fuzzy_min_confidence: 0.30,
+            fuzzy_retry_reduction: 0.55,
+            jails: vec![Fail2BanJailConfig::default()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fail2BanJailConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub backend: String,
+    pub log_paths: Vec<PathBuf>,
+    pub filter_files: Vec<PathBuf>,
+    pub fail_regex: Vec<String>,
+    pub ignore_regex: Vec<String>,
+    pub prefilter_regex: Option<String>,
+    pub max_retry: u32,
+    pub find_time_ms: u64,
+    pub ban_time_ms: i64,
+    pub ban_increment: bool,
+    pub ban_multiplier: f64,
+    pub ban_max_time_ms: u64,
+    pub ban_randomize_ms: u64,
+    pub ignore_ips: Vec<String>,
+    pub poll_interval_ms: u64,
+    pub event_ip_keys: Vec<String>,
+    pub action_start: Option<String>,
+    pub action_stop: Option<String>,
+    pub action_ban: Option<String>,
+    pub action_unban: Option<String>,
+    pub shell: String,
+    pub action_timeout_ms: u64,
+}
+
+impl Default for Fail2BanJailConfig {
+    fn default() -> Self {
+        Self {
+            name: "tracey-default".to_string(),
+            enabled: true,
+            backend: "tracey_event".to_string(),
+            log_paths: Vec::new(),
+            filter_files: Vec::new(),
+            fail_regex: vec![
+                r"(?i)(failed|invalid|denied|rejected|unauthorized).*?(?P<host>(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4})".to_string(),
+                r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4})".to_string(),
+            ],
+            ignore_regex: Vec::new(),
+            prefilter_regex: None,
+            max_retry: 3,
+            find_time_ms: 600_000,
+            ban_time_ms: 600_000,
+            ban_increment: true,
+            ban_multiplier: 2.0,
+            ban_max_time_ms: 7_200_000,
+            ban_randomize_ms: 15_000,
+            ignore_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            poll_interval_ms: 1_000,
+            event_ip_keys: vec![
+                "ip".to_string(),
+                "src_ip".to_string(),
+                "source_ip".to_string(),
+                "client_ip".to_string(),
+                "remote_addr".to_string(),
+            ],
+            action_start: None,
+            action_stop: None,
+            action_ban: None,
+            action_unban: None,
+            shell: "/bin/sh".to_string(),
+            action_timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub agent_id: String,
     pub agents: usize,
@@ -255,6 +376,7 @@ pub struct Config {
     pub update: crate::update::UpdateConfig,
     pub telemetry: TelemetryConfig,
     pub embedded: EmbeddedConfig,
+    pub fail2ban: Fail2BanConfig,
     pub governance: crate::governance::GovernanceConfig,
     pub coordination: CoordinationConfig,
     pub status: StatusConfig,
@@ -290,6 +412,7 @@ impl Default for Config {
             update: crate::update::UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
             embedded: EmbeddedConfig::default(),
+            fail2ban: Fail2BanConfig::default(),
             governance: crate::governance::GovernanceConfig::default(),
             coordination: CoordinationConfig::default(),
             status: StatusConfig::default(),
@@ -343,9 +466,17 @@ impl Config {
         self.fuzzy.security_weight = self.fuzzy.security_weight.clamp(0.0, 1.0);
 
         self.storage.max_bytes = self.storage.max_bytes.clamp(1_000_000, 1_000_000_000);
+        self.storage.max_total_bytes = self
+            .storage
+            .max_total_bytes
+            .clamp(1_000_000, 10_000_000_000);
         self.storage.retain_lines = self.storage.retain_lines.clamp(100, 100_000);
         self.storage.compact_interval_ms = self.storage.compact_interval_ms.clamp(5_000, 600_000);
+        self.storage.rotate_archives = self.storage.rotate_archives.clamp(0, 20);
         self.storage.summary_top_keys = self.storage.summary_top_keys.clamp(5, 200);
+        if self.storage.max_total_bytes < self.storage.max_bytes {
+            self.storage.max_total_bytes = self.storage.max_bytes;
+        }
 
         self.discovery.announce_interval_ms =
             self.discovery.announce_interval_ms.clamp(200, 60_000);
@@ -396,6 +527,49 @@ impl Config {
         self.embedded.process_window_ms = self.embedded.process_window_ms.clamp(1000, 120_000);
         self.embedded.process_max = self.embedded.process_max.clamp(64, 65_535);
         self.embedded.gpu_max_devices = self.embedded.gpu_max_devices.clamp(1, 32);
+
+        self.fail2ban.max_advertised_ips = self.fail2ban.max_advertised_ips.clamp(1, 2048);
+        self.fail2ban.remote_ttl_ms = self.fail2ban.remote_ttl_ms.clamp(1_000, 300_000);
+        self.fail2ban.unban_check_ms = self.fail2ban.unban_check_ms.clamp(200, 120_000);
+        self.fail2ban.persist_interval_ms = self.fail2ban.persist_interval_ms.clamp(500, 300_000);
+        if self.fail2ban.sudo_program.trim().is_empty() {
+            self.fail2ban.sudo_program = "sudo".to_string();
+        }
+        self.fail2ban.min_samples = self.fail2ban.min_samples.clamp(3, 10_000);
+        self.fail2ban.fuzzy.order = self.fail2ban.fuzzy.order.clamp(1, 8);
+        self.fail2ban.fuzzy.uncertainty = self.fail2ban.fuzzy.uncertainty.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy.edge_bias = self.fail2ban.fuzzy.edge_bias.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy.aarnn_weight = self.fail2ban.fuzzy.aarnn_weight.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy.security_weight = self.fail2ban.fuzzy.security_weight.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy_min_risk = self.fail2ban.fuzzy_min_risk.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy_min_confidence = self.fail2ban.fuzzy_min_confidence.clamp(0.0, 1.0);
+        self.fail2ban.fuzzy_retry_reduction = self.fail2ban.fuzzy_retry_reduction.clamp(0.0, 0.95);
+        if self.fail2ban.agent_id.trim().is_empty() {
+            self.fail2ban.agent_id = self.agent_id.clone();
+        }
+        for (idx, jail) in self.fail2ban.jails.iter_mut().enumerate() {
+            if jail.name.trim().is_empty() {
+                jail.name = format!("tracey-jail-{}", idx + 1);
+            }
+            jail.backend = jail.backend.trim().to_ascii_lowercase();
+            if jail.backend.is_empty() {
+                jail.backend = "tracey_event".to_string();
+            }
+            jail.max_retry = jail.max_retry.clamp(1, 100);
+            jail.find_time_ms = jail.find_time_ms.clamp(1_000, 86_400_000);
+            jail.ban_time_ms = jail.ban_time_ms.clamp(-1, 86_400_000);
+            jail.ban_multiplier = jail.ban_multiplier.clamp(1.0, 64.0);
+            jail.ban_max_time_ms = jail.ban_max_time_ms.clamp(0, 604_800_000);
+            jail.ban_randomize_ms = jail.ban_randomize_ms.clamp(0, 300_000);
+            jail.poll_interval_ms = jail.poll_interval_ms.clamp(100, 120_000);
+            jail.action_timeout_ms = jail.action_timeout_ms.clamp(250, 120_000);
+            if jail.shell.trim().is_empty() {
+                jail.shell = "/bin/sh".to_string();
+            }
+            if jail.event_ip_keys.is_empty() {
+                jail.event_ip_keys = Fail2BanJailConfig::default().event_ip_keys;
+            }
+        }
 
         self.governance.vote_interval_ms = self.governance.vote_interval_ms.clamp(500, 30_000);
         self.governance.vote_ttl_ms = self.governance.vote_ttl_ms.clamp(1000, 60_000);
@@ -464,6 +638,121 @@ impl Config {
             self.fuzzy.security_weight = value;
         }
 
+        if let Some(value) = env_bool_any(&["TRACEY_FAIL2BAN_ENABLED", "NM_FAIL2BAN_ENABLED"]) {
+            self.fail2ban.enabled = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_FAIL2BAN_AUTO_ELEVATE_ROOT",
+            "NM_FAIL2BAN_AUTO_ELEVATE_ROOT",
+        ]) {
+            self.fail2ban.auto_elevate_root = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_FAIL2BAN_SUDO_PROGRAM", "NM_FAIL2BAN_SUDO_PROGRAM"])
+        {
+            self.fail2ban.sudo_program = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_FAIL2BAN_SUDO_NON_INTERACTIVE",
+            "NM_FAIL2BAN_SUDO_NON_INTERACTIVE",
+        ]) {
+            self.fail2ban.sudo_non_interactive = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_FAIL2BAN_USE_SUDO_FOR_ACTIONS",
+            "NM_FAIL2BAN_USE_SUDO_FOR_ACTIONS",
+        ]) {
+            self.fail2ban.use_sudo_for_actions = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_FAIL2BAN_INHERIT_GLOBAL_FUZZY",
+            "NM_FAIL2BAN_INHERIT_GLOBAL_FUZZY",
+        ]) {
+            self.fail2ban.inherit_global_fuzzy = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_FAIL2BAN_STATE_PATH", "NM_FAIL2BAN_STATE_PATH"]) {
+            self.fail2ban.state_path = PathBuf::from(value);
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_FAIL2BAN_MAX_ADVERTISED_IPS",
+            "NM_FAIL2BAN_MAX_ADVERTISED_IPS",
+        ]) {
+            self.fail2ban.max_advertised_ips = value as usize;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_FAIL2BAN_REMOTE_TTL_MS", "NM_FAIL2BAN_REMOTE_TTL_MS"])
+        {
+            self.fail2ban.remote_ttl_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_FAIL2BAN_UNBAN_CHECK_MS",
+            "NM_FAIL2BAN_UNBAN_CHECK_MS",
+        ]) {
+            self.fail2ban.unban_check_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_FAIL2BAN_PERSIST_INTERVAL_MS",
+            "NM_FAIL2BAN_PERSIST_INTERVAL_MS",
+        ]) {
+            self.fail2ban.persist_interval_ms = value;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_FAIL2BAN_MIN_SAMPLES", "NM_FAIL2BAN_MIN_SAMPLES"])
+        {
+            self.fail2ban.min_samples = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_MIN_RISK",
+            "NM_FAIL2BAN_FUZZY_MIN_RISK",
+        ]) {
+            self.fail2ban.fuzzy_min_risk = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_MIN_CONFIDENCE",
+            "NM_FAIL2BAN_FUZZY_MIN_CONFIDENCE",
+        ]) {
+            self.fail2ban.fuzzy_min_confidence = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_RETRY_REDUCTION",
+            "NM_FAIL2BAN_FUZZY_RETRY_REDUCTION",
+        ]) {
+            self.fail2ban.fuzzy_retry_reduction = value;
+        }
+        if let Some(value) =
+            env_bool_any(&["TRACEY_FAIL2BAN_FUZZY_ENABLED", "NM_FAIL2BAN_FUZZY_ENABLED"])
+        {
+            self.fail2ban.fuzzy.enabled = value;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_FAIL2BAN_FUZZY_ORDER", "NM_FAIL2BAN_FUZZY_ORDER"])
+        {
+            self.fail2ban.fuzzy.order = value as u8;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_UNCERTAINTY",
+            "NM_FAIL2BAN_FUZZY_UNCERTAINTY",
+        ]) {
+            self.fail2ban.fuzzy.uncertainty = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_EDGE_BIAS",
+            "NM_FAIL2BAN_FUZZY_EDGE_BIAS",
+        ]) {
+            self.fail2ban.fuzzy.edge_bias = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_AARNN_WEIGHT",
+            "NM_FAIL2BAN_FUZZY_AARNN_WEIGHT",
+        ]) {
+            self.fail2ban.fuzzy.aarnn_weight = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_FAIL2BAN_FUZZY_SECURITY_WEIGHT",
+            "NM_FAIL2BAN_FUZZY_SECURITY_WEIGHT",
+        ]) {
+            self.fail2ban.fuzzy.security_weight = value;
+        }
+
         if let Some(mode) = env_any(&["TRACEY_AUTH_MODE", "NM_AUTH_MODE"]) {
             self.auth.mode = mode.to_lowercase();
         }
@@ -472,6 +761,12 @@ impl Config {
         }
         if let Some(value) = env_u64_any(&["TRACEY_STORAGE_MAX_BYTES", "NM_STORAGE_MAX_BYTES"]) {
             self.storage.max_bytes = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_STORAGE_MAX_TOTAL_BYTES",
+            "NM_STORAGE_MAX_TOTAL_BYTES",
+        ]) {
+            self.storage.max_total_bytes = value;
         }
         if let Some(value) =
             env_u64_any(&["TRACEY_STORAGE_RETAIN_LINES", "NM_STORAGE_RETAIN_LINES"])
@@ -483,6 +778,12 @@ impl Config {
             "NM_STORAGE_COMPACT_INTERVAL_MS",
         ]) {
             self.storage.compact_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_STORAGE_ROTATE_ARCHIVES",
+            "NM_STORAGE_ROTATE_ARCHIVES",
+        ]) {
+            self.storage.rotate_archives = value as usize;
         }
         if let Some(value) = env_u64_any(&[
             "TRACEY_STORAGE_SUMMARY_TOP_KEYS",
