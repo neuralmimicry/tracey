@@ -1,3 +1,8 @@
+//! Action policy mapping risk/confidence scores into response actions.
+//!
+//! This is a core safety boundary: any stricter response must pass both
+//! confidence gating and threshold ordering.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -11,6 +16,7 @@ pub enum Action {
 }
 
 impl Action {
+    /// Returns true when the action triggers operator-visible handling.
     pub fn is_alerting(self) -> bool {
         matches!(
             self,
@@ -42,6 +48,9 @@ impl Default for ActionPolicy {
 }
 
 impl ActionPolicy {
+    /// Decides the response action for a risk/confidence pair.
+    ///
+    /// Confidence is checked first to avoid acting on low-quality signals.
     pub fn decide(&self, risk: f64, confidence: f64) -> Action {
         if confidence < self.min_confidence {
             return Action::Monitor;
@@ -57,5 +66,37 @@ impl ActionPolicy {
         } else {
             Action::Monitor
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_confidence_forces_monitor() {
+        let policy = ActionPolicy::default();
+        let action = policy.decide(1.0, policy.min_confidence - 0.01);
+        assert_eq!(action, Action::Monitor);
+    }
+
+    #[test]
+    fn thresholds_map_to_expected_actions() {
+        let policy = ActionPolicy::default();
+        let c = policy.min_confidence;
+        assert_eq!(
+            policy.decide(policy.alert_threshold - 0.001, c),
+            Action::Monitor
+        );
+        assert_eq!(policy.decide(policy.alert_threshold, c), Action::Alert);
+        assert_eq!(
+            policy.decide(policy.throttle_threshold, c),
+            Action::Throttle
+        );
+        assert_eq!(policy.decide(policy.isolate_threshold, c), Action::Isolate);
+        assert_eq!(
+            policy.decide(policy.shutdown_threshold, c),
+            Action::Shutdown
+        );
     }
 }

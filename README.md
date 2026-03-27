@@ -28,7 +28,8 @@ Tracey runs on a non-blocking, multi-threaded async runtime and uses all availab
 - `src/swarm/coordinator.rs` enforces consensus and response policy.
 - `src/swarm/learning.rs` maintains online stats and merges baselines.
 - `src/discovery.rs` authenticates agent presence via UDP gossip.
-- `src/fail2ban.rs` provides Fail2Ban-compatible jails, regex filtering, action hooks, ban persistence, and cross-agent ban-intel sharing.
+- `src/tracey_ban.rs` provides TraceyBan-compatible jails, regex filtering, action hooks, ban persistence, and cross-agent ban-intel sharing.
+- `src/tracey_guard.rs` translates TraceyGuard probe-agent behaviors into Tracey's async runtime, including probe orchestration, fuzzy fault scoring, TMR checks, and distributed fault-intel gossip.
 - `src/embedded.rs` gathers local embedded metrics from `/proc` and `/sys`.
 - `src/assets.rs` ingests external asset observations (JSONL feed).
 - `src/storage.rs` writes JSONL records for events, decisions, learning snapshots, and inventory.
@@ -159,9 +160,9 @@ Example:
     "gpu_rocm_enabled": true,
     "gpu_max_devices": 8
   },
-  "fail2ban": {
+  "tracey_ban": {
     "enabled": true,
-    "state_path": "tracey.fail2ban.state.json",
+    "state_path": "tracey.tracey_ban.state.json",
     "max_advertised_ips": 64,
     "remote_ttl_ms": 15000,
     "unban_check_ms": 1000,
@@ -205,6 +206,42 @@ Example:
         "action_timeout_ms": 5000
       }
     ]
+  },
+  "tracey_guard": {
+    "enabled": true,
+    "scheduler_poll_ms": 200,
+    "max_parallel_tasks": 32,
+    "overhead_budget_pct": 2.0,
+    "max_devices": 32,
+    "synthetic_devices": 1,
+    "default_sm_count": 16,
+    "max_advertised_faults": 64,
+    "remote_fault_ttl_ms": 120000,
+    "deep_dive_max_faults": 256,
+    "probes": {
+      "fma": { "enabled": true, "period_ms": 60000, "sm_coverage": 1.0, "priority": 1, "timeout_ms": 500 },
+      "tensor_core": { "enabled": true, "period_ms": 60000, "sm_coverage": 1.0, "priority": 1, "timeout_ms": 1000 },
+      "transcendental": { "enabled": true, "period_ms": 120000, "sm_coverage": 0.5, "priority": 2, "timeout_ms": 500 },
+      "aes": { "enabled": true, "period_ms": 300000, "sm_coverage": 0.25, "priority": 3, "timeout_ms": 2000 },
+      "memory": { "enabled": true, "period_ms": 600000, "sm_coverage": 1.0, "priority": 4, "timeout_ms": 5000 },
+      "register_file": { "enabled": true, "period_ms": 120000, "sm_coverage": 1.0, "priority": 2, "timeout_ms": 500 },
+      "shared_memory": { "enabled": true, "period_ms": 300000, "sm_coverage": 0.5, "priority": 3, "timeout_ms": 1000 }
+    },
+    "tmr": {
+      "enabled": true,
+      "interval_ms": 600000,
+      "timeout_ms": 30000,
+      "triples_per_interval": 3
+    },
+    "correlation": {
+      "window_ms": 300000,
+      "min_confidence": 0.60,
+      "healthy_to_suspect": 0.95,
+      "suspect_to_quarantine": 0.80,
+      "quarantine_to_healthy": 0.98,
+      "immediate_quarantine_failures": 3,
+      "deep_test_passes": 128
+    }
   },
   "governance": {
     "enabled": true,
@@ -293,34 +330,34 @@ Environment overrides:
 - `TRACEY_FUZZY_EDGE_BIAS` / `NM_FUZZY_EDGE_BIAS`
 - `TRACEY_FUZZY_AARNN_WEIGHT` / `NM_FUZZY_AARNN_WEIGHT`
 - `TRACEY_FUZZY_SECURITY_WEIGHT` / `NM_FUZZY_SECURITY_WEIGHT`
-- `TRACEY_FAIL2BAN_ENABLED` / `NM_FAIL2BAN_ENABLED`
-- `TRACEY_FAIL2BAN_STATE_PATH` / `NM_FAIL2BAN_STATE_PATH`
-- `TRACEY_FAIL2BAN_MAX_ADVERTISED_IPS` / `NM_FAIL2BAN_MAX_ADVERTISED_IPS`
-- `TRACEY_FAIL2BAN_REMOTE_TTL_MS` / `NM_FAIL2BAN_REMOTE_TTL_MS`
-- `TRACEY_FAIL2BAN_UNBAN_CHECK_MS` / `NM_FAIL2BAN_UNBAN_CHECK_MS`
-- `TRACEY_FAIL2BAN_PERSIST_INTERVAL_MS` / `NM_FAIL2BAN_PERSIST_INTERVAL_MS`
-- `TRACEY_FAIL2BAN_AUTO_ELEVATE_ROOT` / `NM_FAIL2BAN_AUTO_ELEVATE_ROOT`
-- `TRACEY_FAIL2BAN_SUDO_PROGRAM` / `NM_FAIL2BAN_SUDO_PROGRAM`
-- `TRACEY_FAIL2BAN_SUDO_NON_INTERACTIVE` / `NM_FAIL2BAN_SUDO_NON_INTERACTIVE`
-- `TRACEY_FAIL2BAN_USE_SUDO_FOR_ACTIONS` / `NM_FAIL2BAN_USE_SUDO_FOR_ACTIONS`
-- `TRACEY_FAIL2BAN_INHERIT_GLOBAL_FUZZY` / `NM_FAIL2BAN_INHERIT_GLOBAL_FUZZY`
-- `TRACEY_FAIL2BAN_MIN_SAMPLES` / `NM_FAIL2BAN_MIN_SAMPLES`
-- `TRACEY_FAIL2BAN_FUZZY_MIN_RISK` / `NM_FAIL2BAN_FUZZY_MIN_RISK`
-- `TRACEY_FAIL2BAN_FUZZY_MIN_CONFIDENCE` / `NM_FAIL2BAN_FUZZY_MIN_CONFIDENCE`
-- `TRACEY_FAIL2BAN_FUZZY_RETRY_REDUCTION` / `NM_FAIL2BAN_FUZZY_RETRY_REDUCTION`
-- `TRACEY_FAIL2BAN_FUZZY_ENABLED` / `NM_FAIL2BAN_FUZZY_ENABLED`
-- `TRACEY_FAIL2BAN_FUZZY_ORDER` / `NM_FAIL2BAN_FUZZY_ORDER`
-- `TRACEY_FAIL2BAN_FUZZY_UNCERTAINTY` / `NM_FAIL2BAN_FUZZY_UNCERTAINTY`
-- `TRACEY_FAIL2BAN_FUZZY_EDGE_BIAS` / `NM_FAIL2BAN_FUZZY_EDGE_BIAS`
-- `TRACEY_FAIL2BAN_FUZZY_AARNN_WEIGHT` / `NM_FAIL2BAN_FUZZY_AARNN_WEIGHT`
-- `TRACEY_FAIL2BAN_FUZZY_SECURITY_WEIGHT` / `NM_FAIL2BAN_FUZZY_SECURITY_WEIGHT`
+- `TRACEY_BAN_ENABLED` / `NM_TRACEY_BAN_ENABLED`
+- `TRACEY_BAN_STATE_PATH` / `NM_TRACEY_BAN_STATE_PATH`
+- `TRACEY_BAN_MAX_ADVERTISED_IPS` / `NM_TRACEY_BAN_MAX_ADVERTISED_IPS`
+- `TRACEY_BAN_REMOTE_TTL_MS` / `NM_TRACEY_BAN_REMOTE_TTL_MS`
+- `TRACEY_BAN_UNBAN_CHECK_MS` / `NM_TRACEY_BAN_UNBAN_CHECK_MS`
+- `TRACEY_BAN_PERSIST_INTERVAL_MS` / `NM_TRACEY_BAN_PERSIST_INTERVAL_MS`
+- `TRACEY_BAN_AUTO_ELEVATE_ROOT` / `NM_TRACEY_BAN_AUTO_ELEVATE_ROOT`
+- `TRACEY_BAN_SUDO_PROGRAM` / `NM_TRACEY_BAN_SUDO_PROGRAM`
+- `TRACEY_BAN_SUDO_NON_INTERACTIVE` / `NM_TRACEY_BAN_SUDO_NON_INTERACTIVE`
+- `TRACEY_BAN_USE_SUDO_FOR_ACTIONS` / `NM_TRACEY_BAN_USE_SUDO_FOR_ACTIONS`
+- `TRACEY_BAN_INHERIT_GLOBAL_FUZZY` / `NM_TRACEY_BAN_INHERIT_GLOBAL_FUZZY`
+- `TRACEY_BAN_MIN_SAMPLES` / `NM_TRACEY_BAN_MIN_SAMPLES`
+- `TRACEY_BAN_FUZZY_MIN_RISK` / `NM_TRACEY_BAN_FUZZY_MIN_RISK`
+- `TRACEY_BAN_FUZZY_MIN_CONFIDENCE` / `NM_TRACEY_BAN_FUZZY_MIN_CONFIDENCE`
+- `TRACEY_BAN_FUZZY_RETRY_REDUCTION` / `NM_TRACEY_BAN_FUZZY_RETRY_REDUCTION`
+- `TRACEY_BAN_FUZZY_ENABLED` / `NM_TRACEY_BAN_FUZZY_ENABLED`
+- `TRACEY_BAN_FUZZY_ORDER` / `NM_TRACEY_BAN_FUZZY_ORDER`
+- `TRACEY_BAN_FUZZY_UNCERTAINTY` / `NM_TRACEY_BAN_FUZZY_UNCERTAINTY`
+- `TRACEY_BAN_FUZZY_EDGE_BIAS` / `NM_TRACEY_BAN_FUZZY_EDGE_BIAS`
+- `TRACEY_BAN_FUZZY_AARNN_WEIGHT` / `NM_TRACEY_BAN_FUZZY_AARNN_WEIGHT`
+- `TRACEY_BAN_FUZZY_SECURITY_WEIGHT` / `NM_TRACEY_BAN_FUZZY_SECURITY_WEIGHT`
 
-### Distributed Fail2Ban Runtime
+### Distributed TraceyBan Runtime
 
-Tracey now includes a native Rust Fail2Ban-compatible subsystem:
+Tracey now includes a native Rust TraceyBan-compatible subsystem:
 
 - Multi-jail processing with file and event backends (`polling`, `tracey_event`, `hybrid`).
-- Regex/ignore-regex matching plus optional ingestion of upstream Fail2Ban filter files.
+- Regex/ignore-regex matching plus optional ingestion of upstream TraceyBan filter files.
 - Ban lifecycle management (`max_retry`, `find_time`, `ban_time`, incremental ban duration, randomized jitter).
 - Type-n fuzzy risk scoring is applied per jail using Tracey's `AdaptiveScorer`; fuzzy risk/confidence dynamically reduce retry thresholds for high-confidence attack signals.
 - Privilege detection and optional auto-elevation (`sudo`) for root-protected logs and firewall-rule action execution.
@@ -435,9 +472,19 @@ Tracey exposes a lightweight status endpoint. Requests to any agent are proxied 
 
 ```bash
 curl http://agent-host:48000/status
+curl http://agent-host:48000/tracey_guard
+curl http://agent-host:48000/tracey_guard/deepdive
+curl -X POST http://agent-host:48000/control/tracey_guard \
+  -H 'content-type: application/json' \
+  -d '{"enabled":true,"deep_dive":true,"overhead_budget_pct":2.5,"tmr_enabled":true,"force_scan":true}'
 ```
 
 Set `status.public_addr` when the listen address is not routable (for example, `0.0.0.0` or a private bind).
+
+TraceyGuard routes:
+- `GET /tracey_guard` returns the current TraceyGuard runtime snapshot.
+- `GET /tracey_guard/deepdive` returns the same deep-dive payload used by NMC dashboard drilldowns.
+- `POST /control/tracey_guard` applies runtime controls without restarting the agent.
 
 ### OIDC Auth (Status + OTLP)
 
@@ -448,6 +495,13 @@ Tracey can enforce OIDC bearer tokens on `/status` and OTLP ingest endpoints. En
 - `NM_OIDC_ALLOWED_AUDIENCES` or `NM_OIDC_AUDIENCE`
 - `NM_OIDC_REQUIRED_SCOPES`
 - `NM_OIDC_PROTECT_STATUS=1`, `NM_OIDC_PROTECT_OTLP_HTTP=1`, `NM_OIDC_PROTECT_OTLP_GRPC=1`
+
+### TraceyGuard Runtime Env Overrides
+
+- `TRACEY_GUARD_ENABLED` / `NM_TRACEY_GUARD_ENABLED`
+- `TRACEY_GUARD_OVERHEAD_PCT` / `NM_TRACEY_GUARD_OVERHEAD_PCT`
+- `TRACEY_GUARD_POLL_MS` / `NM_TRACEY_GUARD_POLL_MS`
+- `TRACEY_GUARD_REMOTE_TTL_MS` / `NM_TRACEY_GUARD_REMOTE_TTL_MS`
 
 ### AER Stimuli Bridge (Tracey <-> AARNN)
 

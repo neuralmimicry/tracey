@@ -1,3 +1,5 @@
+//! Agent/asset inventory correlation and unmanaged-host detection.
+
 use crate::assets::HostObservation;
 use crate::config::InventoryConfig;
 use crate::discovery::AgentPresence;
@@ -30,6 +32,7 @@ enum InventoryEvent {
 }
 
 impl Inventory {
+    /// Spawns inventory worker that tracks agent and host presence windows.
     pub fn new(config: InventoryConfig, storage: Storage, mut shutdown: ShutdownListener) -> Self {
         let (tx, mut rx) = mpsc::channel::<InventoryEvent>(2048);
 
@@ -92,10 +95,12 @@ impl Inventory {
         Self { tx }
     }
 
+    /// Records observed agent presence.
     pub async fn record_agent(&self, presence: AgentPresence) {
         let _ = self.tx.send(InventoryEvent::Agent(presence)).await;
     }
 
+    /// Records observed host inventory data.
     pub async fn record_host(&self, host: HostObservation) {
         let _ = self.tx.send(InventoryEvent::Host(host)).await;
     }
@@ -107,4 +112,44 @@ fn purge_expired(map: &mut HashMap<String, Instant>, ttl: Duration) {
 
 fn purge_hosts(map: &mut HashMap<String, (Instant, HostObservation)>, ttl: Duration) {
     map.retain(|_, (last_seen, _)| last_seen.elapsed() < ttl);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_expired_removes_stale_entries() {
+        let mut map = HashMap::new();
+        map.insert("fresh".to_string(), Instant::now());
+        map.insert(
+            "stale".to_string(),
+            Instant::now() - Duration::from_millis(100),
+        );
+        purge_expired(&mut map, Duration::from_millis(50));
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("stale"));
+    }
+
+    #[test]
+    fn purge_hosts_removes_stale_host_entries() {
+        let mut map: HashMap<String, (Instant, HostObservation)> = HashMap::new();
+        let host = HostObservation {
+            host_id: "h1".to_string(),
+            ip: Some("10.0.0.1".to_string()),
+            mac: None,
+            hostname: Some("host1".to_string()),
+            os: None,
+            source: "test".to_string(),
+            ts_ms: now_ms(),
+        };
+        map.insert("fresh".to_string(), (Instant::now(), host.clone()));
+        map.insert(
+            "stale".to_string(),
+            (Instant::now() - Duration::from_millis(100), host),
+        );
+        purge_hosts(&mut map, Duration::from_millis(50));
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("stale"));
+    }
 }

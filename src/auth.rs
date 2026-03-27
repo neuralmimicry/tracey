@@ -1,3 +1,7 @@
+//! Authentication gates for HTTP and gRPC endpoints.
+//!
+//! Supports disabled mode and OIDC JWT validation with cached discovery/JWKS.
+
 use crate::config::{AuthConfig, OidcAuthConfig};
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
@@ -33,6 +37,7 @@ pub struct AuthSystem {
 }
 
 impl AuthSystem {
+    /// Builds auth system from runtime config.
     pub fn from_config(cfg: &AuthConfig) -> Self {
         let mode = AuthMode::parse(&cfg.mode);
         let validator = if mode == AuthMode::Oidc && cfg.oidc.enabled() {
@@ -49,14 +54,17 @@ impl AuthSystem {
         }
     }
 
+    /// Gate for status endpoints.
     pub fn status_gate(&self) -> AuthGate {
         AuthGate::new(self.mode, self.protect_status, self.validator.clone())
     }
 
+    /// Gate for OTLP/HTTP ingest endpoint.
     pub fn otlp_http_gate(&self) -> AuthGate {
         AuthGate::new(self.mode, self.protect_otlp_http, self.validator.clone())
     }
 
+    /// Gate for OTLP/gRPC ingest endpoint.
     pub fn otlp_grpc_gate(&self) -> AuthGate {
         AuthGate::new(self.mode, self.protect_otlp_grpc, self.validator.clone())
     }
@@ -187,6 +195,7 @@ impl OidcError {
 }
 
 impl OidcValidator {
+    /// Creates an OIDC validator with TTL-cached discovery and JWKS fetches.
     pub fn new(cfg: OidcAuthConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.http_timeout_ms))
@@ -204,6 +213,7 @@ impl OidcValidator {
         }
     }
 
+    /// Validates a JWT against configured issuer/JWKS/audience/scope rules.
     pub async fn validate(&self, token: &str) -> Result<(), OidcError> {
         if token.trim().is_empty() {
             return Err(OidcError::MissingToken);
@@ -372,4 +382,45 @@ fn is_supported_alg(alg: Algorithm) -> bool {
             | Algorithm::PS512
             | Algorithm::EdDSA
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_mode_parse_defaults_to_off() {
+        assert_eq!(AuthMode::parse("oidc"), AuthMode::Oidc);
+        assert_eq!(AuthMode::parse("OIDC"), AuthMode::Oidc);
+        assert_eq!(AuthMode::parse("off"), AuthMode::Off);
+        assert_eq!(AuthMode::parse("unknown"), AuthMode::Off);
+    }
+
+    #[test]
+    fn extract_bearer_accepts_common_cases() {
+        assert_eq!(extract_bearer("Bearer abc"), Some("abc"));
+        assert_eq!(extract_bearer("bearer xyz"), Some("xyz"));
+        assert_eq!(extract_bearer("Token nope"), None);
+    }
+
+    #[test]
+    fn required_scope_check_is_all_of() {
+        let scopes = HashSet::from_iter(["read".to_string(), "write".to_string()]);
+        assert!(has_required_scopes(&scopes, &["read".to_string()]));
+        assert!(has_required_scopes(
+            &scopes,
+            &["read".to_string(), "write".to_string()]
+        ));
+        assert!(!has_required_scopes(
+            &scopes,
+            &["read".to_string(), "admin".to_string()]
+        ));
+    }
+
+    #[test]
+    fn supported_alg_filter_blocks_none() {
+        assert!(is_supported_alg(Algorithm::RS256));
+        assert!(is_supported_alg(Algorithm::EdDSA));
+        assert!(!is_supported_alg(Algorithm::HS256));
+    }
 }

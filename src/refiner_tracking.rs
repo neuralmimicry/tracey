@@ -1,3 +1,5 @@
+//! Refiner service integration: health monitoring and security feed ingestion.
+
 use crate::bus::EventBus;
 use crate::config::RefinerTrackingConfig;
 use crate::event::{Event, EventKind, Severity};

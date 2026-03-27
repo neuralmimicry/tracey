@@ -1,3 +1,8 @@
+//! Authenticated UDP gossip for peer discovery and distributed intelligence.
+//!
+//! Announcements include capability data and optional TraceyBan/TraceyGuard
+//! advertisements signed with a shared-key digest.
+
 use crate::capabilities::Capabilities;
 use crate::config::DiscoveryConfig;
 use crate::coordination::CoordinatorRole;
@@ -23,7 +28,8 @@ pub struct AgentAnnouncement {
     pub ts_ms: u64,
     pub addr: Option<String>,
     pub status_addr: Option<String>,
-    pub ban_advertisement: Option<crate::fail2ban::BanAdvertisement>,
+    pub ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
+    pub fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
     pub capabilities: Capabilities,
     pub signature: String,
     pub is_coordinator: Option<bool>,
@@ -37,7 +43,8 @@ pub struct AgentPresence {
     pub ts_ms: u64,
     pub addr: Option<String>,
     pub status_addr: Option<String>,
-    pub ban_advertisement: Option<crate::fail2ban::BanAdvertisement>,
+    pub ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
+    pub fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
     pub capabilities: Capabilities,
     pub source: String,
     pub is_coordinator: Option<bool>,
@@ -55,8 +62,10 @@ pub async fn spawn_discovery(
     coordination: crate::coordination::Coordination,
     status_addr: Option<String>,
     capabilities: Capabilities,
-    ban_intel: Option<crate::fail2ban::BanIntelHub>,
+    ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     max_advertised_ips: usize,
+    fault_intel: Option<crate::tracey_guard::FaultIntelHub>,
+    max_advertised_faults: usize,
 ) -> std::io::Result<()> {
     if !config.enabled {
         tracing::info!("discovery disabled");
@@ -92,6 +101,11 @@ pub async fn spawn_discovery(
                     } else {
                         None
                     };
+                    let fault_advertisement = if let Some(intel) = &fault_intel {
+                        Some(intel.build_advertisement(max_advertised_faults).await)
+                    } else {
+                        None
+                    };
                     let announcement = build_announcement(
                         &agent_id,
                         &config,
@@ -100,6 +114,7 @@ pub async fn spawn_discovery(
                         &role,
                         status_addr.as_deref(),
                         ban_advertisement,
+                        fault_advertisement,
                     );
                     match serde_json::to_vec(&announcement) {
                         Ok(payload) => {
@@ -153,6 +168,11 @@ pub async fn spawn_discovery(
                         continue;
                     }
                     sanitize_announcement(&mut announcement, max_advertised_ips, &peer.to_string(), now);
+                    sanitize_fault_announcement(
+                        &mut announcement,
+                        max_advertised_faults,
+                        &peer.to_string(),
+                    );
 
                     let presence = AgentPresence {
                         agent_id: announcement.agent_id,
@@ -160,6 +180,7 @@ pub async fn spawn_discovery(
                         addr: announcement.addr,
                         status_addr: announcement.status_addr,
                         ban_advertisement: announcement.ban_advertisement.clone(),
+                        fault_advertisement: announcement.fault_advertisement.clone(),
                         capabilities: announcement.capabilities,
                         source: "gossip".to_string(),
                         is_coordinator: announcement.is_coordinator,
@@ -168,6 +189,11 @@ pub async fn spawn_discovery(
                     };
                     if let Some(intel) = &ban_intel
                         && let Some(advertisement) = &presence.ban_advertisement
+                    {
+                        intel.ingest_remote(&presence.agent_id, advertisement.clone()).await;
+                    }
+                    if let Some(intel) = &fault_intel
+                        && let Some(advertisement) = &presence.fault_advertisement
                     {
                         intel.ingest_remote(&presence.agent_id, advertisement.clone()).await;
                     }
@@ -190,7 +216,8 @@ fn build_announcement(
     key: &[u8; 32],
     role: &CoordinatorRole,
     status_addr: Option<&str>,
-    ban_advertisement: Option<crate::fail2ban::BanAdvertisement>,
+    ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
+    fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
 ) -> AgentAnnouncement {
     let ts_ms = now_ms();
     let addr = config.advertise_addr.clone();
@@ -202,6 +229,7 @@ fn build_announcement(
         role,
         status_addr,
         ban_advertisement.as_ref(),
+        fault_advertisement.as_ref(),
         key,
     );
     AgentAnnouncement {
@@ -210,6 +238,7 @@ fn build_announcement(
         addr,
         status_addr: status_addr.map(|v| v.to_string()),
         ban_advertisement,
+        fault_advertisement,
         capabilities: capabilities.clone(),
         signature,
         is_coordinator: Some(role.is_coordinator),
@@ -239,6 +268,7 @@ fn valid_signature(announcement: &AgentAnnouncement, key: &[u8; 32]) -> bool {
         &role,
         announcement.status_addr.as_deref(),
         announcement.ban_advertisement.as_ref(),
+        announcement.fault_advertisement.as_ref(),
         key,
     );
     normalize_eq(&announcement.signature, &expected)
@@ -355,6 +385,65 @@ fn sanitize_announcement(
     advertisement.entries = cleaned;
 }
 
+fn sanitize_fault_announcement(
+    announcement: &mut AgentAnnouncement,
+    max_advertised_faults: usize,
+    peer: &str,
+) {
+    let Some(advertisement) = announcement.fault_advertisement.as_mut() else {
+        return;
+    };
+
+    let original_len = advertisement.entries.len();
+    let mut cleaned = Vec::with_capacity(advertisement.entries.len());
+    let mut dropped = 0usize;
+
+    for mut entry in advertisement.entries.drain(..) {
+        if entry.key.trim().is_empty() || entry.key.len() > 256 {
+            dropped += 1;
+            continue;
+        }
+        if entry.gpu_id.trim().is_empty() || entry.gpu_id.len() > MAX_AGENT_ID_LEN {
+            dropped += 1;
+            continue;
+        }
+        if entry.probe_type.trim().is_empty() || entry.probe_type.len() > MAX_TAG_LEN {
+            dropped += 1;
+            continue;
+        }
+        entry.key = entry.key.trim().to_string();
+        entry.gpu_id = entry.gpu_id.trim().to_string();
+        entry.probe_type = entry.probe_type.trim().to_ascii_lowercase();
+        entry.state = entry.state.trim().to_ascii_lowercase();
+        entry.severity = entry.severity.trim().to_ascii_lowercase();
+        entry.risk = entry.risk.clamp(0.0, 1.0);
+        entry.confidence = entry.confidence.clamp(0.0, 1.0);
+        cleaned.push(entry);
+        if cleaned.len() >= max_advertised_faults {
+            break;
+        }
+    }
+
+    if dropped > 0 {
+        tracing::warn!(
+            peer = %peer,
+            agent_id = %announcement.agent_id,
+            dropped_entries = dropped,
+            "discovery fault advertisement contained invalid entries"
+        );
+    }
+    if original_len > max_advertised_faults {
+        tracing::warn!(
+            peer = %peer,
+            agent_id = %announcement.agent_id,
+            received_entries = original_len,
+            max_advertised_faults,
+            "discovery fault advertisement exceeded maximum entries and was truncated"
+        );
+    }
+    advertisement.entries = cleaned;
+}
+
 fn sign_payload(
     agent_id: &str,
     ts_ms: u64,
@@ -362,15 +451,20 @@ fn sign_payload(
     capabilities: &Capabilities,
     role: &CoordinatorRole,
     status_addr: Option<&str>,
-    ban_advertisement: Option<&crate::fail2ban::BanAdvertisement>,
+    ban_advertisement: Option<&crate::tracey_ban::BanAdvertisement>,
+    fault_advertisement: Option<&crate::tracey_guard::FaultAdvertisement>,
     key: &[u8; 32],
 ) -> String {
     let ban_digest = ban_advertisement
         .and_then(|advertisement| serde_json::to_vec(advertisement).ok())
         .map(|payload| blake3::hash(&payload).to_hex().to_string())
         .unwrap_or_default();
+    let fault_digest = fault_advertisement
+        .and_then(|advertisement| serde_json::to_vec(advertisement).ok())
+        .map(|payload| blake3::hash(&payload).to_hex().to_string())
+        .unwrap_or_default();
     let payload = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         agent_id,
         ts_ms,
         addr.unwrap_or(""),
@@ -382,7 +476,8 @@ fn sign_payload(
         role.is_coordinator,
         role.epoch,
         role.score,
-        ban_digest
+        ban_digest,
+        fault_digest
     );
     let hash = blake3::keyed_hash(key, payload.as_bytes());
     to_hex(hash.as_bytes())
@@ -428,7 +523,7 @@ fn payload_preview(payload: &[u8], max: usize) -> String {
 mod tests {
     use super::*;
     use crate::capabilities::Capabilities;
-    use crate::fail2ban::{BanAdvertisement, BanAdvertisementEntry};
+    use crate::tracey_ban::{BanAdvertisement, BanAdvertisementEntry};
     use proptest::prelude::*;
 
     #[test]
@@ -473,6 +568,7 @@ mod tests {
                     },
                 ],
             }),
+            fault_advertisement: None,
             capabilities: Capabilities {
                 os: "linux".to_string(),
                 arch: "x86_64".to_string(),
@@ -521,6 +617,7 @@ mod tests {
                 addr,
                 status_addr,
                 ban_advertisement: None,
+                fault_advertisement: None,
                 capabilities: Capabilities {
                     os: "linux".to_string(),
                     arch: "x86_64".to_string(),

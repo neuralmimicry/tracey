@@ -1,8 +1,12 @@
+//! Compact Address-Event Representation (AER) codec used by stimuli bridge.
+//!
+//! Encoding uses timestamp deltas + varints for transport efficiency.
+
 use thiserror::Error;
 
 const MAGIC: &[u8; 4] = b"AER1";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AerEvent {
     pub ts_us: u64,
     pub addr: u32,
@@ -19,6 +23,7 @@ pub enum AerError {
     VarintOverflow,
 }
 
+/// Encodes AER events sorted by timestamp into a compact binary payload.
 pub fn encode_events(events: &[AerEvent]) -> Vec<u8> {
     if events.is_empty() {
         return Vec::new();
@@ -44,6 +49,7 @@ pub fn encode_events(events: &[AerEvent]) -> Vec<u8> {
     out
 }
 
+/// Decodes AER payload bytes into ordered events.
 pub fn decode_events(bytes: &[u8]) -> Result<Vec<AerEvent>, AerError> {
     if bytes.len() < 12 {
         return Err(AerError::Truncated);
@@ -102,4 +108,67 @@ fn read_varint(bytes: &[u8]) -> Result<(u64, usize), AerError> {
         }
     }
     Err(AerError::Truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_round_trip_preserves_events() {
+        let events = vec![
+            AerEvent {
+                ts_us: 1002,
+                addr: 0x10,
+                value: 7,
+            },
+            AerEvent {
+                ts_us: 1000,
+                addr: 0x20,
+                value: 9,
+            },
+            AerEvent {
+                ts_us: 1010,
+                addr: 0x30,
+                value: 255,
+            },
+        ];
+        let encoded = encode_events(&events);
+        let decoded = decode_events(&encoded).expect("payload should decode");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].ts_us, 1000);
+        assert_eq!(decoded[1].ts_us, 1002);
+        assert_eq!(decoded[2].ts_us, 1010);
+        assert_eq!(decoded[2].value, 255);
+    }
+
+    #[test]
+    fn decode_rejects_invalid_magic() {
+        let mut payload = b"BAD!".to_vec();
+        payload.extend_from_slice(&123u64.to_le_bytes());
+        assert!(matches!(
+            decode_events(&payload),
+            Err(AerError::InvalidMagic)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_payload() {
+        assert!(matches!(decode_events(&[]), Err(AerError::Truncated)));
+        assert!(matches!(
+            decode_events(b"AER1\x00\x00\x00\x00"),
+            Err(AerError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_varint_overflow() {
+        let mut payload = b"AER1".to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[0x80; 10]);
+        assert!(matches!(
+            decode_events(&payload),
+            Err(AerError::VarintOverflow)
+        ));
+    }
 }

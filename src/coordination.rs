@@ -1,3 +1,8 @@
+//! Distributed coordination and leader election for multi-agent deployments.
+//!
+//! Election uses weighted scoring from compute capacity, network latency,
+//! deterministic hash score, and optional capability tags.
+
 use crate::capabilities::Capabilities;
 use crate::config::CoordinationConfig;
 use crate::discovery::AgentPresence;
@@ -45,6 +50,7 @@ pub struct Coordination {
 }
 
 impl Coordination {
+    /// Creates a coordination state for the local agent.
     pub fn new(
         agent_id: String,
         config: CoordinationConfig,
@@ -72,6 +78,7 @@ impl Coordination {
         }
     }
 
+    /// Returns a shared role state handle for status/reporting paths.
     pub fn role_handle(&self) -> Arc<RwLock<CoordinatorRole>> {
         self.role.clone()
     }
@@ -81,6 +88,7 @@ impl Coordination {
         self.role.read().await.proxy_agent_id.clone()
     }
 
+    /// Updates presence cache with a gossip announcement.
     pub async fn record_presence(&self, presence: AgentPresence) {
         let seen = now_ms();
         let latency_ms = seen.saturating_sub(presence.ts_ms);
@@ -106,6 +114,7 @@ impl Coordination {
         self.role.read().await.is_coordinator
     }
 
+    /// Runs periodic role elections while governance permits coordination.
     pub async fn spawn_election(self, governance: Arc<RwLock<GovernanceState>>) {
         if !self.config.enabled {
             tracing::info!("coordination disabled");
@@ -262,4 +271,67 @@ fn select_proxy<'a>(
         .iter()
         .min_by(|a, b| a.1.latency_ms.cmp(&b.1.latency_ms))
         .map(|(_, record)| *record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_record(agent_id: &str, latency_ms: u64, tags: Vec<&str>) -> PresenceRecord {
+        PresenceRecord {
+            agent_id: agent_id.to_string(),
+            score: 123,
+            cpu_cores: 8,
+            latency_ms,
+            status_addr: Some(format!("{}:48000", agent_id)),
+            tags: tags.into_iter().map(|v| v.to_string()).collect(),
+            is_coordinator: false,
+            epoch: 1,
+            last_seen_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn score_agent_is_stable_for_same_input() {
+        let a = score_agent("agent-1", "shared-key");
+        let b = score_agent("agent-1", "shared-key");
+        let c = score_agent("agent-2", "shared-key");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn weighted_score_prefers_lower_latency_when_weighted() {
+        let cfg = CoordinationConfig {
+            weight_cpu: 0.0,
+            weight_latency: 1.0,
+            weight_hash: 0.0,
+            weight_capability: 0.0,
+            ..CoordinationConfig::default()
+        };
+        let fast = mk_record("fast", 5, vec![]);
+        let slow = mk_record("slow", 80, vec![]);
+        assert!(weighted_score(&fast, &cfg) > weighted_score(&slow, &cfg));
+    }
+
+    #[test]
+    fn capability_score_rewards_jetson_and_soc_tags() {
+        let plain = mk_record("plain", 10, vec!["board:generic"]);
+        let jetson = mk_record(
+            "jetson",
+            10,
+            vec!["board:jetson", "jetson", "vendor:nvidia", "soc:orin"],
+        );
+        assert!(capability_score(&jetson) > capability_score(&plain));
+    }
+
+    #[test]
+    fn select_proxy_chooses_lowest_latency_candidate() {
+        let a = mk_record("a", 40, vec![]);
+        let b = mk_record("b", 8, vec![]);
+        let all = vec![(0.9, &a), (0.8, &b)];
+        let leaders = vec![(0.9, &a), (0.8, &b)];
+        let proxy = select_proxy(&all, &leaders).expect("proxy should exist");
+        assert_eq!(proxy.agent_id, "b");
+    }
 }

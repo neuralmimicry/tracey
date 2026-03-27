@@ -1,3 +1,5 @@
+//! Host capability discovery used by election weighting and gossip metadata.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -10,6 +12,7 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Captures local OS/CPU traits and optional Linux device-tree tags.
     pub fn local() -> Self {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
@@ -126,4 +129,49 @@ fn dedup_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_tag_value_filters_and_truncates() {
+        let raw = "  Jetson, AGX/Orin!! With Spaces And Symbols ###  ";
+        let normalized = normalize_tag_value(raw);
+        assert!(normalized.contains("jetson"));
+        assert!(normalized.contains("orin"));
+        assert!(!normalized.contains('#'));
+        assert!(normalized.len() <= 64);
+    }
+
+    #[test]
+    fn tag_with_prefix_rejects_empty_normalized_values() {
+        assert_eq!(tag_with_prefix("board", "!!!"), None);
+        assert_eq!(
+            tag_with_prefix("board", "Jetson Xavier"),
+            Some("board:jetson_xavier".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_tags_preserves_first_occurrence_order() {
+        let tags = vec![
+            "jetson".to_string(),
+            "vendor:nvidia".to_string(),
+            "jetson".to_string(),
+            "".to_string(),
+            "soc:orin".to_string(),
+            "vendor:nvidia".to_string(),
+        ];
+        let deduped = dedup_tags(tags);
+        assert_eq!(
+            deduped,
+            vec![
+                "jetson".to_string(),
+                "vendor:nvidia".to_string(),
+                "soc:orin".to_string()
+            ]
+        );
+    }
 }

@@ -1,3 +1,8 @@
+//! Telemetry ingestion bridges for Prometheus text scrape and OTLP metrics.
+//!
+//! Metrics are normalized into Tracey `Event` records with optional
+//! deduplication when Prometheus is the preferred source.
+
 use crate::auth::{AuthGate, AuthSystem};
 use crate::bus::EventBus;
 use crate::config::{OtlpReceiverConfig, TelemetryConfig};
@@ -993,4 +998,58 @@ async fn otlp_http_handler(
     )
     .await;
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_metric_line_parses_labels_and_value() {
+        let line = r#"node_cpu_seconds_total{cpu="0",mode="idle"} 12.5"#;
+        let parsed = parse_metric_line(line).expect("line should parse");
+        assert_eq!(parsed.0, "node_cpu_seconds_total");
+        assert_eq!(parsed.1, 12.5);
+        assert_eq!(parsed.2.get("cpu").map(String::as_str), Some("0"));
+        assert_eq!(parsed.2.get("mode").map(String::as_str), Some("idle"));
+    }
+
+    #[test]
+    fn parse_labels_unescapes_quotes_and_backslashes() {
+        let labels = parse_labels(r#"a="hello \"world\"",b="c:\\path""#);
+        assert_eq!(
+            labels.get("a").map(String::as_str),
+            Some(r#"hello "world""#)
+        );
+        assert_eq!(labels.get("b").map(String::as_str), Some(r#"c:\path"#));
+    }
+
+    #[test]
+    fn metric_key_is_deterministic_across_map_order() {
+        let mut a = HashMap::new();
+        a.insert("host".to_string(), "a".to_string());
+        a.insert("zone".to_string(), "1".to_string());
+        let mut b = HashMap::new();
+        b.insert("zone".to_string(), "1".to_string());
+        b.insert("host".to_string(), "a".to_string());
+        assert_eq!(metric_key("metric_name", &a), metric_key("metric_name", &b));
+    }
+
+    #[test]
+    fn allow_rules_honor_exact_then_prefixes() {
+        let mut cfg = TelemetryConfig::default();
+        cfg.allow_exact = vec!["exact_metric".to_string()];
+        cfg.allow_prefixes = vec!["node_".to_string()];
+        assert!(is_allowed("exact_metric", &cfg));
+        assert!(is_allowed("node_cpu", &cfg));
+        assert!(!is_allowed("random", &cfg));
+    }
+
+    #[test]
+    fn loopback_detection_handles_common_local_urls() {
+        assert!(is_loopback("http://127.0.0.1:9100/metrics"));
+        assert!(is_loopback("https://localhost/metrics"));
+        assert!(is_loopback("http://[::1]:9464/metrics"));
+        assert!(!is_loopback("http://10.0.0.5:9100/metrics"));
+    }
 }

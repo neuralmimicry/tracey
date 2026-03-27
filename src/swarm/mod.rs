@@ -1,3 +1,5 @@
+//! Swarm runtime modules: agent workers, coordinator, and learning model state.
+
 mod agent;
 mod coordinator;
 mod learning;

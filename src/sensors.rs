@@ -1,3 +1,5 @@
+//! Synthetic signal generators used for baseline swarm exercise and demos.
+
 use crate::bus::EventBus;
 use crate::config::Config;
 use crate::event::{Event, EventKind, Severity};
@@ -18,6 +20,7 @@ pub struct SimulatedSensor {
 }
 
 impl SimulatedSensor {
+    /// Builds a simulated sensor with a deterministic PRNG seed derived from its name.
     pub fn new(
         name: impl Into<String>,
         kind: EventKind,
@@ -36,6 +39,7 @@ impl SimulatedSensor {
         }
     }
 
+    /// Runs periodic event generation until shutdown.
     pub async fn run(
         self,
         bus: EventBus,
@@ -78,6 +82,7 @@ impl SimulatedSensor {
     }
 }
 
+/// Spawns the default system/network/user/automation synthetic sensor set.
 pub fn spawn_default_sensors(
     bus: EventBus,
     storage: Storage,
@@ -145,4 +150,39 @@ fn seed_from_name(name: &str) -> u64 {
         hash = hash.wrapping_mul(1099511628211);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_from_name_is_stable_and_distinct() {
+        let a1 = seed_from_name("system_cpu");
+        let a2 = seed_from_name("system_cpu");
+        let b = seed_from_name("network_flow");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+    }
+
+    #[test]
+    fn generate_event_marks_forced_anomaly() {
+        let sensor = SimulatedSensor::new("test", EventKind::SystemMetric, 0.3, 0.0, 1.0, 0.5);
+        let mut prng = Prng::new(123);
+        let event = sensor.generate_event(&mut prng);
+        assert!(matches!(event.severity, Severity::High));
+        assert_eq!(
+            event.attributes.get("anomaly").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn prng_f64_stays_in_unit_interval() {
+        let mut prng = Prng::new(1);
+        for _ in 0..1024 {
+            let value = prng.next_f64();
+            assert!((0.0..1.0).contains(&value));
+        }
+    }
 }

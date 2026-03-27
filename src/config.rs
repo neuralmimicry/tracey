@@ -1,3 +1,8 @@
+//! Runtime configuration model, defaults, env overrides, and sanitization.
+//!
+//! Config loading follows precedence: defaults < JSON file < env overrides,
+//! then a normalization pass clamps invalid/out-of-range values.
+
 use crate::security::ActionPolicy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -211,6 +216,180 @@ impl Default for EmbeddedConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TraceyGuardProbeConfig {
+    pub enabled: bool,
+    pub period_ms: u64,
+    pub sm_coverage: f64,
+    pub priority: u8,
+    pub timeout_ms: u64,
+}
+
+impl Default for TraceyGuardProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            period_ms: 60_000,
+            sm_coverage: 1.0,
+            priority: 1,
+            timeout_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceyGuardProbeCatalogConfig {
+    pub fma: TraceyGuardProbeConfig,
+    pub tensor_core: TraceyGuardProbeConfig,
+    pub transcendental: TraceyGuardProbeConfig,
+    pub aes: TraceyGuardProbeConfig,
+    pub memory: TraceyGuardProbeConfig,
+    pub register_file: TraceyGuardProbeConfig,
+    pub shared_memory: TraceyGuardProbeConfig,
+}
+
+impl Default for TraceyGuardProbeCatalogConfig {
+    fn default() -> Self {
+        Self {
+            fma: TraceyGuardProbeConfig {
+                period_ms: 60_000,
+                sm_coverage: 1.0,
+                priority: 1,
+                timeout_ms: 500,
+                enabled: true,
+            },
+            tensor_core: TraceyGuardProbeConfig {
+                period_ms: 60_000,
+                sm_coverage: 1.0,
+                priority: 1,
+                timeout_ms: 1_000,
+                enabled: true,
+            },
+            transcendental: TraceyGuardProbeConfig {
+                period_ms: 120_000,
+                sm_coverage: 0.5,
+                priority: 2,
+                timeout_ms: 500,
+                enabled: true,
+            },
+            aes: TraceyGuardProbeConfig {
+                period_ms: 300_000,
+                sm_coverage: 0.25,
+                priority: 3,
+                timeout_ms: 2_000,
+                enabled: true,
+            },
+            memory: TraceyGuardProbeConfig {
+                period_ms: 600_000,
+                sm_coverage: 1.0,
+                priority: 4,
+                timeout_ms: 5_000,
+                enabled: true,
+            },
+            register_file: TraceyGuardProbeConfig {
+                period_ms: 120_000,
+                sm_coverage: 1.0,
+                priority: 2,
+                timeout_ms: 500,
+                enabled: true,
+            },
+            shared_memory: TraceyGuardProbeConfig {
+                period_ms: 300_000,
+                sm_coverage: 0.5,
+                priority: 3,
+                timeout_ms: 1_000,
+                enabled: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceyGuardTmrConfig {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    pub triples_per_interval: usize,
+}
+
+impl Default for TraceyGuardTmrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 600_000,
+            timeout_ms: 30_000,
+            triples_per_interval: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceyGuardCorrelationConfig {
+    pub window_ms: u64,
+    pub min_confidence: f64,
+    pub healthy_to_suspect: f64,
+    pub suspect_to_quarantine: f64,
+    pub quarantine_to_healthy: f64,
+    pub immediate_quarantine_failures: u32,
+    pub deep_test_passes: u32,
+}
+
+impl Default for TraceyGuardCorrelationConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: 300_000,
+            min_confidence: 0.6,
+            healthy_to_suspect: 0.95,
+            suspect_to_quarantine: 0.80,
+            quarantine_to_healthy: 0.98,
+            immediate_quarantine_failures: 3,
+            deep_test_passes: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceyGuardConfig {
+    pub enabled: bool,
+    pub scheduler_poll_ms: u64,
+    pub max_parallel_tasks: usize,
+    pub overhead_budget_pct: f64,
+    pub max_devices: usize,
+    pub synthetic_devices: usize,
+    pub default_sm_count: usize,
+    pub max_advertised_faults: usize,
+    pub remote_fault_ttl_ms: u64,
+    pub deep_dive_max_faults: usize,
+    pub probes: TraceyGuardProbeCatalogConfig,
+    pub tmr: TraceyGuardTmrConfig,
+    pub correlation: TraceyGuardCorrelationConfig,
+}
+
+impl Default for TraceyGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scheduler_poll_ms: 200,
+            max_parallel_tasks: 32,
+            overhead_budget_pct: 2.0,
+            max_devices: 32,
+            synthetic_devices: 1,
+            default_sm_count: 16,
+            max_advertised_faults: 64,
+            remote_fault_ttl_ms: 120_000,
+            deep_dive_max_faults: 256,
+            probes: TraceyGuardProbeCatalogConfig::default(),
+            tmr: TraceyGuardTmrConfig::default(),
+            correlation: TraceyGuardCorrelationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OtlpReceiverConfig {
     pub enabled: bool,
     pub grpc_addr: String,
@@ -233,7 +412,7 @@ impl Default for OtlpReceiverConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Fail2BanConfig {
+pub struct TraceyBanConfig {
     pub enabled: bool,
     pub state_path: PathBuf,
     pub max_advertised_ips: usize,
@@ -251,14 +430,14 @@ pub struct Fail2BanConfig {
     pub fuzzy_min_risk: f64,
     pub fuzzy_min_confidence: f64,
     pub fuzzy_retry_reduction: f64,
-    pub jails: Vec<Fail2BanJailConfig>,
+    pub jails: Vec<TraceyBanJailConfig>,
 }
 
-impl Default for Fail2BanConfig {
+impl Default for TraceyBanConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            state_path: PathBuf::from("tracey.fail2ban.state.json"),
+            state_path: PathBuf::from("tracey.tracey_ban.state.json"),
             max_advertised_ips: 64,
             remote_ttl_ms: 15_000,
             unban_check_ms: 1_000,
@@ -274,14 +453,14 @@ impl Default for Fail2BanConfig {
             fuzzy_min_risk: 0.62,
             fuzzy_min_confidence: 0.30,
             fuzzy_retry_reduction: 0.55,
-            jails: vec![Fail2BanJailConfig::default()],
+            jails: vec![TraceyBanJailConfig::default()],
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Fail2BanJailConfig {
+pub struct TraceyBanJailConfig {
     pub name: String,
     pub enabled: bool,
     pub backend: String,
@@ -308,7 +487,7 @@ pub struct Fail2BanJailConfig {
     pub action_timeout_ms: u64,
 }
 
-impl Default for Fail2BanJailConfig {
+impl Default for TraceyBanJailConfig {
     fn default() -> Self {
         Self {
             name: "tracey-default".to_string(),
@@ -376,7 +555,8 @@ pub struct Config {
     pub update: crate::update::UpdateConfig,
     pub telemetry: TelemetryConfig,
     pub embedded: EmbeddedConfig,
-    pub fail2ban: Fail2BanConfig,
+    pub tracey_guard: TraceyGuardConfig,
+    pub tracey_ban: TraceyBanConfig,
     pub governance: crate::governance::GovernanceConfig,
     pub coordination: CoordinationConfig,
     pub status: StatusConfig,
@@ -412,7 +592,8 @@ impl Default for Config {
             update: crate::update::UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
             embedded: EmbeddedConfig::default(),
-            fail2ban: Fail2BanConfig::default(),
+            tracey_guard: TraceyGuardConfig::default(),
+            tracey_ban: TraceyBanConfig::default(),
             governance: crate::governance::GovernanceConfig::default(),
             coordination: CoordinationConfig::default(),
             status: StatusConfig::default(),
@@ -423,6 +604,8 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Loads configuration from `TRACEY_CONFIG` (if present), applies env
+    /// overrides, and sanitizes values to safe operational ranges.
     pub fn load() -> Self {
         let path = std::env::var("TRACEY_CONFIG").ok();
         if let Some(path) = path {
@@ -528,26 +711,87 @@ impl Config {
         self.embedded.process_max = self.embedded.process_max.clamp(64, 65_535);
         self.embedded.gpu_max_devices = self.embedded.gpu_max_devices.clamp(1, 32);
 
-        self.fail2ban.max_advertised_ips = self.fail2ban.max_advertised_ips.clamp(1, 2048);
-        self.fail2ban.remote_ttl_ms = self.fail2ban.remote_ttl_ms.clamp(1_000, 300_000);
-        self.fail2ban.unban_check_ms = self.fail2ban.unban_check_ms.clamp(200, 120_000);
-        self.fail2ban.persist_interval_ms = self.fail2ban.persist_interval_ms.clamp(500, 300_000);
-        if self.fail2ban.sudo_program.trim().is_empty() {
-            self.fail2ban.sudo_program = "sudo".to_string();
+        self.tracey_guard.scheduler_poll_ms = self.tracey_guard.scheduler_poll_ms.clamp(50, 10_000);
+        self.tracey_guard.max_parallel_tasks = self.tracey_guard.max_parallel_tasks.clamp(1, 1024);
+        self.tracey_guard.overhead_budget_pct =
+            self.tracey_guard.overhead_budget_pct.clamp(0.1, 50.0);
+        self.tracey_guard.max_devices = self.tracey_guard.max_devices.clamp(1, 256);
+        self.tracey_guard.synthetic_devices = self.tracey_guard.synthetic_devices.clamp(1, 256);
+        self.tracey_guard.default_sm_count = self.tracey_guard.default_sm_count.clamp(1, 256);
+        self.tracey_guard.max_advertised_faults =
+            self.tracey_guard.max_advertised_faults.clamp(1, 4096);
+        self.tracey_guard.remote_fault_ttl_ms =
+            self.tracey_guard.remote_fault_ttl_ms.clamp(1_000, 600_000);
+        self.tracey_guard.deep_dive_max_faults =
+            self.tracey_guard.deep_dive_max_faults.clamp(8, 10_000);
+        self.tracey_guard.tmr.interval_ms =
+            self.tracey_guard.tmr.interval_ms.clamp(5_000, 3_600_000);
+        self.tracey_guard.tmr.timeout_ms = self.tracey_guard.tmr.timeout_ms.clamp(500, 120_000);
+        self.tracey_guard.tmr.triples_per_interval =
+            self.tracey_guard.tmr.triples_per_interval.clamp(1, 128);
+        self.tracey_guard.correlation.window_ms = self
+            .tracey_guard
+            .correlation
+            .window_ms
+            .clamp(5_000, 3_600_000);
+        self.tracey_guard.correlation.min_confidence =
+            self.tracey_guard.correlation.min_confidence.clamp(0.0, 1.0);
+        self.tracey_guard.correlation.healthy_to_suspect = self
+            .tracey_guard
+            .correlation
+            .healthy_to_suspect
+            .clamp(0.50, 0.999);
+        self.tracey_guard.correlation.suspect_to_quarantine = self
+            .tracey_guard
+            .correlation
+            .suspect_to_quarantine
+            .clamp(0.10, self.tracey_guard.correlation.healthy_to_suspect);
+        self.tracey_guard.correlation.quarantine_to_healthy = self
+            .tracey_guard
+            .correlation
+            .quarantine_to_healthy
+            .clamp(self.tracey_guard.correlation.healthy_to_suspect, 0.999);
+        self.tracey_guard.correlation.immediate_quarantine_failures = self
+            .tracey_guard
+            .correlation
+            .immediate_quarantine_failures
+            .clamp(1, 32);
+        self.tracey_guard.correlation.deep_test_passes = self
+            .tracey_guard
+            .correlation
+            .deep_test_passes
+            .clamp(1, 10_000);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.fma);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.tensor_core);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.transcendental);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.aes);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.memory);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.register_file);
+        sanitize_probe_cfg(&mut self.tracey_guard.probes.shared_memory);
+
+        self.tracey_ban.max_advertised_ips = self.tracey_ban.max_advertised_ips.clamp(1, 2048);
+        self.tracey_ban.remote_ttl_ms = self.tracey_ban.remote_ttl_ms.clamp(1_000, 300_000);
+        self.tracey_ban.unban_check_ms = self.tracey_ban.unban_check_ms.clamp(200, 120_000);
+        self.tracey_ban.persist_interval_ms =
+            self.tracey_ban.persist_interval_ms.clamp(500, 300_000);
+        if self.tracey_ban.sudo_program.trim().is_empty() {
+            self.tracey_ban.sudo_program = "sudo".to_string();
         }
-        self.fail2ban.min_samples = self.fail2ban.min_samples.clamp(3, 10_000);
-        self.fail2ban.fuzzy.order = self.fail2ban.fuzzy.order.clamp(1, 8);
-        self.fail2ban.fuzzy.uncertainty = self.fail2ban.fuzzy.uncertainty.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy.edge_bias = self.fail2ban.fuzzy.edge_bias.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy.aarnn_weight = self.fail2ban.fuzzy.aarnn_weight.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy.security_weight = self.fail2ban.fuzzy.security_weight.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy_min_risk = self.fail2ban.fuzzy_min_risk.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy_min_confidence = self.fail2ban.fuzzy_min_confidence.clamp(0.0, 1.0);
-        self.fail2ban.fuzzy_retry_reduction = self.fail2ban.fuzzy_retry_reduction.clamp(0.0, 0.95);
-        if self.fail2ban.agent_id.trim().is_empty() {
-            self.fail2ban.agent_id = self.agent_id.clone();
+        self.tracey_ban.min_samples = self.tracey_ban.min_samples.clamp(3, 10_000);
+        self.tracey_ban.fuzzy.order = self.tracey_ban.fuzzy.order.clamp(1, 8);
+        self.tracey_ban.fuzzy.uncertainty = self.tracey_ban.fuzzy.uncertainty.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy.edge_bias = self.tracey_ban.fuzzy.edge_bias.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy.aarnn_weight = self.tracey_ban.fuzzy.aarnn_weight.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy.security_weight =
+            self.tracey_ban.fuzzy.security_weight.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy_min_risk = self.tracey_ban.fuzzy_min_risk.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy_min_confidence = self.tracey_ban.fuzzy_min_confidence.clamp(0.0, 1.0);
+        self.tracey_ban.fuzzy_retry_reduction =
+            self.tracey_ban.fuzzy_retry_reduction.clamp(0.0, 0.95);
+        if self.tracey_ban.agent_id.trim().is_empty() {
+            self.tracey_ban.agent_id = self.agent_id.clone();
         }
-        for (idx, jail) in self.fail2ban.jails.iter_mut().enumerate() {
+        for (idx, jail) in self.tracey_ban.jails.iter_mut().enumerate() {
             if jail.name.trim().is_empty() {
                 jail.name = format!("tracey-jail-{}", idx + 1);
             }
@@ -567,7 +811,7 @@ impl Config {
                 jail.shell = "/bin/sh".to_string();
             }
             if jail.event_ip_keys.is_empty() {
-                jail.event_ip_keys = Fail2BanJailConfig::default().event_ip_keys;
+                jail.event_ip_keys = TraceyBanJailConfig::default().event_ip_keys;
             }
         }
 
@@ -616,6 +860,7 @@ impl Config {
         self.auth.oidc.http_timeout_ms = self.auth.oidc.http_timeout_ms.clamp(500, 15_000);
     }
 
+    /// Applies environment variable overrides for selected runtime settings.
     fn apply_env_overrides(&mut self) {
         if let Some(value) = env_bool_any(&["TRACEY_FUZZY_ENABLED", "NM_FUZZY_ENABLED"]) {
             self.fuzzy.enabled = value;
@@ -638,119 +883,130 @@ impl Config {
             self.fuzzy.security_weight = value;
         }
 
-        if let Some(value) = env_bool_any(&["TRACEY_FAIL2BAN_ENABLED", "NM_FAIL2BAN_ENABLED"]) {
-            self.fail2ban.enabled = value;
+        if let Some(value) = env_bool_any(&["TRACEY_GUARD_ENABLED", "NM_TRACEY_GUARD_ENABLED"]) {
+            self.tracey_guard.enabled = value;
         }
-        if let Some(value) = env_bool_any(&[
-            "TRACEY_FAIL2BAN_AUTO_ELEVATE_ROOT",
-            "NM_FAIL2BAN_AUTO_ELEVATE_ROOT",
-        ]) {
-            self.fail2ban.auto_elevate_root = value;
-        }
-        if let Some(value) = env_any(&["TRACEY_FAIL2BAN_SUDO_PROGRAM", "NM_FAIL2BAN_SUDO_PROGRAM"])
+        if let Some(value) =
+            env_f64_any(&["TRACEY_GUARD_OVERHEAD_PCT", "NM_TRACEY_GUARD_OVERHEAD_PCT"])
         {
-            self.fail2ban.sudo_program = value;
+            self.tracey_guard.overhead_budget_pct = value;
         }
-        if let Some(value) = env_bool_any(&[
-            "TRACEY_FAIL2BAN_SUDO_NON_INTERACTIVE",
-            "NM_FAIL2BAN_SUDO_NON_INTERACTIVE",
-        ]) {
-            self.fail2ban.sudo_non_interactive = value;
-        }
-        if let Some(value) = env_bool_any(&[
-            "TRACEY_FAIL2BAN_USE_SUDO_FOR_ACTIONS",
-            "NM_FAIL2BAN_USE_SUDO_FOR_ACTIONS",
-        ]) {
-            self.fail2ban.use_sudo_for_actions = value;
-        }
-        if let Some(value) = env_bool_any(&[
-            "TRACEY_FAIL2BAN_INHERIT_GLOBAL_FUZZY",
-            "NM_FAIL2BAN_INHERIT_GLOBAL_FUZZY",
-        ]) {
-            self.fail2ban.inherit_global_fuzzy = value;
-        }
-        if let Some(value) = env_any(&["TRACEY_FAIL2BAN_STATE_PATH", "NM_FAIL2BAN_STATE_PATH"]) {
-            self.fail2ban.state_path = PathBuf::from(value);
+        if let Some(value) = env_u64_any(&["TRACEY_GUARD_POLL_MS", "NM_TRACEY_GUARD_POLL_MS"]) {
+            self.tracey_guard.scheduler_poll_ms = value;
         }
         if let Some(value) = env_u64_any(&[
-            "TRACEY_FAIL2BAN_MAX_ADVERTISED_IPS",
-            "NM_FAIL2BAN_MAX_ADVERTISED_IPS",
+            "TRACEY_GUARD_REMOTE_TTL_MS",
+            "NM_TRACEY_GUARD_REMOTE_TTL_MS",
         ]) {
-            self.fail2ban.max_advertised_ips = value as usize;
+            self.tracey_guard.remote_fault_ttl_ms = value;
         }
-        if let Some(value) =
-            env_u64_any(&["TRACEY_FAIL2BAN_REMOTE_TTL_MS", "NM_FAIL2BAN_REMOTE_TTL_MS"])
-        {
-            self.fail2ban.remote_ttl_ms = value;
+
+        if let Some(value) = env_bool_any(&["TRACEY_BAN_ENABLED", "NM_TRACEY_BAN_ENABLED"]) {
+            self.tracey_ban.enabled = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_AUTO_ELEVATE_ROOT",
+            "NM_TRACEY_BAN_AUTO_ELEVATE_ROOT",
+        ]) {
+            self.tracey_ban.auto_elevate_root = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_BAN_SUDO_PROGRAM", "NM_TRACEY_BAN_SUDO_PROGRAM"]) {
+            self.tracey_ban.sudo_program = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_SUDO_NON_INTERACTIVE",
+            "NM_TRACEY_BAN_SUDO_NON_INTERACTIVE",
+        ]) {
+            self.tracey_ban.sudo_non_interactive = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_USE_SUDO_FOR_ACTIONS",
+            "NM_TRACEY_BAN_USE_SUDO_FOR_ACTIONS",
+        ]) {
+            self.tracey_ban.use_sudo_for_actions = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_INHERIT_GLOBAL_FUZZY",
+            "NM_TRACEY_BAN_INHERIT_GLOBAL_FUZZY",
+        ]) {
+            self.tracey_ban.inherit_global_fuzzy = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_BAN_STATE_PATH", "NM_TRACEY_BAN_STATE_PATH"]) {
+            self.tracey_ban.state_path = PathBuf::from(value);
         }
         if let Some(value) = env_u64_any(&[
-            "TRACEY_FAIL2BAN_UNBAN_CHECK_MS",
-            "NM_FAIL2BAN_UNBAN_CHECK_MS",
+            "TRACEY_BAN_MAX_ADVERTISED_IPS",
+            "NM_TRACEY_BAN_MAX_ADVERTISED_IPS",
         ]) {
-            self.fail2ban.unban_check_ms = value;
+            self.tracey_ban.max_advertised_ips = value as usize;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_BAN_REMOTE_TTL_MS", "NM_TRACEY_BAN_REMOTE_TTL_MS"])
+        {
+            self.tracey_ban.remote_ttl_ms = value;
+        }
+        if let Some(value) =
+            env_u64_any(&["TRACEY_BAN_UNBAN_CHECK_MS", "NM_TRACEY_BAN_UNBAN_CHECK_MS"])
+        {
+            self.tracey_ban.unban_check_ms = value;
         }
         if let Some(value) = env_u64_any(&[
-            "TRACEY_FAIL2BAN_PERSIST_INTERVAL_MS",
-            "NM_FAIL2BAN_PERSIST_INTERVAL_MS",
+            "TRACEY_BAN_PERSIST_INTERVAL_MS",
+            "NM_TRACEY_BAN_PERSIST_INTERVAL_MS",
         ]) {
-            self.fail2ban.persist_interval_ms = value;
+            self.tracey_ban.persist_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_BAN_MIN_SAMPLES", "NM_TRACEY_BAN_MIN_SAMPLES"]) {
+            self.tracey_ban.min_samples = value;
         }
         if let Some(value) =
-            env_u64_any(&["TRACEY_FAIL2BAN_MIN_SAMPLES", "NM_FAIL2BAN_MIN_SAMPLES"])
+            env_f64_any(&["TRACEY_BAN_FUZZY_MIN_RISK", "NM_TRACEY_BAN_FUZZY_MIN_RISK"])
         {
-            self.fail2ban.min_samples = value;
+            self.tracey_ban.fuzzy_min_risk = value;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_MIN_RISK",
-            "NM_FAIL2BAN_FUZZY_MIN_RISK",
+            "TRACEY_BAN_FUZZY_MIN_CONFIDENCE",
+            "NM_TRACEY_BAN_FUZZY_MIN_CONFIDENCE",
         ]) {
-            self.fail2ban.fuzzy_min_risk = value;
+            self.tracey_ban.fuzzy_min_confidence = value;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_MIN_CONFIDENCE",
-            "NM_FAIL2BAN_FUZZY_MIN_CONFIDENCE",
+            "TRACEY_BAN_FUZZY_RETRY_REDUCTION",
+            "NM_TRACEY_BAN_FUZZY_RETRY_REDUCTION",
         ]) {
-            self.fail2ban.fuzzy_min_confidence = value;
-        }
-        if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_RETRY_REDUCTION",
-            "NM_FAIL2BAN_FUZZY_RETRY_REDUCTION",
-        ]) {
-            self.fail2ban.fuzzy_retry_reduction = value;
+            self.tracey_ban.fuzzy_retry_reduction = value;
         }
         if let Some(value) =
-            env_bool_any(&["TRACEY_FAIL2BAN_FUZZY_ENABLED", "NM_FAIL2BAN_FUZZY_ENABLED"])
+            env_bool_any(&["TRACEY_BAN_FUZZY_ENABLED", "NM_TRACEY_BAN_FUZZY_ENABLED"])
         {
-            self.fail2ban.fuzzy.enabled = value;
+            self.tracey_ban.fuzzy.enabled = value;
         }
-        if let Some(value) =
-            env_u64_any(&["TRACEY_FAIL2BAN_FUZZY_ORDER", "NM_FAIL2BAN_FUZZY_ORDER"])
-        {
-            self.fail2ban.fuzzy.order = value as u8;
+        if let Some(value) = env_u64_any(&["TRACEY_BAN_FUZZY_ORDER", "NM_TRACEY_BAN_FUZZY_ORDER"]) {
+            self.tracey_ban.fuzzy.order = value as u8;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_UNCERTAINTY",
-            "NM_FAIL2BAN_FUZZY_UNCERTAINTY",
+            "TRACEY_BAN_FUZZY_UNCERTAINTY",
+            "NM_TRACEY_BAN_FUZZY_UNCERTAINTY",
         ]) {
-            self.fail2ban.fuzzy.uncertainty = value;
+            self.tracey_ban.fuzzy.uncertainty = value;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_EDGE_BIAS",
-            "NM_FAIL2BAN_FUZZY_EDGE_BIAS",
+            "TRACEY_BAN_FUZZY_EDGE_BIAS",
+            "NM_TRACEY_BAN_FUZZY_EDGE_BIAS",
         ]) {
-            self.fail2ban.fuzzy.edge_bias = value;
+            self.tracey_ban.fuzzy.edge_bias = value;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_AARNN_WEIGHT",
-            "NM_FAIL2BAN_FUZZY_AARNN_WEIGHT",
+            "TRACEY_BAN_FUZZY_AARNN_WEIGHT",
+            "NM_TRACEY_BAN_FUZZY_AARNN_WEIGHT",
         ]) {
-            self.fail2ban.fuzzy.aarnn_weight = value;
+            self.tracey_ban.fuzzy.aarnn_weight = value;
         }
         if let Some(value) = env_f64_any(&[
-            "TRACEY_FAIL2BAN_FUZZY_SECURITY_WEIGHT",
-            "NM_FAIL2BAN_FUZZY_SECURITY_WEIGHT",
+            "TRACEY_BAN_FUZZY_SECURITY_WEIGHT",
+            "NM_TRACEY_BAN_FUZZY_SECURITY_WEIGHT",
         ]) {
-            self.fail2ban.fuzzy.security_weight = value;
+            self.tracey_ban.fuzzy.security_weight = value;
         }
 
         if let Some(mode) = env_any(&["TRACEY_AUTH_MODE", "NM_AUTH_MODE"]) {
@@ -1113,6 +1369,13 @@ impl Default for OidcAuthConfig {
     }
 }
 
+fn sanitize_probe_cfg(cfg: &mut TraceyGuardProbeConfig) {
+    cfg.period_ms = cfg.period_ms.clamp(100, 3_600_000);
+    cfg.sm_coverage = cfg.sm_coverage.clamp(0.01, 1.0);
+    cfg.priority = cfg.priority.clamp(1, 10);
+    cfg.timeout_ms = cfg.timeout_ms.clamp(50, 120_000);
+}
+
 fn default_agent_id() -> String {
     let hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -1185,4 +1448,62 @@ fn env_csv_any(names: &[&str]) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_probe_cfg_clamps_extremes() {
+        let mut probe = TraceyGuardProbeConfig {
+            enabled: true,
+            period_ms: 1,
+            sm_coverage: 5.0,
+            priority: 99,
+            timeout_ms: 1,
+        };
+        sanitize_probe_cfg(&mut probe);
+        assert_eq!(probe.period_ms, 100);
+        assert_eq!(probe.sm_coverage, 1.0);
+        assert_eq!(probe.priority, 10);
+        assert_eq!(probe.timeout_ms, 50);
+    }
+
+    #[test]
+    fn oidc_config_enabled_when_issuer_or_jwks_present() {
+        let mut cfg = OidcAuthConfig::default();
+        assert!(!cfg.enabled());
+        cfg.issuer = "https://issuer.example.com".to_string();
+        assert!(cfg.enabled());
+        cfg.issuer.clear();
+        cfg.jwks_url = Some("https://issuer.example.com/jwks.json".to_string());
+        assert!(cfg.enabled());
+    }
+
+    #[test]
+    fn config_sanitize_clamps_core_ranges_and_disables_invalid_keys() {
+        let mut cfg = Config::default();
+        cfg.agents = 0;
+        cfg.bus_capacity = 1;
+        cfg.assessment_channel_capacity = 1;
+        cfg.assessment_quorum = 9999;
+        cfg.decision_threshold = 5.0;
+        cfg.event_rate_ms = 1;
+        cfg.discovery.enabled = true;
+        cfg.discovery.shared_key = "   ".to_string();
+        cfg.update.enabled = true;
+        cfg.update.shared_key = "".to_string();
+
+        cfg.sanitize();
+
+        assert_eq!(cfg.agents, 1);
+        assert_eq!(cfg.bus_capacity, 128);
+        assert_eq!(cfg.assessment_channel_capacity, 128);
+        assert_eq!(cfg.assessment_quorum, 1);
+        assert_eq!(cfg.decision_threshold, 1.0);
+        assert_eq!(cfg.event_rate_ms, 50);
+        assert!(!cfg.discovery.enabled);
+        assert!(!cfg.update.enabled);
+    }
 }

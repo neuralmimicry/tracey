@@ -1,3 +1,5 @@
+//! Supervisor process for crash restart and zero-downtime binary handoff.
+
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

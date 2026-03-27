@@ -1,3 +1,8 @@
+//! Coordinator logic that aggregates agent assessments into final decisions.
+//!
+//! It also owns governance vote processing, learning snapshot broadcast,
+//! and optional adaptive threshold tuning.
+
 use crate::config::Config;
 use crate::coordination::Coordination;
 use crate::event::{Event, EventKind, Severity, now_ms};
@@ -71,6 +76,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    /// Builds the coordinator with channels, policy, and governance context.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         assessment_rx: mpsc::Receiver<Assessment>,
@@ -115,6 +121,7 @@ impl Coordinator {
         }
     }
 
+    /// Runs coordinator orchestration loops until shutdown.
     pub async fn run(mut self, mut shutdown: ShutdownListener) {
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let mut cleanup_tick = tokio::time::interval(Duration::from_millis(200));

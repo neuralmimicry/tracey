@@ -1,3 +1,5 @@
+//! Online adaptive scoring model with fuzzy Type-n refinement.
+
 use crate::config::FuzzyConfig;
 use crate::event::{Event, EventKind};
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,7 @@ pub struct OnlineStats {
 }
 
 impl OnlineStats {
+    /// Updates running moments using Welford's algorithm.
     pub fn update(&mut self, value: f64) {
         self.count += 1;
         let delta = value - self.mean;
@@ -81,6 +84,7 @@ pub struct AdaptiveScorer {
 }
 
 impl AdaptiveScorer {
+    /// Creates an adaptive scorer keyed by event kind.
     pub fn new(min_samples: u64, fuzzy: FuzzyConfig) -> Self {
         Self {
             stats: HashMap::new(),
@@ -109,6 +113,7 @@ impl AdaptiveScorer {
         LearningSnapshot { stats }
     }
 
+    /// Scores an event and updates per-kind baseline statistics.
     pub fn score_and_update(&mut self, event: &Event) -> Score {
         let (count, mean, stddev) = {
             let stats = self.stats.entry(event.kind).or_default();

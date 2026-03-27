@@ -1,3 +1,6 @@
+//! Embedded/Linux host collectors for CPU, memory, thermal, disk, process,
+//! battery, and optional GPU/Jetson signals.
+
 use crate::bus::EventBus;
 use crate::config::EmbeddedConfig;
 use crate::event::{Event, EventKind, Severity};
@@ -1849,5 +1852,56 @@ async fn collect_iio_power(path: &Path, sensors: &mut Vec<JetsonPowerSensor>) {
                 unit: "microamp".to_string(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_proc_stat_parses_valid_line() {
+        let line = "1234 (my process) S 1 2 3 4 5 6 7 8 9 10 11 12 13";
+        let parsed = parse_proc_stat(line).expect("line should parse");
+        assert_eq!(parsed.0, "my process");
+        assert_eq!(parsed.1, 11);
+        assert_eq!(parsed.2, 12);
+    }
+
+    #[test]
+    fn parse_proc_stat_rejects_invalid_line() {
+        assert!(parse_proc_stat("bad").is_none());
+        assert!(parse_proc_stat("1234 no_parens").is_none());
+    }
+
+    #[test]
+    fn mount_unescape_and_ignore_rules_work() {
+        assert_eq!(unescape_mount("/mnt/data\\040disk"), "/mnt/data disk");
+        assert!(is_ignored_fstype("proc"));
+        assert!(!is_ignored_fstype("ext4"));
+    }
+
+    #[test]
+    fn vendor_and_severity_mappings_are_stable() {
+        assert_eq!(vendor_from_id(Some("0x10de")), "nvidia");
+        assert_eq!(vendor_from_id(Some("0x1002")), "amd");
+        assert_eq!(vendor_from_id(Some("0x8086")), "intel");
+        assert_eq!(vendor_from_id(Some("0x0000")), "unknown");
+
+        assert!(matches!(severity_from_ratio(0.2), Severity::Low));
+        assert!(matches!(severity_from_ratio(0.8), Severity::Medium));
+        assert!(matches!(severity_from_ratio(0.95), Severity::High));
+    }
+
+    #[test]
+    fn rate_bytes_and_track_rate_behave_monotonically() {
+        assert_eq!(rate_bytes(200, 100, 2.0), 50.0);
+        assert_eq!(rate_bytes(50, 100, 2.0), 0.0);
+
+        let mut cache = HashMap::new();
+        let r1 = track_rate(&mut cache, "disk0", 100.0);
+        let r2 = track_rate(&mut cache, "disk0", 50.0);
+        assert!((0.0..=1.0).contains(&r1));
+        assert!((0.0..=1.0).contains(&r2));
     }
 }

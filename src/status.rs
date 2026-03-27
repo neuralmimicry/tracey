@@ -1,10 +1,15 @@
+//! HTTP status/control surface for local and proxied cluster state.
+//!
+//! Includes posture-aware snapshots, TraceyBan summaries, and TraceyGuard
+//! status/control endpoints with optional auth gating.
+
 use crate::auth::AuthGate;
 use crate::coordination::CoordinatorRole;
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -25,12 +30,15 @@ pub struct StatusService {
     pub governance_state: Arc<tokio::sync::RwLock<GovernanceState>>,
     pub client: reqwest::Client,
     pub auth: AuthGate,
-    pub ban_intel: Option<crate::fail2ban::BanIntelHub>,
+    pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
+    pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct StatusSnapshot {
     ts_ms: u64,
+    #[serde(default)]
+    status: Option<String>,
     agent_id: String,
     is_coordinator: bool,
     leader_rank: usize,
@@ -45,11 +53,13 @@ struct StatusSnapshot {
     update_enabled: bool,
     telemetry_enabled: bool,
     discovery_enabled: bool,
-    fail2ban_local_bans: usize,
-    fail2ban_remote_bans: usize,
-    fail2ban_remote_agents: usize,
-    fail2ban_local_entries: Vec<String>,
-    fail2ban_remote_entries: Vec<String>,
+    tracey_ban_local_bans: usize,
+    tracey_ban_remote_bans: usize,
+    tracey_ban_remote_agents: usize,
+    tracey_ban_local_entries: Vec<String>,
+    tracey_ban_remote_entries: Vec<String>,
+    #[serde(default)]
+    tracey_guard: Option<crate::tracey_guard::TraceyGuardStatusSnapshot>,
 }
 
 pub async fn spawn_status(
@@ -61,6 +71,9 @@ pub async fn spawn_status(
         .route("/status", get(status_handler))
         .route("/health", get(status_handler))
         .route("/ready", get(status_handler))
+        .route("/tracey_guard", get(tracey_guard_handler))
+        .route("/tracey_guard/deepdive", get(tracey_guard_handler))
+        .route("/control/tracey_guard", post(tracey_guard_control_handler))
         .with_state(service);
     let listener = match tokio::net::TcpListener::bind(listen_addr).await {
         Ok(listener) => listener,
@@ -111,6 +124,35 @@ async fn status_handler(
     }
 
     Ok(Json(local_snapshot(&service, &role).await))
+}
+
+async fn tracey_guard_handler(
+    State(service): State<StatusService>,
+    headers: HeaderMap,
+) -> Result<Json<crate::tracey_guard::TraceyGuardStatusSnapshot>, StatusCode> {
+    service.auth.authorize_http(&headers).await?;
+    let Some(runtime) = &service.tracey_guard else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(runtime.snapshot().await))
+}
+
+async fn tracey_guard_control_handler(
+    State(service): State<StatusService>,
+    headers: HeaderMap,
+    Json(request): Json<crate::tracey_guard::TraceyGuardControlRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    service.auth.authorize_http(&headers).await?;
+    let Some(runtime) = &service.tracey_guard else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let control = runtime.apply_control(request).await;
+    let snapshot = runtime.snapshot().await;
+    Ok(Json(serde_json::json!({
+        "control": control,
+        "summary": snapshot.summary,
+        "updated_ms": now_ms()
+    })))
 }
 
 async fn forward_to_proxy(
@@ -182,11 +224,18 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     let ban_snapshot = if let Some(ban_intel) = &service.ban_intel {
         ban_intel.snapshot(16).await
     } else {
-        crate::fail2ban::BanStatusSnapshot::default()
+        crate::tracey_ban::BanStatusSnapshot::default()
+    };
+
+    let tracey_guard = if let Some(tracey_guard) = &service.tracey_guard {
+        Some(tracey_guard.snapshot().await)
+    } else {
+        None
     };
 
     StatusSnapshot {
         ts_ms: now_ms(),
+        status: Some(status_for_posture(state.posture)),
         agent_id: service.agent_id.clone(),
         is_coordinator: role.is_coordinator,
         leader_rank: role.leader_rank,
@@ -201,19 +250,30 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         update_enabled: state.update_enabled,
         telemetry_enabled: state.telemetry_enabled,
         discovery_enabled: state.discovery_enabled,
-        fail2ban_local_bans: ban_snapshot.local_ban_count,
-        fail2ban_remote_bans: ban_snapshot.remote_ban_count,
-        fail2ban_remote_agents: ban_snapshot.remote_agents,
-        fail2ban_local_entries: ban_snapshot
+        tracey_ban_local_bans: ban_snapshot.local_ban_count,
+        tracey_ban_remote_bans: ban_snapshot.remote_ban_count,
+        tracey_ban_remote_agents: ban_snapshot.remote_agents,
+        tracey_ban_local_entries: ban_snapshot
             .local_entries
             .into_iter()
             .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
             .collect(),
-        fail2ban_remote_entries: ban_snapshot
+        tracey_ban_remote_entries: ban_snapshot
             .remote_entries
             .into_iter()
             .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
             .collect(),
+        tracey_guard,
+    }
+}
+
+fn status_for_posture(posture: crate::governance::Posture) -> String {
+    match posture {
+        crate::governance::Posture::Relaxed | crate::governance::Posture::Balanced => {
+            "healthy".to_string()
+        }
+        crate::governance::Posture::Strict => "degraded".to_string(),
+        crate::governance::Posture::Lockdown => "offline".to_string(),
     }
 }
 
@@ -285,11 +345,11 @@ mod tests {
             "update_enabled": true,
             "telemetry_enabled": true,
             "discovery_enabled": true,
-            "fail2ban_local_bans": 0,
-            "fail2ban_remote_bans": 0,
-            "fail2ban_remote_agents": 0,
-            "fail2ban_local_entries": [],
-            "fail2ban_remote_entries": []
+            "tracey_ban_local_bans": 0,
+            "tracey_ban_remote_bans": 0,
+            "tracey_ban_remote_agents": 0,
+            "tracey_ban_local_entries": [],
+            "tracey_ban_remote_entries": []
         })
         .to_string();
 
@@ -332,11 +392,11 @@ mod tests {
                 "update_enabled": true,
                 "telemetry_enabled": true,
                 "discovery_enabled": true,
-                "fail2ban_local_bans": 0,
-                "fail2ban_remote_bans": 0,
-                "fail2ban_remote_agents": 0,
-                "fail2ban_local_entries": local_entries,
-                "fail2ban_remote_entries": remote_entries
+                "tracey_ban_local_bans": 0,
+                "tracey_ban_remote_bans": 0,
+                "tracey_ban_remote_agents": 0,
+                "tracey_ban_local_entries": local_entries,
+                "tracey_ban_remote_entries": remote_entries
             })
             .to_string();
 

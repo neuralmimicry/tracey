@@ -1,3 +1,8 @@
+//! Adaptive threshold tuning based on observed alert-rate drift.
+//!
+//! The tuner nudges coordinator decision threshold toward a configured target
+//! over fixed time windows.
+
 use crate::event::now_ms;
 use crate::security::Action;
 use serde::{Deserialize, Serialize};
@@ -46,6 +51,7 @@ pub struct AdaptiveTuner {
 }
 
 impl AdaptiveTuner {
+    /// Initializes tuner state with a starting threshold.
     pub fn new(config: TuningConfig, initial_threshold: f64) -> Self {
         Self {
             window_start: Instant::now(),
@@ -56,6 +62,7 @@ impl AdaptiveTuner {
         }
     }
 
+    /// Observes a coordinator action and emits a threshold update at window end.
     pub fn observe(&mut self, action: Action) -> Option<TuningUpdate> {
         self.total = self.total.saturating_add(1);
         if action.is_alerting() {
@@ -94,7 +101,57 @@ impl AdaptiveTuner {
         Some(update)
     }
 
+    /// Returns the current tuned threshold.
     pub fn threshold(&self) -> f64 {
         self.threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::Action;
+
+    #[test]
+    fn observe_waits_for_window_boundary() {
+        let config = TuningConfig {
+            window_ms: 60_000,
+            ..TuningConfig::default()
+        };
+        let mut tuner = AdaptiveTuner::new(config, 0.7);
+        assert!(tuner.observe(Action::Alert).is_none());
+    }
+
+    #[test]
+    fn observe_adjusts_up_when_alert_rate_exceeds_target() {
+        let config = TuningConfig {
+            window_ms: 0,
+            target_alert_rate: 0.1,
+            adjustment_rate: 0.5,
+            min_threshold: 0.2,
+            max_threshold: 0.95,
+            enabled: true,
+        };
+        let mut tuner = AdaptiveTuner::new(config, 0.5);
+        let update = tuner
+            .observe(Action::Alert)
+            .expect("zero window should emit update");
+        assert!(update.new_threshold > update.old_threshold);
+    }
+
+    #[test]
+    fn observe_clamps_threshold_to_bounds() {
+        let config = TuningConfig {
+            window_ms: 0,
+            target_alert_rate: 0.0,
+            adjustment_rate: 1.0,
+            min_threshold: 0.4,
+            max_threshold: 0.6,
+            enabled: true,
+        };
+        let mut tuner = AdaptiveTuner::new(config, 0.59);
+        let _ = tuner.observe(Action::Shutdown);
+        assert!(tuner.threshold() <= 0.6);
+        assert!(tuner.threshold() >= 0.4);
     }
 }

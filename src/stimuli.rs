@@ -1,3 +1,8 @@
+//! UDP AER bridge that translates between Tracey events and external stimuli.
+//!
+//! Outbound events are encoded as AER frames; inbound frames are decoded into
+//! synthetic `aarnn` source events.
+
 use crate::aer::{AerEvent, decode_events, encode_events};
 use crate::bus::EventBus;
 use crate::config::StimuliConfig;
@@ -264,4 +269,54 @@ fn posture_index(posture: Posture) -> u32 {
 
 fn is_known_aer_addr(addr: u32) -> bool {
     addr_to_kind_severity(addr).is_some() || addr >= AARNN_OUTPUT_BASE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_aer_round_trip_preserves_kind_and_severity() {
+        let event = Event::new(7, "sensor", EventKind::NetworkFlow, 0.6, Severity::Critical);
+        let aer = event_to_aer(&event);
+        let restored = aer_to_event(&aer, "peer-a").expect("AER should map to event");
+        assert_eq!(restored.kind, EventKind::NetworkFlow);
+        assert_eq!(restored.severity, Severity::Critical);
+        assert_eq!(
+            restored.attributes.get("aer_peer").map(String::as_str),
+            Some("peer-a")
+        );
+    }
+
+    #[test]
+    fn posture_events_use_dedicated_address_range() {
+        let relaxed = posture_to_aer(Posture::Relaxed);
+        let lockdown = posture_to_aer(Posture::Lockdown);
+        assert_eq!(relaxed.addr, TRACEY_POSTURE_BASE);
+        assert_eq!(lockdown.addr, TRACEY_POSTURE_BASE + 3);
+    }
+
+    #[test]
+    fn aarnn_output_addresses_attach_output_index() {
+        let aer = AerEvent {
+            ts_us: 0,
+            addr: AARNN_OUTPUT_BASE + 5,
+            value: 127,
+        };
+        let event = aer_to_event(&aer, "peer").expect("event expected");
+        assert_eq!(event.kind, EventKind::Observability);
+        assert_eq!(
+            event
+                .attributes
+                .get("aarnn_output_index")
+                .map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn unknown_low_addresses_are_not_classified() {
+        assert!(addr_to_kind_severity(0x10).is_none());
+        assert!(!is_known_aer_addr(0x10));
+    }
 }

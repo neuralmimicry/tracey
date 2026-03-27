@@ -1,3 +1,7 @@
+//! OTA update staging, signature verification, and supervised handoff.
+//!
+//! Update bundles are verified with keyed BLAKE3 signatures before activation.
+
 use crate::event::now_ms;
 use crate::shutdown::{Shutdown, ShutdownListener};
 use crate::storage::Storage;
@@ -93,6 +97,7 @@ pub struct UpdateManager {
 }
 
 impl UpdateManager {
+    /// Creates an update manager bound to governance and shutdown channels.
     pub fn new(
         config: UpdateConfig,
         shutdown: Shutdown,
@@ -109,6 +114,7 @@ impl UpdateManager {
         }
     }
 
+    /// Runs periodic local/remote update checks until shutdown.
     pub async fn run(mut self) {
         if !self.config.enabled {
             tracing::info!("update manager disabled");
@@ -337,6 +343,7 @@ impl UpdateManager {
     }
 }
 
+/// Writes readiness token for zero-downtime handoff when requested by parent.
 pub async fn signal_handoff_ready() {
     let path = std::env::var("TRACEY_HANDOFF_PATH").ok();
     let token = std::env::var("TRACEY_HANDOFF_TOKEN").ok();
@@ -352,6 +359,7 @@ pub async fn signal_handoff_ready() {
     }
 }
 
+/// CLI helper: signs an update bundle and writes metadata/signature artifacts.
 pub fn run_sign_update(args: &[String]) -> Result<(), String> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Err(sign_usage());
@@ -585,3 +593,77 @@ impl std::fmt::Display for UpdateError {
 }
 
 impl std::error::Error for UpdateError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tracey-update-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            now_ms()
+        ))
+    }
+
+    #[test]
+    fn constant_time_eq_requires_identical_inputs() {
+        assert!(constant_time_eq("abcd", "abcd"));
+        assert!(!constant_time_eq("abcd", "abce"));
+        assert!(!constant_time_eq("abcd", "abc"));
+    }
+
+    #[test]
+    fn join_url_normalizes_slashes() {
+        assert_eq!(
+            join_url("https://updates.example.com/base/", "/tracey.update"),
+            "https://updates.example.com/base/tracey.update"
+        );
+    }
+
+    #[test]
+    fn sign_payload_is_deterministic_for_same_inputs() {
+        let key = derive_key("shared");
+        let a = sign_payload(b"meta", b"bundle", &key);
+        let b = sign_payload(b"meta", b"bundle", &key);
+        let c = sign_payload(b"meta2", b"bundle", &key);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn run_sign_update_writes_expected_files() {
+        let dir = test_dir("sign");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let bundle = dir.join("tracey.bin");
+        std::fs::write(&bundle, b"binary-payload").expect("write bundle");
+
+        let args = vec![
+            "--bundle".to_string(),
+            bundle.display().to_string(),
+            "--version".to_string(),
+            "1.2.3".to_string(),
+            "--out".to_string(),
+            dir.display().to_string(),
+            "--key".to_string(),
+            "test-shared-key".to_string(),
+        ];
+
+        run_sign_update(&args).expect("sign-update should succeed");
+
+        let metadata = dir.join("tracey.update.meta.json");
+        let signature = dir.join("tracey.update.sig");
+        let copied_bundle = dir.join("tracey.update");
+        assert!(metadata.exists());
+        assert!(signature.exists());
+        assert!(copied_bundle.exists());
+
+        let meta_bytes = std::fs::read(&metadata).expect("read metadata");
+        let meta: UpdateMetadata =
+            serde_json::from_slice(&meta_bytes).expect("metadata should parse");
+        assert_eq!(meta.version, "1.2.3");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

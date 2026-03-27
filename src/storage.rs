@@ -1,3 +1,8 @@
+//! Asynchronous JSONL storage pipeline with rotation/compaction primitives.
+//!
+//! Storage persists events and control records while enforcing archive
+//! retention and total-byte budgets.
+
 use crate::assets::HostObservation;
 use crate::config::StorageConfig;
 use crate::discovery::AgentPresence;
@@ -56,6 +61,7 @@ pub struct BanUpdateRecord {
 }
 
 impl Storage {
+    /// Starts storage worker task and returns a producer handle.
     pub async fn new(
         config: StorageConfig,
         mut shutdown: ShutdownListener,
@@ -103,6 +109,7 @@ impl Storage {
         Ok(Self { tx })
     }
 
+    /// Queues an event record.
     pub async fn record_event(&self, event: Event) {
         let _ = self.tx.send(StorageRecord::Event { payload: event }).await;
     }

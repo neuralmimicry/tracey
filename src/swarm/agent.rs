@@ -1,3 +1,5 @@
+//! Swarm agent worker: subscribes to events, scores risk, and emits assessments.
+
 use crate::event::{Event, EventKind, Severity, now_ms};
 use crate::governance::{GovernanceConfig, GovernanceVote, Posture};
 use crate::security::{Action, ActionPolicy};
@@ -56,6 +58,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Constructs an agent worker with independent scorer/governance state.
     pub fn new(
         id: u32,
         receiver: broadcast::Receiver<Event>,
@@ -87,6 +90,7 @@ impl Agent {
         }
     }
 
+    /// Runs the event/learning/directive loop until shutdown.
     pub async fn run(mut self, mut shutdown: ShutdownListener) {
         let mut vote_tick = tokio::time::interval(std::time::Duration::from_millis(
             self.governance_cfg.vote_interval_ms,

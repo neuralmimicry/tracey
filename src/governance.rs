@@ -1,3 +1,8 @@
+//! Swarm governance policy for posture decisions and feature gating.
+//!
+//! Governance translates aggregated votes into runtime mode changes
+//! (threshold, response posture, update/telemetry allowances).
+
 use crate::config::Config;
 use crate::event::now_ms;
 use serde::{Deserialize, Serialize};
@@ -64,6 +69,7 @@ pub enum Posture {
 }
 
 impl Posture {
+    /// Maps mean risk to a posture bucket using configured cutoffs.
     pub fn from_risk(risk: f64, cfg: &GovernanceConfig) -> Self {
         if risk >= cfg.lockdown_risk {
             Posture::Lockdown
@@ -76,6 +82,7 @@ impl Posture {
         }
     }
 
+    /// Deterministic adversarial vote flip used for rebel simulation.
     pub fn rebel_flip(self) -> Self {
         match self {
             Posture::Relaxed => Posture::Lockdown,
@@ -112,6 +119,7 @@ pub struct GovernanceState {
 }
 
 impl GovernanceState {
+    /// Initializes governance state from static config defaults.
     pub fn from_config(cfg: &Config) -> Self {
         let mut state = Self {
             posture: Posture::Balanced,
@@ -132,11 +140,13 @@ impl GovernanceState {
         state
     }
 
+    /// Sets and reapplies base threshold used by posture transforms.
     pub fn set_base_threshold(&mut self, base: f64, cfg: &Config) {
         self.base_decision_threshold = base;
         self.apply_posture(self.posture, cfg);
     }
 
+    /// Applies posture-derived policy toggles.
     pub fn apply_posture(&mut self, posture: Posture, cfg: &Config) {
         self.posture = posture;
 
@@ -175,6 +185,7 @@ pub struct GovernanceUpdate {
 }
 
 impl GovernanceUpdate {
+    /// Creates a governance update stamped with current wall time.
     pub fn new(
         posture: Posture,
         support_ratio: f64,
@@ -188,5 +199,59 @@ impl GovernanceUpdate {
             total_votes,
             reason: reason.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posture_from_risk_respects_thresholds() {
+        let cfg = GovernanceConfig::default();
+        assert_eq!(Posture::from_risk(0.0, &cfg), Posture::Relaxed);
+        assert_eq!(Posture::from_risk(0.5, &cfg), Posture::Balanced);
+        assert_eq!(Posture::from_risk(cfg.strict_risk, &cfg), Posture::Strict);
+        assert_eq!(
+            Posture::from_risk(cfg.lockdown_risk, &cfg),
+            Posture::Lockdown
+        );
+    }
+
+    #[test]
+    fn apply_posture_updates_feature_gates() {
+        let mut cfg = Config::default();
+        cfg.active_response = true;
+        cfg.shutdown_enabled = true;
+        cfg.update.enabled = true;
+        cfg.telemetry.enabled = true;
+        cfg.telemetry.allow_remote = true;
+
+        let mut state = GovernanceState::from_config(&cfg);
+
+        state.apply_posture(Posture::Strict, &cfg);
+        assert!(state.active_response);
+        assert!(!state.shutdown_enabled);
+        assert!(!state.update_enabled);
+        assert!(!state.telemetry_allow_remote);
+
+        state.apply_posture(Posture::Lockdown, &cfg);
+        assert!(state.active_response);
+        assert!(state.shutdown_enabled);
+        assert!(!state.update_enabled);
+
+        state.apply_posture(Posture::Relaxed, &cfg);
+        assert!(!state.active_response);
+        assert!(state.update_enabled);
+        assert!(state.telemetry_allow_remote);
+    }
+
+    #[test]
+    fn set_base_threshold_clamps_resulting_threshold() {
+        let cfg = Config::default();
+        let mut state = GovernanceState::from_config(&cfg);
+        state.apply_posture(Posture::Lockdown, &cfg);
+        state.set_base_threshold(1.5, &cfg);
+        assert!((0.1..=0.99).contains(&state.decision_threshold));
     }
 }
