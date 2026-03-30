@@ -30,6 +30,8 @@ pub struct AgentAnnouncement {
     pub status_addr: Option<String>,
     pub ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
     pub fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
+    #[serde(default)]
+    pub slurm: Option<crate::slurm::SlurmSnapshot>,
     pub capabilities: Capabilities,
     pub signature: String,
     pub is_coordinator: Option<bool>,
@@ -45,6 +47,8 @@ pub struct AgentPresence {
     pub status_addr: Option<String>,
     pub ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
     pub fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
+    #[serde(default)]
+    pub slurm: Option<crate::slurm::SlurmSnapshot>,
     pub capabilities: Capabilities,
     pub source: String,
     pub is_coordinator: Option<bool>,
@@ -62,6 +66,7 @@ pub async fn spawn_discovery(
     coordination: crate::coordination::Coordination,
     status_addr: Option<String>,
     capabilities: Capabilities,
+    slurm: crate::slurm::SlurmRuntimeHandle,
     ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     max_advertised_ips: usize,
     fault_intel: Option<crate::tracey_guard::FaultIntelHub>,
@@ -106,15 +111,22 @@ pub async fn spawn_discovery(
                     } else {
                         None
                     };
+                    let slurm_snapshot = slurm.snapshot().await;
+                    let announcement_capabilities = if let Some(snapshot) = &slurm_snapshot {
+                        capabilities.with_extra_tags(snapshot.capability_tags())
+                    } else {
+                        capabilities.clone()
+                    };
                     let announcement = build_announcement(
                         &agent_id,
                         &config,
-                        &capabilities,
+                        &announcement_capabilities,
                         &shared_key,
                         &role,
                         status_addr.as_deref(),
                         ban_advertisement,
                         fault_advertisement,
+                        slurm_snapshot,
                     );
                     match serde_json::to_vec(&announcement) {
                         Ok(payload) => {
@@ -181,6 +193,7 @@ pub async fn spawn_discovery(
                         status_addr: announcement.status_addr,
                         ban_advertisement: announcement.ban_advertisement.clone(),
                         fault_advertisement: announcement.fault_advertisement.clone(),
+                        slurm: announcement.slurm.clone(),
                         capabilities: announcement.capabilities,
                         source: "gossip".to_string(),
                         is_coordinator: announcement.is_coordinator,
@@ -218,6 +231,7 @@ fn build_announcement(
     status_addr: Option<&str>,
     ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
     fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
+    slurm: Option<crate::slurm::SlurmSnapshot>,
 ) -> AgentAnnouncement {
     let ts_ms = now_ms();
     let addr = config.advertise_addr.clone();
@@ -239,6 +253,7 @@ fn build_announcement(
         status_addr: status_addr.map(|v| v.to_string()),
         ban_advertisement,
         fault_advertisement,
+        slurm,
         capabilities: capabilities.clone(),
         signature,
         is_coordinator: Some(role.is_coordinator),
@@ -339,50 +354,63 @@ fn sanitize_announcement(
     peer: &str,
     now: u64,
 ) {
-    let Some(advertisement) = announcement.ban_advertisement.as_mut() else {
-        return;
-    };
+    if let Some(advertisement) = announcement.ban_advertisement.as_mut() {
+        let original_len = advertisement.entries.len();
+        let mut dropped = 0usize;
+        let mut cleaned = Vec::with_capacity(advertisement.entries.len());
+        for mut entry in advertisement.entries.drain(..) {
+            if entry.jail.trim().is_empty() || entry.jail.len() > MAX_AGENT_ID_LEN {
+                dropped += 1;
+                continue;
+            }
+            let Ok(ip) = entry.ip.parse::<IpAddr>() else {
+                dropped += 1;
+                continue;
+            };
+            entry.ip = ip.to_string();
+            if entry.expires_ms.is_some_and(|expires| expires <= now) {
+                dropped += 1;
+                continue;
+            }
+            cleaned.push(entry);
+            if cleaned.len() >= max_advertised_ips {
+                break;
+            }
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                peer = %peer,
+                agent_id = %announcement.agent_id,
+                dropped_entries = dropped,
+                "discovery ban advertisement contained invalid entries"
+            );
+        }
+        if original_len > max_advertised_ips {
+            tracing::warn!(
+                peer = %peer,
+                agent_id = %announcement.agent_id,
+                received_entries = original_len,
+                max_advertised_ips,
+                "discovery ban advertisement exceeded maximum entries and was truncated"
+            );
+        }
+        advertisement.entries = cleaned;
+    }
 
-    let original_len = advertisement.entries.len();
-    let mut dropped = 0usize;
-    let mut cleaned = Vec::with_capacity(advertisement.entries.len());
-    for mut entry in advertisement.entries.drain(..) {
-        if entry.jail.trim().is_empty() || entry.jail.len() > MAX_AGENT_ID_LEN {
-            dropped += 1;
-            continue;
-        }
-        let Ok(ip) = entry.ip.parse::<IpAddr>() else {
-            dropped += 1;
-            continue;
-        };
-        entry.ip = ip.to_string();
-        if entry.expires_ms.is_some_and(|expires| expires <= now) {
-            dropped += 1;
-            continue;
-        }
-        cleaned.push(entry);
-        if cleaned.len() >= max_advertised_ips {
-            break;
-        }
-    }
-    if dropped > 0 {
+    let drop_slurm = if let Some(snapshot) = announcement.slurm.as_mut() {
+        snapshot.sanitize();
+        snapshot.mode.is_empty() || snapshot.roles.is_empty()
+    } else {
+        false
+    };
+    if drop_slurm {
         tracing::warn!(
             peer = %peer,
             agent_id = %announcement.agent_id,
-            dropped_entries = dropped,
-            "discovery ban advertisement contained invalid entries"
+            "discovery slurm advertisement was invalid and has been dropped"
         );
+        announcement.slurm = None;
     }
-    if original_len > max_advertised_ips {
-        tracing::warn!(
-            peer = %peer,
-            agent_id = %announcement.agent_id,
-            received_entries = original_len,
-            max_advertised_ips,
-            "discovery ban advertisement exceeded maximum entries and was truncated"
-        );
-    }
-    advertisement.entries = cleaned;
 }
 
 fn sanitize_fault_announcement(
@@ -569,6 +597,7 @@ mod tests {
                 ],
             }),
             fault_advertisement: None,
+            slurm: None,
             capabilities: Capabilities {
                 os: "linux".to_string(),
                 arch: "x86_64".to_string(),
@@ -618,6 +647,7 @@ mod tests {
                 status_addr,
                 ban_advertisement: None,
                 fault_advertisement: None,
+                slurm: None,
                 capabilities: Capabilities {
                     os: "linux".to_string(),
                     arch: "x86_64".to_string(),

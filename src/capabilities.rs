@@ -28,6 +28,20 @@ impl Capabilities {
             tags: dedup_tags(tags),
         }
     }
+
+    pub fn with_extra_tags<I>(&self, extra_tags: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut tags = self.tags.clone();
+        tags.extend(extra_tags);
+        Self {
+            os: self.os.clone(),
+            arch: self.arch.clone(),
+            cpu_cores: self.cpu_cores,
+            tags: dedup_tags(tags),
+        }
+    }
 }
 
 fn linux_device_tree_tags() -> Vec<String> {
@@ -171,6 +185,30 @@ mod tests {
                 "jetson".to_string(),
                 "vendor:nvidia".to_string(),
                 "soc:orin".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn with_extra_tags_deduplicates_and_preserves_existing_tags() {
+        let capabilities = Capabilities {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_cores: 8,
+            tags: vec!["jetson".to_string(), "vendor:nvidia".to_string()],
+        };
+        let merged = capabilities.with_extra_tags(vec![
+            "orchestrator:slurm".to_string(),
+            "jetson".to_string(),
+            "slurm:controller".to_string(),
+        ]);
+        assert_eq!(
+            merged.tags,
+            vec![
+                "jetson".to_string(),
+                "vendor:nvidia".to_string(),
+                "orchestrator:slurm".to_string(),
+                "slurm:controller".to_string(),
             ]
         );
     }

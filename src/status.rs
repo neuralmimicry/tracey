@@ -32,6 +32,7 @@ pub struct StatusService {
     pub auth: AuthGate,
     pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
+    pub slurm: crate::slurm::SlurmRuntimeHandle,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +61,8 @@ struct StatusSnapshot {
     tracey_ban_remote_entries: Vec<String>,
     #[serde(default)]
     tracey_guard: Option<crate::tracey_guard::TraceyGuardStatusSnapshot>,
+    #[serde(default)]
+    slurm: Option<crate::slurm::SlurmSnapshot>,
 }
 
 pub async fn spawn_status(
@@ -232,6 +235,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let slurm = service.slurm.snapshot().await;
 
     StatusSnapshot {
         ts_ms: now_ms(),
@@ -264,6 +268,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
             .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
             .collect(),
         tracey_guard,
+        slurm,
     }
 }
 

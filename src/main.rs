@@ -19,6 +19,7 @@ mod refiner_tracking;
 mod security;
 mod sensors;
 mod shutdown;
+mod slurm;
 mod status;
 mod stimuli;
 mod storage;
@@ -113,8 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let auth_system = auth::AuthSystem::from_config(&config.auth);
+    let slurm_runtime = slurm::spawn_slurm_runtime(shutdown_listener.clone()).await;
 
-    let local_capabilities = capabilities::Capabilities::local();
+    let local_capabilities = capabilities::Capabilities::local()
+        .with_extra_tags(slurm_runtime.capability_tags().await);
 
     let coordination = coordination::Coordination::new(
         config.agent_id.clone(),
@@ -199,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     },
                     tracey_guard: Some(tracey_guard.clone()),
+                    slurm: slurm_runtime.clone(),
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));
@@ -289,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discovery_coordination = coordination.clone();
     let discovery_role = coordination_role.clone();
     let discovery_status_addr = status_advertise_addr.clone();
+    let discovery_slurm_runtime = slurm_runtime.clone();
     let discovery_ban_intel = if config.tracey_ban.enabled {
         Some(ban_intel.clone())
     } else {
@@ -308,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery_coordination,
             discovery_status_addr,
             local_capabilities,
+            discovery_slurm_runtime,
             discovery_ban_intel,
             discovery_ban_max,
             Some(discovery_fault_hub),
