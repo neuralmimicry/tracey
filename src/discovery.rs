@@ -5,7 +5,7 @@
 
 use crate::capabilities::Capabilities;
 use crate::config::DiscoveryConfig;
-use crate::coordination::CoordinatorRole;
+use crate::coordination::{CoordinatorRole, PrometheusProbe};
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
 use crate::inventory::Inventory;
@@ -37,6 +37,8 @@ pub struct AgentAnnouncement {
     pub is_coordinator: Option<bool>,
     pub coordinator_epoch: Option<u64>,
     pub score: Option<u64>,
+    #[serde(default)]
+    pub prometheus_probe: Option<PrometheusProbe>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +56,8 @@ pub struct AgentPresence {
     pub is_coordinator: Option<bool>,
     pub coordinator_epoch: Option<u64>,
     pub score: Option<u64>,
+    #[serde(default)]
+    pub prometheus_probe: Option<PrometheusProbe>,
 }
 
 pub async fn spawn_discovery(
@@ -199,6 +203,7 @@ pub async fn spawn_discovery(
                         is_coordinator: announcement.is_coordinator,
                         coordinator_epoch: announcement.coordinator_epoch,
                         score: announcement.score,
+                        prometheus_probe: announcement.prometheus_probe,
                     };
                     if let Some(intel) = &ban_intel
                         && let Some(advertisement) = &presence.ban_advertisement
@@ -259,6 +264,7 @@ fn build_announcement(
         is_coordinator: Some(role.is_coordinator),
         coordinator_epoch: Some(role.epoch),
         score: Some(role.score),
+        prometheus_probe: role.prometheus_probe.clone(),
     }
 }
 
@@ -274,6 +280,12 @@ fn valid_signature(announcement: &AgentAnnouncement, key: &[u8; 32]) -> bool {
         proxy_agent_id: None,
         proxy_latency_ms: None,
         proxy_addr: None,
+        is_prometheus_exporter: false,
+        prometheus_exporter_agent_id: None,
+        prometheus_exporter_addr: None,
+        prometheus_exporter_latency_ms: None,
+        prometheus_exporter_bandwidth_mbps: None,
+        prometheus_probe: announcement.prometheus_probe.clone(),
     };
     let expected = sign_payload(
         &announcement.agent_id,
@@ -330,6 +342,14 @@ fn validate_announcement_semantics(
     }
     for tag in &announcement.capabilities.tags {
         validate_text_field("capability_tag", tag, MAX_TAG_LEN)?;
+    }
+    if let Some(probe) = &announcement.prometheus_probe {
+        if !probe.bandwidth_mbps.is_finite() || probe.bandwidth_mbps < 0.0 {
+            return Err("prometheus_probe.bandwidth_mbps invalid".to_string());
+        }
+        if probe.sampled_at_ms > now.saturating_add(MAX_FUTURE_SKEW_MS) {
+            return Err("prometheus_probe.sampled_at_ms too far in future".to_string());
+        }
     }
     Ok(())
 }
@@ -491,8 +511,14 @@ fn sign_payload(
         .and_then(|advertisement| serde_json::to_vec(advertisement).ok())
         .map(|payload| blake3::hash(&payload).to_hex().to_string())
         .unwrap_or_default();
+    let probe_digest = role
+        .prometheus_probe
+        .as_ref()
+        .and_then(|probe| serde_json::to_vec(probe).ok())
+        .map(|payload| blake3::hash(&payload).to_hex().to_string())
+        .unwrap_or_default();
     let payload = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         agent_id,
         ts_ms,
         addr.unwrap_or(""),
@@ -505,7 +531,8 @@ fn sign_payload(
         role.epoch,
         role.score,
         ban_digest,
-        fault_digest
+        fault_digest,
+        probe_digest
     );
     let hash = blake3::keyed_hash(key, payload.as_bytes());
     to_hex(hash.as_bytes())
@@ -608,6 +635,7 @@ mod tests {
             is_coordinator: Some(false),
             coordinator_epoch: Some(1),
             score: Some(1),
+            prometheus_probe: None,
         };
 
         sanitize_announcement(&mut announcement, 8, "127.0.0.1:12345", now);
@@ -658,6 +686,7 @@ mod tests {
                 is_coordinator: Some(false),
                 coordinator_epoch: Some(0),
                 score: Some(0),
+                prometheus_probe: None,
             };
 
             let _ = validate_announcement_semantics(&announcement, 20_000, now_ms());

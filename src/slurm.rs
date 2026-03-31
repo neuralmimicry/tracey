@@ -210,7 +210,7 @@ async fn detect_podman_context() -> Option<ProbeContext> {
     } else if has_master {
         PODMAN_MASTER_NAME.to_string()
     } else {
-        first_node.clone()? 
+        first_node.clone()?
     };
 
     let mut roles = vec!["host".to_string()];
@@ -227,18 +227,20 @@ async fn detect_podman_context() -> Option<ProbeContext> {
     Some(ProbeContext {
         mode: "podman",
         roles: dedup_strings(roles),
-        command_prefix: vec![
-            "podman".to_string(),
-            "exec".to_string(),
-            exec_target,
-        ],
-        config_hints: PODMAN_CONFIG_HINTS.iter().map(|path| path.to_string()).collect(),
+        command_prefix: vec!["podman".to_string(), "exec".to_string(), exec_target],
+        config_hints: PODMAN_CONFIG_HINTS
+            .iter()
+            .map(|path| path.to_string())
+            .collect(),
     })
 }
 
 fn detect_local_context() -> Option<ProbeContext> {
-    let config_present = LOCAL_CONFIG_HINTS.iter().any(|path| Path::new(path).exists());
-    let env_present = std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("SLURM_"));
+    let config_present = LOCAL_CONFIG_HINTS
+        .iter()
+        .any(|path| Path::new(path).exists());
+    let env_present =
+        std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("SLURM_"));
     let commands_present = path_has_executable("scontrol")
         || path_has_executable("sinfo")
         || path_has_executable("squeue");
@@ -355,7 +357,11 @@ async fn run_string_command(argv: &[String]) -> Option<String> {
 }
 
 fn apply_node_state_lines(snapshot: &mut SlurmSnapshot, output: &str) {
-    for state in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for state in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         snapshot.nodes_total = snapshot.nodes_total.saturating_add(1);
         let normalized = normalize_state(state);
         if normalized == "idle" {
@@ -377,7 +383,11 @@ fn apply_node_state_lines(snapshot: &mut SlurmSnapshot, output: &str) {
 }
 
 fn apply_job_state_lines(snapshot: &mut SlurmSnapshot, output: &str) {
-    for state in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for state in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         snapshot.jobs_total = snapshot.jobs_total.saturating_add(1);
         let normalized = normalize_state(state);
         if normalized == "pending" {
@@ -512,13 +522,17 @@ mod tests {
     #[test]
     fn extract_cluster_name_parses_common_formats() {
         assert_eq!(
-            extract_cluster_name("ClusterName=cluster
-SlurmctldHost=controller"),
+            extract_cluster_name(
+                "ClusterName=cluster
+SlurmctldHost=controller"
+            ),
             Some("cluster".to_string())
         );
         assert_eq!(
-            extract_cluster_name("ClusterName = continuum
-SchedulerType = sched/backfill"),
+            extract_cluster_name(
+                "ClusterName = continuum
+SchedulerType = sched/backfill"
+            ),
             Some("continuum".to_string())
         );
     }
@@ -552,12 +566,15 @@ SchedulerType = sched/backfill"),
     #[test]
     fn node_state_classification_counts_expected_buckets() {
         let mut snapshot = SlurmSnapshot::default();
-        apply_node_state_lines(&mut snapshot, "idle
+        apply_node_state_lines(
+            &mut snapshot,
+            "idle
 alloc
 mixed
 down
 future
-");
+",
+        );
         assert_eq!(snapshot.nodes_total, 5);
         assert_eq!(snapshot.nodes_idle, 1);
         assert_eq!(snapshot.nodes_allocated, 2);
@@ -568,12 +585,15 @@ future
     #[test]
     fn job_state_classification_counts_expected_buckets() {
         let mut snapshot = SlurmSnapshot::default();
-        apply_job_state_lines(&mut snapshot, "PENDING
+        apply_job_state_lines(
+            &mut snapshot,
+            "PENDING
 RUNNING
 COMPLETING
 FAILED
 COMPLETED
-");
+",
+        );
         assert_eq!(snapshot.jobs_total, 5);
         assert_eq!(snapshot.jobs_pending, 1);
         assert_eq!(snapshot.jobs_running, 1);

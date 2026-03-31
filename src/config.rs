@@ -6,6 +6,7 @@
 use crate::security::ActionPolicy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -168,6 +169,42 @@ impl Default for TelemetryConfig {
             prefer_prometheus: true,
             dedup_ttl_ms: 30_000,
             otlp: OtlpReceiverConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrometheusLogExportConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub probe_path: String,
+    pub probe_interval_ms: u64,
+    pub probe_timeout_ms: u64,
+    pub forward_interval_ms: u64,
+    pub batch_ttl_ms: u64,
+    pub max_batch: usize,
+    pub max_queue: usize,
+    pub min_signal: f64,
+    pub min_decision_risk: f64,
+    pub series_ttl_ms: u64,
+}
+
+impl Default for PrometheusLogExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            server_url: "http://prometheus.neuralmimicry.ai".to_string(),
+            probe_path: "/-/ready".to_string(),
+            probe_interval_ms: 5_000,
+            probe_timeout_ms: 1_500,
+            forward_interval_ms: 1_000,
+            batch_ttl_ms: 30_000,
+            max_batch: 64,
+            max_queue: 2_048,
+            min_signal: 0.70,
+            min_decision_risk: 0.70,
+            series_ttl_ms: 86_400_000,
         }
     }
 }
@@ -554,11 +591,13 @@ pub struct Config {
     pub tuning: crate::tuning::TuningConfig,
     pub update: crate::update::UpdateConfig,
     pub telemetry: TelemetryConfig,
+    pub prometheus_log_export: PrometheusLogExportConfig,
     pub embedded: EmbeddedConfig,
     pub tracey_guard: TraceyGuardConfig,
     pub tracey_ban: TraceyBanConfig,
     pub governance: crate::governance::GovernanceConfig,
     pub coordination: CoordinationConfig,
+    pub loader: LoaderConfig,
     pub status: StatusConfig,
     pub stimuli: StimuliConfig,
     pub auth: AuthConfig,
@@ -591,11 +630,13 @@ impl Default for Config {
             tuning: crate::tuning::TuningConfig::default(),
             update: crate::update::UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
+            prometheus_log_export: PrometheusLogExportConfig::default(),
             embedded: EmbeddedConfig::default(),
             tracey_guard: TraceyGuardConfig::default(),
             tracey_ban: TraceyBanConfig::default(),
             governance: crate::governance::GovernanceConfig::default(),
             coordination: CoordinationConfig::default(),
+            loader: LoaderConfig::default(),
             status: StatusConfig::default(),
             stimuli: StimuliConfig::default(),
             auth: AuthConfig::default(),
@@ -697,10 +738,52 @@ impl Config {
         }
         self.update.remote.timeout_ms = self.update.remote.timeout_ms.clamp(1000, 30_000);
 
+        self.loader.announce_interval_ms = self.loader.announce_interval_ms.clamp(200, 60_000);
+        self.loader.sync_interval_ms = self.loader.sync_interval_ms.clamp(500, 120_000);
+        self.loader.ttl_ms = self.loader.ttl_ms.clamp(1000, 120_000);
+        self.loader.request_timeout_ms = self.loader.request_timeout_ms.clamp(500, 30_000);
+        self.loader.handoff_timeout_ms = self.loader.handoff_timeout_ms.clamp(1000, 60_000);
+        self.loader.integrity_check_interval_ms = self
+            .loader
+            .integrity_check_interval_ms
+            .clamp(5_000, 3_600_000);
+        self.loader.rollback_window_ms = self.loader.rollback_window_ms.clamp(1_000, 86_400_000);
+
         self.telemetry.scrape_interval_ms = self.telemetry.scrape_interval_ms.clamp(500, 120_000);
         self.telemetry.max_samples = self.telemetry.max_samples.clamp(10, 10_000);
         self.telemetry.timeout_ms = self.telemetry.timeout_ms.clamp(500, 15_000);
         self.telemetry.dedup_ttl_ms = self.telemetry.dedup_ttl_ms.clamp(1000, 300_000);
+
+        self.prometheus_log_export.probe_interval_ms = self
+            .prometheus_log_export
+            .probe_interval_ms
+            .clamp(500, 300_000);
+        self.prometheus_log_export.probe_timeout_ms = self
+            .prometheus_log_export
+            .probe_timeout_ms
+            .clamp(200, 30_000);
+        self.prometheus_log_export.forward_interval_ms = self
+            .prometheus_log_export
+            .forward_interval_ms
+            .clamp(200, 60_000);
+        self.prometheus_log_export.batch_ttl_ms = self
+            .prometheus_log_export
+            .batch_ttl_ms
+            .clamp(1_000, 300_000);
+        self.prometheus_log_export.max_batch = self.prometheus_log_export.max_batch.clamp(1, 1_024);
+        self.prometheus_log_export.max_queue =
+            self.prometheus_log_export.max_queue.clamp(32, 65_535);
+        self.prometheus_log_export.min_signal =
+            self.prometheus_log_export.min_signal.clamp(0.0, 1.0);
+        self.prometheus_log_export.min_decision_risk =
+            self.prometheus_log_export.min_decision_risk.clamp(0.0, 1.0);
+        self.prometheus_log_export.series_ttl_ms = self
+            .prometheus_log_export
+            .series_ttl_ms
+            .clamp(60_000, 7 * 86_400_000);
+        if self.prometheus_log_export.server_url.trim().is_empty() {
+            self.prometheus_log_export.enabled = false;
+        }
 
         self.embedded.interval_ms = self.embedded.interval_ms.clamp(500, 60_000);
         self.embedded.max_thermals = self.embedded.max_thermals.clamp(1, 64);
@@ -841,11 +924,20 @@ impl Config {
         self.coordination.weight_latency = self.coordination.weight_latency.clamp(0.0, 10.0);
         self.coordination.weight_hash = self.coordination.weight_hash.clamp(0.0, 10.0);
         self.coordination.weight_capability = self.coordination.weight_capability.clamp(0.0, 10.0);
+        self.coordination.weight_prometheus_latency =
+            self.coordination.weight_prometheus_latency.clamp(0.0, 10.0);
+        self.coordination.weight_prometheus_bandwidth = self
+            .coordination
+            .weight_prometheus_bandwidth
+            .clamp(0.0, 10.0);
 
         if self.status.listen_addr.trim().is_empty() {
             self.status.enabled = false;
         }
         self.status.proxy_timeout_ms = self.status.proxy_timeout_ms.clamp(200, 10_000);
+        if !self.status.enabled {
+            self.prometheus_log_export.enabled = false;
+        }
 
         if self.stimuli.listen_addr.trim().is_empty() {
             self.stimuli.enabled = false;
@@ -881,6 +973,24 @@ impl Config {
             env_f64_any(&["TRACEY_FUZZY_SECURITY_WEIGHT", "NM_FUZZY_SECURITY_WEIGHT"])
         {
             self.fuzzy.security_weight = value;
+        }
+
+        if let Some(value) = env_any(&["TRACEY_DISCOVERY_SHARED_KEY", "NM_DISCOVERY_SHARED_KEY"]) {
+            self.discovery.shared_key = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_UPDATE_SHARED_KEY", "NM_UPDATE_SHARED_KEY"]) {
+            self.update.shared_key = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_UPDATE_LOCAL_CHANNEL", "NM_UPDATE_LOCAL_CHANNEL"])
+            && let Ok(channel) = crate::update::UpdateChannel::from_str(&value)
+        {
+            self.update.local_channel = channel;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_LOADER_ROLLBACK_WINDOW_MS",
+            "NM_LOADER_ROLLBACK_WINDOW_MS",
+        ]) {
+            self.loader.rollback_window_ms = value;
         }
 
         if let Some(value) = env_bool_any(&["TRACEY_GUARD_ENABLED", "NM_TRACEY_GUARD_ENABLED"]) {
@@ -1153,6 +1263,24 @@ impl Config {
         ]) {
             self.embedded.gpu_max_devices = value as usize;
         }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_PROMETHEUS_LOG_EXPORT_ENABLED",
+            "NM_PROMETHEUS_LOG_EXPORT_ENABLED",
+        ]) {
+            self.prometheus_log_export.enabled = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_PROMETHEUS_LOG_EXPORT_URL",
+            "NM_PROMETHEUS_LOG_EXPORT_URL",
+        ]) {
+            self.prometheus_log_export.server_url = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_PROMETHEUS_LOG_EXPORT_PROBE_PATH",
+            "NM_PROMETHEUS_LOG_EXPORT_PROBE_PATH",
+        ]) {
+            self.prometheus_log_export.probe_path = value;
+        }
         if let Some(value) = env_bool_any(&["TRACEY_OIDC_PROTECT_STATUS", "NM_OIDC_PROTECT_STATUS"])
         {
             self.auth.protect_status = value;
@@ -1249,6 +1377,8 @@ pub struct CoordinationConfig {
     pub weight_latency: f64,
     pub weight_hash: f64,
     pub weight_capability: f64,
+    pub weight_prometheus_latency: f64,
+    pub weight_prometheus_bandwidth: f64,
 }
 
 impl Default for CoordinationConfig {
@@ -1262,6 +1392,50 @@ impl Default for CoordinationConfig {
             weight_latency: 1.5,
             weight_hash: 0.1,
             weight_capability: 0.5,
+            weight_prometheus_latency: 2.5,
+            weight_prometheus_bandwidth: 1.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoaderConfig {
+    pub enabled: bool,
+    pub state_dir: PathBuf,
+    pub discovery_bind_addr: String,
+    pub discovery_broadcast_addr: String,
+    pub advertise_addr: Option<String>,
+    pub transfer_listen_addr: String,
+    pub transfer_public_addr: Option<String>,
+    pub announce_interval_ms: u64,
+    pub sync_interval_ms: u64,
+    pub ttl_ms: u64,
+    pub request_timeout_ms: u64,
+    pub handoff_timeout_ms: u64,
+    pub integrity_check_interval_ms: u64,
+    pub rollback_window_ms: u64,
+    pub bootstrap_version: Option<String>,
+}
+
+impl Default for LoaderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            state_dir: PathBuf::from("loader"),
+            discovery_bind_addr: "0.0.0.0:47989".to_string(),
+            discovery_broadcast_addr: "255.255.255.255:47989".to_string(),
+            advertise_addr: None,
+            transfer_listen_addr: "0.0.0.0:47988".to_string(),
+            transfer_public_addr: None,
+            announce_interval_ms: 1500,
+            sync_interval_ms: 5000,
+            ttl_ms: 10_000,
+            request_timeout_ms: 3000,
+            handoff_timeout_ms: 10_000,
+            integrity_check_interval_ms: 30_000,
+            rollback_window_ms: 120_000,
+            bootstrap_version: None,
         }
     }
 }

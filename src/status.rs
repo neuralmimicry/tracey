@@ -7,8 +7,10 @@ use crate::auth::AuthGate;
 use crate::coordination::CoordinatorRole;
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,7 @@ pub struct StatusService {
     pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
     pub slurm: crate::slurm::SlurmRuntimeHandle,
+    pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +50,22 @@ struct StatusSnapshot {
     proxy_agent_id: Option<String>,
     proxy_addr: Option<String>,
     proxy_latency_ms: Option<u64>,
+    #[serde(default)]
+    is_prometheus_exporter: bool,
+    #[serde(default)]
+    prometheus_exporter_agent_id: Option<String>,
+    #[serde(default)]
+    prometheus_exporter_addr: Option<String>,
+    #[serde(default)]
+    prometheus_exporter_latency_ms: Option<u64>,
+    #[serde(default)]
+    prometheus_exporter_bandwidth_mbps: Option<f64>,
+    #[serde(default)]
+    local_prometheus_probe_ready: Option<bool>,
+    #[serde(default)]
+    local_prometheus_latency_ms: Option<u64>,
+    #[serde(default)]
+    local_prometheus_bandwidth_mbps: Option<f64>,
     posture: String,
     decision_threshold: f64,
     active_response: bool,
@@ -77,6 +96,8 @@ pub async fn spawn_status(
         .route("/tracey_guard", get(tracey_guard_handler))
         .route("/tracey_guard/deepdive", get(tracey_guard_handler))
         .route("/control/tracey_guard", post(tracey_guard_control_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/prometheus/ingest", post(prometheus_ingest_handler))
         .with_state(service);
     let listener = match tokio::net::TcpListener::bind(listen_addr).await {
         Ok(listener) => listener,
@@ -158,6 +179,36 @@ async fn tracey_guard_control_handler(
     })))
 }
 
+async fn metrics_handler(
+    State(service): State<StatusService>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let Some(export) = &service.prometheus_export else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let body = export.render_metrics().await;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
+async fn prometheus_ingest_handler(
+    State(service): State<StatusService>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let Some(export) = &service.prometheus_export else {
+        return StatusCode::NOT_FOUND;
+    };
+    match export.ingest_http(&headers, &body).await {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(code) => code,
+    }
+}
+
 async fn forward_to_proxy(
     service: &StatusService,
     proxy_addr: &str,
@@ -236,6 +287,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         None
     };
     let slurm = service.slurm.snapshot().await;
+    let local_probe = role.prometheus_probe.clone();
 
     StatusSnapshot {
         ts_ms: now_ms(),
@@ -247,6 +299,14 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         proxy_agent_id: role.proxy_agent_id.clone(),
         proxy_addr: role.proxy_addr.clone(),
         proxy_latency_ms: role.proxy_latency_ms,
+        is_prometheus_exporter: role.is_prometheus_exporter,
+        prometheus_exporter_agent_id: role.prometheus_exporter_agent_id.clone(),
+        prometheus_exporter_addr: role.prometheus_exporter_addr.clone(),
+        prometheus_exporter_latency_ms: role.prometheus_exporter_latency_ms,
+        prometheus_exporter_bandwidth_mbps: role.prometheus_exporter_bandwidth_mbps,
+        local_prometheus_probe_ready: local_probe.as_ref().map(|probe| probe.ready),
+        local_prometheus_latency_ms: local_probe.as_ref().map(|probe| probe.latency_ms),
+        local_prometheus_bandwidth_mbps: local_probe.as_ref().map(|probe| probe.bandwidth_mbps),
         posture: format!("{:?}", state.posture),
         decision_threshold: state.decision_threshold,
         active_response: state.active_response,

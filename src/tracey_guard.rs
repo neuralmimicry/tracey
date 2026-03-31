@@ -4,6 +4,7 @@
 use crate::bus::EventBus;
 use crate::config::{TraceyGuardConfig, TraceyGuardProbeConfig};
 use crate::event::{Event, EventKind, Severity, now_ms};
+use crate::gpu::GpuBackendConfig;
 use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
 use crate::swarm::AdaptiveScorer;
@@ -109,8 +110,15 @@ struct DeviceTelemetryContext {
     power_w: f64,
     util_pct: f64,
     mem_used_ratio: f64,
+    graphics_clock_ratio: f64,
+    memory_clock_ratio: f64,
+    fan_speed_ratio: f64,
+    encoder_util_ratio: f64,
+    decoder_util_ratio: f64,
     thermal_spike_count: u64,
     power_anomaly_count: u64,
+    clock_anomaly_count: u64,
+    codec_pressure_count: u64,
     ecc_error_count: u64,
     last_update_ms: u64,
 }
@@ -635,6 +643,7 @@ impl TraceyGuardRuntimeHandle {
 /// Spawn the TraceyGuard runtime translated into Tracey's async orchestration model.
 pub fn spawn_tracey_guard(
     config: TraceyGuardConfig,
+    gpu_backends: GpuBackendConfig,
     bus: EventBus,
     storage: Storage,
     shutdown: ShutdownListener,
@@ -658,8 +667,17 @@ pub fn spawn_tracey_guard(
     };
 
     tokio::spawn(async move {
-        run_tracey_guard_runtime(config, bus, storage, shutdown, control, snapshot, fault_hub)
-            .await;
+        run_tracey_guard_runtime(
+            config,
+            gpu_backends,
+            bus,
+            storage,
+            shutdown,
+            control,
+            snapshot,
+            fault_hub,
+        )
+        .await;
     });
 
     handle
@@ -667,6 +685,7 @@ pub fn spawn_tracey_guard(
 
 async fn run_tracey_guard_runtime(
     config: TraceyGuardConfig,
+    gpu_backends: GpuBackendConfig,
     bus: EventBus,
     storage: Storage,
     mut shutdown: ShutdownListener,
@@ -676,7 +695,7 @@ async fn run_tracey_guard_runtime(
 ) {
     // Device discovery intentionally supports synthetic fallback so TraceyGuard can
     // still exercise scheduling/fuzzy/correlation logic on CPU-only hosts.
-    let devices = discover_devices(&config).await;
+    let devices = discover_devices(&config, &gpu_backends).await;
     if devices.is_empty() {
         tracing::warn!("tracey_guard runtime found no devices; disabled");
         let mut snap = snapshot.write().await;
@@ -1087,23 +1106,19 @@ async fn refresh_snapshot(
     write.timeline = timeline.iter().cloned().collect();
 }
 
-async fn discover_devices(config: &TraceyGuardConfig) -> Vec<DiscoveredDevice> {
-    let mut out = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir("/sys/class/drm").await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("card") {
-                continue;
-            }
-            if out.len() >= config.max_devices {
-                break;
-            }
-            out.push(DiscoveredDevice {
-                gpu_id: name,
-                sm_count: config.default_sm_count as u32,
-            });
-        }
-    }
+async fn discover_devices(
+    config: &TraceyGuardConfig,
+    gpu_backends: &GpuBackendConfig,
+) -> Vec<DiscoveredDevice> {
+    let mut out: Vec<DiscoveredDevice> = crate::gpu::discover_devices(gpu_backends)
+        .await
+        .into_iter()
+        .take(config.max_devices)
+        .map(|device| DiscoveredDevice {
+            gpu_id: device.id,
+            sm_count: config.default_sm_count as u32,
+        })
+        .collect();
 
     if out.is_empty() {
         for idx in 0..config.synthetic_devices {
@@ -1360,6 +1375,46 @@ fn ingest_telemetry_context(
                 ctx.mem_used_ratio = ratio.clamp(0.0, 1.0);
             }
         }
+        "gpu_clock_graphics_mhz" => {
+            let ratio = event
+                .attributes
+                .get("normalized_ratio")
+                .and_then(|ratio| ratio.parse::<f64>().ok())
+                .unwrap_or_else(|| (value / 3000.0).clamp(0.0, 1.0));
+            ctx.graphics_clock_ratio = ratio.clamp(0.0, 1.0);
+            if ctx.graphics_clock_ratio >= 0.90 {
+                ctx.clock_anomaly_count = ctx.clock_anomaly_count.saturating_add(1);
+            }
+        }
+        "gpu_clock_memory_mhz" => {
+            let ratio = event
+                .attributes
+                .get("normalized_ratio")
+                .and_then(|ratio| ratio.parse::<f64>().ok())
+                .unwrap_or_else(|| (value / 12000.0).clamp(0.0, 1.0));
+            ctx.memory_clock_ratio = ratio.clamp(0.0, 1.0);
+            if ctx.memory_clock_ratio >= 0.90 {
+                ctx.clock_anomaly_count = ctx.clock_anomaly_count.saturating_add(1);
+            }
+        }
+        "gpu_fan_speed_percent" => {
+            ctx.fan_speed_ratio = (value / 100.0).clamp(0.0, 1.0);
+            if ctx.fan_speed_ratio >= 0.85 && ctx.temp_c >= 80.0 {
+                ctx.thermal_spike_count = ctx.thermal_spike_count.saturating_add(1);
+            }
+        }
+        "gpu_encoder_util_percent" => {
+            ctx.encoder_util_ratio = (value / 100.0).clamp(0.0, 1.0);
+            if ctx.encoder_util_ratio >= 0.75 {
+                ctx.codec_pressure_count = ctx.codec_pressure_count.saturating_add(1);
+            }
+        }
+        "gpu_decoder_util_percent" => {
+            ctx.decoder_util_ratio = (value / 100.0).clamp(0.0, 1.0);
+            if ctx.decoder_util_ratio >= 0.75 {
+                ctx.codec_pressure_count = ctx.codec_pressure_count.saturating_add(1);
+            }
+        }
         _ => {
             if metric.contains("ecc") {
                 ctx.ecc_error_count = ctx.ecc_error_count.saturating_add(1);
@@ -1411,6 +1466,26 @@ fn execute_probe_kernel(
     context.insert("temp_c".to_string(), format!("{:.2}", ctx.temp_c));
     context.insert("util_pct".to_string(), format!("{:.2}", ctx.util_pct));
     context.insert("power_w".to_string(), format!("{:.2}", ctx.power_w));
+    context.insert(
+        "graphics_clock_ratio".to_string(),
+        format!("{:.4}", ctx.graphics_clock_ratio),
+    );
+    context.insert(
+        "memory_clock_ratio".to_string(),
+        format!("{:.4}", ctx.memory_clock_ratio),
+    );
+    context.insert(
+        "fan_speed_ratio".to_string(),
+        format!("{:.4}", ctx.fan_speed_ratio),
+    );
+    context.insert(
+        "encoder_util_ratio".to_string(),
+        format!("{:.4}", ctx.encoder_util_ratio),
+    );
+    context.insert(
+        "decoder_util_ratio".to_string(),
+        format!("{:.4}", ctx.decoder_util_ratio),
+    );
 
     ProbeExecution {
         ts_ms,
@@ -1533,16 +1608,31 @@ fn compute_stress(ctx: &DeviceTelemetryContext) -> f64 {
     let power = (ctx.power_w / 350.0).clamp(0.0, 1.0);
     let util = (ctx.util_pct / 100.0).clamp(0.0, 1.0);
     let memory = ctx.mem_used_ratio.clamp(0.0, 1.0);
+    let graphics_clock = ctx.graphics_clock_ratio.clamp(0.0, 1.0);
+    let memory_clock = ctx.memory_clock_ratio.clamp(0.0, 1.0);
+    let fan = ctx.fan_speed_ratio.clamp(0.0, 1.0);
+    let codec = ctx
+        .encoder_util_ratio
+        .max(ctx.decoder_util_ratio)
+        .clamp(0.0, 1.0);
     let thermal_penalty = (ctx.thermal_spike_count as f64 / 20.0).clamp(0.0, 1.0);
     let power_penalty = (ctx.power_anomaly_count as f64 / 20.0).clamp(0.0, 1.0);
+    let clock_penalty = (ctx.clock_anomaly_count as f64 / 20.0).clamp(0.0, 1.0);
+    let codec_penalty = (ctx.codec_pressure_count as f64 / 20.0).clamp(0.0, 1.0);
     let ecc_penalty = (ctx.ecc_error_count as f64 / 5.0).clamp(0.0, 1.0);
 
-    (temp * 0.30
-        + power * 0.20
-        + util * 0.20
+    (temp * 0.22
+        + power * 0.18
+        + util * 0.16
         + memory * 0.10
-        + thermal_penalty * 0.10
-        + power_penalty * 0.05
+        + graphics_clock * 0.08
+        + memory_clock * 0.06
+        + fan * 0.05
+        + codec * 0.03
+        + thermal_penalty * 0.05
+        + power_penalty * 0.03
+        + clock_penalty * 0.02
+        + codec_penalty * 0.02
         + ecc_penalty * 0.05)
         .clamp(0.0, 1.0)
 }
@@ -1898,5 +1988,69 @@ mod tests {
         let no_support = derive_signal(&execution, 0);
         let with_support = derive_signal(&execution, 5);
         assert!(with_support > no_support);
+    }
+
+    #[test]
+    fn ingest_telemetry_context_tracks_revised_gpu_metrics() {
+        let mut telemetry = HashMap::new();
+        let power_event = Event::new(1, "embedded", EventKind::SystemMetric, 0.5, Severity::Low)
+            .with_attr("metric", "gpu_power_w")
+            .with_attr("gpu_id", "nvidia:0")
+            .with_attr("value", "175.000");
+        ingest_telemetry_context(&power_event, &mut telemetry);
+
+        let mem_event = Event::new(2, "embedded", EventKind::SystemMetric, 0.5, Severity::Low)
+            .with_attr("metric", "gpu_mem_used_bytes")
+            .with_attr("gpu_id", "nvidia:0")
+            .with_attr("value", "4096.000")
+            .with_attr("used_ratio", "0.5000");
+        ingest_telemetry_context(&mem_event, &mut telemetry);
+
+        let gfx_clock_event = Event::new(
+            3,
+            "embedded",
+            EventKind::SystemMetric,
+            0.9,
+            Severity::Medium,
+        )
+        .with_attr("metric", "gpu_clock_graphics_mhz")
+        .with_attr("gpu_id", "nvidia:0")
+        .with_attr("value", "2200.000")
+        .with_attr("normalized_ratio", "0.9200");
+        ingest_telemetry_context(&gfx_clock_event, &mut telemetry);
+
+        let fan_event = Event::new(
+            4,
+            "embedded",
+            EventKind::SystemMetric,
+            0.88,
+            Severity::Medium,
+        )
+        .with_attr("metric", "gpu_fan_speed_percent")
+        .with_attr("gpu_id", "nvidia:0")
+        .with_attr("value", "88.000");
+        ingest_telemetry_context(&fan_event, &mut telemetry);
+
+        let encoder_event = Event::new(
+            5,
+            "embedded",
+            EventKind::SystemMetric,
+            0.81,
+            Severity::Medium,
+        )
+        .with_attr("metric", "gpu_encoder_util_percent")
+        .with_attr("gpu_id", "nvidia:0")
+        .with_attr("value", "81.000");
+        ingest_telemetry_context(&encoder_event, &mut telemetry);
+
+        let ctx = telemetry.get("nvidia:0").expect("gpu context should exist");
+        assert_eq!(ctx.power_w, 175.0);
+        assert!((ctx.mem_used_ratio - 0.5).abs() < f64::EPSILON);
+        assert!((ctx.graphics_clock_ratio - 0.92).abs() < f64::EPSILON);
+        assert!((ctx.fan_speed_ratio - 0.88).abs() < f64::EPSILON);
+        assert!((ctx.encoder_util_ratio - 0.81).abs() < f64::EPSILON);
+        assert!(ctx.clock_anomaly_count >= 1);
+        assert!(ctx.codec_pressure_count >= 1);
+        assert!(compute_stress(ctx) > 0.25);
     }
 }

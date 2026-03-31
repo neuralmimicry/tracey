@@ -7,10 +7,56 @@ use crate::shutdown::{Shutdown, ShutdownListener};
 use crate::storage::Storage;
 use crate::supervisor;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Production,
+    Development,
+}
+
+impl UpdateChannel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Development => "development",
+        }
+    }
+
+    pub fn distributable(&self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
+impl Default for UpdateChannel {
+    fn default() -> Self {
+        Self::Production
+    }
+}
+
+impl fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UpdateChannel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "production" | "prod" => Ok(Self::Production),
+            "development" | "dev" => Ok(Self::Development),
+            other => Err(format!("unsupported update channel: {}", other)),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,6 +94,7 @@ pub struct UpdateConfig {
     pub bundle_name: String,
     pub signature_name: String,
     pub metadata_name: String,
+    pub local_channel: UpdateChannel,
     pub shared_key: String,
     pub poll_interval_ms: u64,
     pub handoff_timeout_ms: u64,
@@ -62,6 +109,7 @@ impl Default for UpdateConfig {
             bundle_name: "tracey.update".to_string(),
             signature_name: "tracey.update.sig".to_string(),
             metadata_name: "tracey.update.meta.json".to_string(),
+            local_channel: UpdateChannel::Production,
             shared_key: "tracey-dev-key-change-me".to_string(),
             poll_interval_ms: 5000,
             handoff_timeout_ms: 10_000,
@@ -76,6 +124,8 @@ pub struct UpdateMetadata {
     pub os: String,
     pub arch: String,
     pub blake3: String,
+    #[serde(default)]
+    pub channel: UpdateChannel,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,8 +219,16 @@ impl UpdateManager {
         }
 
         let metadata_bytes = fs::read(&metadata_path).await.map_err(UpdateError::Io)?;
-        let metadata: UpdateMetadata =
-            serde_json::from_slice(&metadata_bytes).map_err(UpdateError::Serde)?;
+        let signature = fs::read_to_string(&signature_path)
+            .await
+            .map_err(UpdateError::Io)?;
+        let bundle_bytes = fs::read(&bundle_path).await.map_err(UpdateError::Io)?;
+        let metadata = verify_signed_artifacts(
+            &metadata_bytes,
+            &bundle_bytes,
+            signature.trim(),
+            &self.config.shared_key,
+        )?;
 
         if metadata.os != std::env::consts::OS || metadata.arch != std::env::consts::ARCH {
             self.record(UpdateRecord {
@@ -185,33 +243,28 @@ impl UpdateManager {
             return Err(UpdateError::Metadata("os/arch mismatch".to_string()));
         }
 
-        let bundle_bytes = fs::read(&bundle_path).await.map_err(UpdateError::Io)?;
-        let computed_hash = blake3::hash(&bundle_bytes);
-        if metadata.blake3 != to_hex(computed_hash.as_bytes()) {
-            return Err(UpdateError::Metadata("bundle hash mismatch".to_string()));
-        }
-
-        let signature = fs::read_to_string(&signature_path)
-            .await
-            .map_err(UpdateError::Io)?;
-        let key = derive_key(&self.config.shared_key);
-        let expected_sig = sign_payload(&metadata_bytes, &bundle_bytes, &key);
-        if !constant_time_eq(signature.trim(), &expected_sig) {
-            return Err(UpdateError::Signature("invalid signature".to_string()));
+        if metadata.channel != self.config.local_channel {
+            self.record(UpdateRecord {
+                ts_ms: now_ms(),
+                status: "ignored".to_string(),
+                detail: format!(
+                    "channel mismatch: local={} incoming={}",
+                    self.config.local_channel, metadata.channel
+                ),
+                version: Some(metadata.version),
+                os: Some(metadata.os),
+                arch: Some(metadata.arch),
+            })
+            .await;
+            return Ok(());
         }
 
         let binary_path = stage_binary(update_dir, &bundle_path).await?;
 
         if std::env::var("TRACEY_SUPERVISED").is_ok() {
-            supervisor::write_update_request(
-                update_dir,
-                &binary_path,
-                &metadata.version,
-                &metadata.os,
-                &metadata.arch,
-            )
-            .await
-            .map_err(UpdateError::Io)?;
+            supervisor::write_update_request(update_dir, &binary_path, &metadata, signature.trim())
+                .await
+                .map_err(UpdateError::Io)?;
 
             archive_update(update_dir, &bundle_path, &signature_path, &metadata_path).await;
             self.record(UpdateRecord {
@@ -343,6 +396,51 @@ impl UpdateManager {
     }
 }
 
+pub(crate) fn build_metadata(
+    version: impl Into<String>,
+    os: impl Into<String>,
+    arch: impl Into<String>,
+    bundle: &[u8],
+    channel: UpdateChannel,
+) -> UpdateMetadata {
+    let hash = blake3::hash(bundle);
+    UpdateMetadata {
+        version: version.into(),
+        os: os.into(),
+        arch: arch.into(),
+        blake3: to_hex(hash.as_bytes()),
+        channel,
+    }
+}
+
+pub(crate) fn serialize_metadata(metadata: &UpdateMetadata) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(metadata)
+}
+
+pub(crate) fn sign_metadata_bytes(metadata: &[u8], bundle: &[u8], shared_key: &str) -> String {
+    let key = derive_key(shared_key);
+    sign_payload(metadata, bundle, &key)
+}
+
+pub(crate) fn verify_signed_artifacts(
+    metadata_bytes: &[u8],
+    bundle_bytes: &[u8],
+    signature: &str,
+    shared_key: &str,
+) -> Result<UpdateMetadata, UpdateError> {
+    let metadata: UpdateMetadata =
+        serde_json::from_slice(metadata_bytes).map_err(UpdateError::Serde)?;
+    let computed_hash = blake3::hash(bundle_bytes);
+    if metadata.blake3 != to_hex(computed_hash.as_bytes()) {
+        return Err(UpdateError::Metadata("bundle hash mismatch".to_string()));
+    }
+    let expected_sig = sign_metadata_bytes(metadata_bytes, bundle_bytes, shared_key);
+    if !constant_time_eq(signature.trim(), &expected_sig) {
+        return Err(UpdateError::Signature("invalid signature".to_string()));
+    }
+    Ok(metadata)
+}
+
 /// Writes readiness token for zero-downtime handoff when requested by parent.
 pub async fn signal_handoff_ready() {
     let path = std::env::var("TRACEY_HANDOFF_PATH").ok();
@@ -371,6 +469,7 @@ pub fn run_sign_update(args: &[String]) -> Result<(), String> {
     let mut arch = None;
     let mut out_dir = None;
     let mut key = None;
+    let mut channel = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -381,6 +480,7 @@ pub fn run_sign_update(args: &[String]) -> Result<(), String> {
             "--arch" => arch = iter.next().cloned(),
             "--out" => out_dir = iter.next().cloned(),
             "--key" => key = iter.next().cloned(),
+            "--channel" => channel = iter.next().cloned(),
             _ => {}
         }
     }
@@ -393,28 +493,25 @@ pub fn run_sign_update(args: &[String]) -> Result<(), String> {
     let key = key
         .or_else(|| std::env::var("TRACEY_UPDATE_KEY").ok())
         .ok_or_else(|| "missing --key or TRACEY_UPDATE_KEY".to_string())?;
+    let channel = channel
+        .map(|value| UpdateChannel::from_str(&value))
+        .transpose()?
+        .unwrap_or(UpdateChannel::Production);
 
     let bundle_path = PathBuf::from(bundle);
     let out_dir = PathBuf::from(out_dir);
     std::fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
 
     let bundle_bytes = std::fs::read(&bundle_path).map_err(|err| err.to_string())?;
-    let hash = blake3::hash(&bundle_bytes);
-    let metadata = UpdateMetadata {
-        version,
-        os,
-        arch,
-        blake3: to_hex(hash.as_bytes()),
-    };
-    let metadata_bytes = serde_json::to_vec(&metadata).map_err(|err| err.to_string())?;
+    let metadata = build_metadata(version, os, arch, &bundle_bytes, channel);
+    let metadata_bytes = serialize_metadata(&metadata).map_err(|err| err.to_string())?;
 
     let metadata_path = out_dir.join("tracey.update.meta.json");
     let signature_path = out_dir.join("tracey.update.sig");
     let bundle_out = out_dir.join("tracey.update");
 
     std::fs::write(&metadata_path, &metadata_bytes).map_err(|err| err.to_string())?;
-    let key = derive_key(&key);
-    let signature = sign_payload(&metadata_bytes, &bundle_bytes, &key);
+    let signature = sign_metadata_bytes(&metadata_bytes, &bundle_bytes, &key);
     std::fs::write(&signature_path, signature.as_bytes()).map_err(|err| err.to_string())?;
     std::fs::copy(&bundle_path, &bundle_out).map_err(|err| err.to_string())?;
 
@@ -456,7 +553,10 @@ async fn wait_for_handoff(path: &Path, token: &str, timeout_ms: u64) -> bool {
     }
 }
 
-async fn stage_binary(update_dir: &Path, bundle_path: &Path) -> Result<PathBuf, UpdateError> {
+pub(crate) async fn stage_binary(
+    update_dir: &Path,
+    bundle_path: &Path,
+) -> Result<PathBuf, UpdateError> {
     let staged = update_dir.join("tracey.next");
     fs::copy(bundle_path, &staged)
         .await
@@ -500,19 +600,19 @@ async fn archive_update(
     .await;
 }
 
-fn sign_payload(metadata: &[u8], bundle: &[u8], key: &[u8; 32]) -> String {
+pub(crate) fn sign_payload(metadata: &[u8], bundle: &[u8], key: &[u8; 32]) -> String {
     let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(metadata);
     hasher.update(bundle);
     to_hex(hasher.finalize().as_bytes())
 }
 
-fn derive_key(shared: &str) -> [u8; 32] {
+pub(crate) fn derive_key(shared: &str) -> [u8; 32] {
     let hash = blake3::hash(shared.as_bytes());
     *hash.as_bytes()
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -522,7 +622,7 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -547,7 +647,7 @@ fn generate_token() -> String {
 fn sign_usage() -> String {
     [
         "Usage:",
-        "  tracey sign-update --bundle <path> --version <v> [--os <os>] [--arch <arch>] [--out <dir>] [--key <key>]",
+        "  tracey sign-update --bundle <path> --version <v> [--os <os>] [--arch <arch>] [--channel production|development] [--out <dir>] [--key <key>]",
         "",
         "Notes:",
         "  --key can be omitted if TRACEY_UPDATE_KEY is set.",
@@ -562,7 +662,7 @@ fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base, path)
 }
 
-async fn write_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }

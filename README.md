@@ -15,9 +15,9 @@ Tracey runs on a non-blocking, multi-threaded async runtime and uses all availab
 - Asset feeds let you report unmanaged hosts from approved telemetry sources (DHCP, DNS, NetFlow, CMDB, etc.).
 - Inventory correlates asset observations with agent presence to flag unmanaged hosts.
 - Optional adaptive tuning keeps alert volumes stable without ML models.
+- A minimal `tracey-loader` can supervise the mutable `tracey` core and redistribute signed production cores between peers.
 - Optional OTA updates let the agent switchover to new code safely (signed bundles + handoff).
 - Optional mTLS update delivery pulls signed bundles from a secured update service.
-- Optional supervisor mode restarts the agent automatically on crash or update.
 - Optional telemetry integration scrapes local Prometheus/OTel metrics endpoints and feeds them into the swarm.
 - Optional embedded collectors read `/proc` and `/sys` for CPU, memory, thermal, disk, and network signals, with Jetson add-ons when available.
 
@@ -41,6 +41,12 @@ cargo run
 ```
 
 Tracey writes JSONL records to `tracey.log.jsonl` by default.
+
+Run the supervised loader entrypoint with:
+
+```bash
+cargo run --bin tracey-loader
+```
 
 ## Configuration
 
@@ -107,6 +113,7 @@ Example:
     "bundle_name": "tracey.update",
     "signature_name": "tracey.update.sig",
     "metadata_name": "tracey.update.meta.json",
+    "local_channel": "production",
     "shared_key": "rotate-this-key",
     "poll_interval_ms": 5000,
     "handoff_timeout_ms": 10000,
@@ -120,6 +127,14 @@ Example:
       "client_identity_path": "certs/client.pem",
       "timeout_ms": 8000
     }
+  },
+  "loader": {
+    "enabled": true,
+    "state_dir": "loader",
+    "discovery_bind_addr": "0.0.0.0:47989",
+    "discovery_broadcast_addr": "255.255.255.255:47989",
+    "transfer_listen_addr": "0.0.0.0:47988",
+    "rollback_window_ms": 120000
   },
   "telemetry": {
     "enabled": true,
@@ -420,7 +435,8 @@ Metadata format:
   "version": "0.2.0",
   "os": "linux",
   "arch": "x86_64",
-  "blake3": "<hex of blake3(binary)>"
+  "blake3": "<hex of blake3(binary)>",
+  "channel": "production"
 }
 ```
 
@@ -435,14 +451,63 @@ When `update.remote.enabled` is true, Tracey downloads the bundle/metadata/signa
 ### Sign Updates Offline
 
 ```bash
-tracey sign-update --bundle ./tracey-new --version 0.2.0 --os linux --arch x86_64 --out updates --key "<shared_key>"
+tracey sign-update --bundle ./tracey-new --version 0.2.0 --os linux --arch x86_64 --channel production --out updates --key "<shared_key>"
 ```
 
 This produces `tracey.update`, `tracey.update.meta.json`, and `tracey.update.sig` in `updates/`.
 
-### Supervisor Mode
+### Loader/Core Split
 
-Run Tracey with `--supervisor` to enable a lightweight watchdog that restarts the agent if it exits. In supervisor mode, OTA updates use a zero-downtime handoff: the supervisor starts the new binary, waits for readiness, then shuts down the old process.
+`tracey-loader` is the durable background service. It keeps a small self-integrity manifest, runs the mutable `tracey` core, and performs zero-downtime handoffs for both local OTA staging and peer-to-peer production rollouts.
+
+Peer rollouts follow these rules:
+
+- loaders only advertise same-OS/arch core metadata and transfer endpoints over authenticated UDP gossip
+- only production cores are redistributed automatically
+- a host configured with `update.local_channel = "development"` will not overwrite its local core with production code and will not serve its core to peers
+- if a peer advertises a newer production core for the same OS/arch, the loader fetches the signed bundle, verifies it locally, and hands over to it without stopping the service
+- newly activated cores stay in a rollback probation window (`loader.rollback_window_ms`) and are not redistributed until they survive that window
+- if a newly received core fails to load or crashes during the probation window, the loader restores the previous signed core automatically
+
+The legacy `tracey --supervisor` entrypoint still exists, but `tracey-loader` is the recommended service mode.
+
+### Service Installation (systemd)
+
+On Linux systems running systemd, use the installer script to install Tracey as a background service. The script installs `tracey-loader` as the service entrypoint, seeds the mutable core into the writable service state tree, creates a stable config with an explicit `agent_id`, writes a systemd unit, and enables the service.
+
+Default install:
+
+```bash
+./scripts/install-service.sh
+```
+
+`--scope auto` now prefers a system service so Tracey starts at boot under `multi-user.target`. If the installer is not already running as root, it will request `sudo` for the privileged install steps.
+When installing system scope, the installer will also disable a conflicting `systemctl --user` Tracey service for the current user so the default loader ports are not double-bound.
+
+System service:
+
+```bash
+sudo ./scripts/install-service.sh
+```
+
+User service:
+
+```bash
+./scripts/install-service.sh --scope user
+```
+
+Preview without changing the host:
+
+```bash
+./scripts/install-service.sh --dry-run
+```
+
+By default the installer writes:
+
+- system scope: `/usr/local/bin/tracey-loader`, `/etc/tracey/tracey.json`, `/var/lib/tracey/loader/current/tracey-core`, `/etc/systemd/system/tracey.service`
+- user scope: `~/.local/bin/tracey-loader`, `~/.config/tracey/tracey.json`, `~/.local/state/tracey/loader/current/tracey-core`, `~/.config/systemd/user/tracey.service`
+
+Override paths with `--core-binary`, `--loader-binary`, `--loader-install-path`, `--core-install-path`, `--config`, `--state-dir`, `--unit-path`, and `--env-file`.
 
 ### Telemetry Integration (Prometheus + OTLP)
 

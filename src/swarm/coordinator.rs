@@ -18,7 +18,7 @@ use crate::tuning::AdaptiveTuner;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
@@ -42,6 +42,7 @@ pub struct DecisionTelemetry {
     pub mean_interval_width: f64,
     pub mean_edge_membership: f64,
     pub mean_security_context: f64,
+    pub mean_metric_context: f64,
     pub mean_aarnn_context: f64,
     pub mean_learned_confidence: f64,
 }
@@ -65,6 +66,7 @@ pub struct Coordinator {
     learning_broadcast: Duration,
     directive_broadcast: Duration,
     storage: Storage,
+    decision_tap: broadcast::Sender<Decision>,
     global_scorer: AdaptiveScorer,
     rolling_risk: HashMap<EventKind, f64>,
     tuner: Option<AdaptiveTuner>,
@@ -92,6 +94,7 @@ impl Coordinator {
         learning_broadcast: Duration,
         directive_broadcast: Duration,
         storage: Storage,
+        decision_tap: broadcast::Sender<Decision>,
         global_scorer: AdaptiveScorer,
         tuner: Option<AdaptiveTuner>,
         governance_cfg: GovernanceConfig,
@@ -110,6 +113,7 @@ impl Coordinator {
             learning_broadcast,
             directive_broadcast,
             storage,
+            decision_tap,
             global_scorer,
             rolling_risk: HashMap::new(),
             tuner,
@@ -232,6 +236,7 @@ impl Coordinator {
         let mut interval_width_sum = 0.0;
         let mut edge_sum = 0.0;
         let mut security_sum = 0.0;
+        let mut metric_sum = 0.0;
         let mut aarnn_sum = 0.0;
         let mut learned_confidence_sum = 0.0;
         let mut fuzzy_order = 0u8;
@@ -244,6 +249,7 @@ impl Coordinator {
             interval_width_sum += assessment.telemetry.interval_width;
             edge_sum += assessment.telemetry.edge_membership;
             security_sum += assessment.telemetry.security_context;
+            metric_sum += assessment.telemetry.metric_context;
             aarnn_sum += assessment.telemetry.aarnn_context;
             learned_confidence_sum += assessment.telemetry.learned_confidence;
             fuzzy_order = fuzzy_order.max(assessment.telemetry.order);
@@ -258,6 +264,7 @@ impl Coordinator {
             mean_interval_width: interval_width_sum / agents as f64,
             mean_edge_membership: edge_sum / agents as f64,
             mean_security_context: security_sum / agents as f64,
+            mean_metric_context: metric_sum / agents as f64,
             mean_aarnn_context: aarnn_sum / agents as f64,
             mean_learned_confidence: learned_confidence_sum / agents as f64,
         };
@@ -295,6 +302,7 @@ impl Coordinator {
         };
 
         self.storage.record_decision(decision.clone()).await;
+        let _ = self.decision_tap.send(decision.clone());
         self.update_learning(pending.kind, pending.severity, mean_signal)
             .await;
         self.update_directive_scores(pending.kind, mean_risk);
@@ -481,12 +489,13 @@ fn build_reason(
     kind: EventKind,
 ) -> String {
     format!(
-        "risk={:.2} confidence={:.2} core={:.2} uncertainty={:.2} sec={:.2} aarnn={:.2} order={} agents={}/{} action={:?} kind={:?}",
+        "risk={:.2} confidence={:.2} core={:.2} uncertainty={:.2} sec={:.2} metric={:.2} aarnn={:.2} order={} agents={}/{} action={:?} kind={:?}",
         mean_risk,
         mean_confidence,
         telemetry.mean_core_risk,
         telemetry.mean_interval_width,
         telemetry.mean_security_context,
+        telemetry.mean_metric_context,
         telemetry.mean_aarnn_context,
         telemetry.fuzzy_order,
         agents,

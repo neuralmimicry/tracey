@@ -14,6 +14,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PrometheusProbe {
+    pub ready: bool,
+    pub latency_ms: u64,
+    pub bandwidth_mbps: f64,
+    pub sampled_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorRole {
     pub agent_id: String,
@@ -26,6 +34,18 @@ pub struct CoordinatorRole {
     pub proxy_agent_id: Option<String>,
     pub proxy_latency_ms: Option<u64>,
     pub proxy_addr: Option<String>,
+    #[serde(default)]
+    pub is_prometheus_exporter: bool,
+    #[serde(default)]
+    pub prometheus_exporter_agent_id: Option<String>,
+    #[serde(default)]
+    pub prometheus_exporter_addr: Option<String>,
+    #[serde(default)]
+    pub prometheus_exporter_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub prometheus_exporter_bandwidth_mbps: Option<f64>,
+    #[serde(default)]
+    pub prometheus_probe: Option<PrometheusProbe>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +59,7 @@ pub struct PresenceRecord {
     pub is_coordinator: bool,
     pub epoch: u64,
     pub last_seen_ms: u64,
+    pub prometheus_probe: Option<PrometheusProbe>,
 }
 
 #[derive(Clone)]
@@ -47,6 +68,7 @@ pub struct Coordination {
     role: Arc<RwLock<CoordinatorRole>>,
     presence: Arc<RwLock<HashMap<String, PresenceRecord>>>,
     local_capabilities: Capabilities,
+    local_prometheus_probe: Arc<RwLock<Option<PrometheusProbe>>>,
 }
 
 impl Coordination {
@@ -69,12 +91,19 @@ impl Coordination {
             proxy_agent_id: None,
             proxy_latency_ms: None,
             proxy_addr: None,
+            is_prometheus_exporter: false,
+            prometheus_exporter_agent_id: None,
+            prometheus_exporter_addr: None,
+            prometheus_exporter_latency_ms: None,
+            prometheus_exporter_bandwidth_mbps: None,
+            prometheus_probe: None,
         };
         Self {
             config,
             role: Arc::new(RwLock::new(role)),
             presence: Arc::new(RwLock::new(HashMap::new())),
             local_capabilities,
+            local_prometheus_probe: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -86,6 +115,17 @@ impl Coordination {
     #[allow(dead_code)]
     pub async fn proxy_agent(&self) -> Option<String> {
         self.role.read().await.proxy_agent_id.clone()
+    }
+
+    pub async fn update_prometheus_probe(&self, probe: Option<PrometheusProbe>) {
+        *self.local_prometheus_probe.write().await = probe.clone();
+        let now = now_ms();
+        let local = self.role.read().await.clone();
+        let mut map = self.presence.write().await;
+        if let Some(entry) = map.get_mut(&local.agent_id) {
+            entry.prometheus_probe = probe;
+            entry.last_seen_ms = now;
+        }
     }
 
     /// Updates presence cache with a gossip announcement.
@@ -105,6 +145,7 @@ impl Coordination {
                 is_coordinator: presence.is_coordinator.unwrap_or(false),
                 epoch: presence.coordinator_epoch.unwrap_or(0),
                 last_seen_ms: seen,
+                prometheus_probe: presence.prometheus_probe,
             },
         );
     }
@@ -140,6 +181,7 @@ impl Coordination {
         map.retain(|_, record| now.saturating_sub(record.last_seen_ms) <= ttl);
 
         let local = self.role.read().await.clone();
+        let local_probe = self.local_prometheus_probe.read().await.clone();
         map.entry(local.agent_id.clone()).or_insert(PresenceRecord {
             agent_id: local.agent_id.clone(),
             score: local.score,
@@ -150,7 +192,12 @@ impl Coordination {
             is_coordinator: local.is_coordinator,
             epoch: local.epoch,
             last_seen_ms: now,
+            prometheus_probe: local_probe.clone(),
         });
+        if let Some(entry) = map.get_mut(&local.agent_id) {
+            entry.prometheus_probe = local_probe.clone();
+            entry.last_seen_ms = now;
+        }
 
         let coordinator_count = map.values().filter(|record| record.is_coordinator).count();
         if coordinator_count == 0 {
@@ -183,6 +230,7 @@ impl Coordination {
             .unwrap_or(usize::MAX);
 
         let proxy = select_proxy(&candidates, &leaders);
+        let exporter = select_prometheus_exporter(&candidates, &self.config);
 
         let mut role = self.role.write().await;
         if role.is_coordinator != should_lead {
@@ -201,11 +249,24 @@ impl Coordination {
         role.proxy_agent_id = proxy.map(|entry| entry.agent_id.clone());
         role.proxy_latency_ms = proxy.map(|entry| entry.latency_ms);
         role.proxy_addr = proxy.and_then(|entry| entry.status_addr.clone());
+        role.is_prometheus_exporter = exporter
+            .map(|entry| entry.agent_id == role.agent_id)
+            .unwrap_or(false);
+        role.prometheus_exporter_agent_id = exporter.map(|entry| entry.agent_id.clone());
+        role.prometheus_exporter_addr = exporter.and_then(|entry| entry.status_addr.clone());
+        role.prometheus_exporter_latency_ms = exporter
+            .and_then(|entry| entry.prometheus_probe.as_ref())
+            .map(|probe| probe.latency_ms);
+        role.prometheus_exporter_bandwidth_mbps = exporter
+            .and_then(|entry| entry.prometheus_probe.as_ref())
+            .map(|probe| probe.bandwidth_mbps);
+        role.prometheus_probe = local_probe;
 
         if let Some(entry) = map.get_mut(&role.agent_id) {
             entry.is_coordinator = role.is_coordinator;
             entry.epoch = role.epoch;
             entry.last_seen_ms = now;
+            entry.prometheus_probe = role.prometheus_probe.clone();
         }
     }
 }
@@ -262,6 +323,48 @@ fn soc_weight(soc: &str) -> f64 {
     }
 }
 
+fn select_prometheus_exporter<'a>(
+    all: &'a [(f64, &'a PresenceRecord)],
+    config: &CoordinationConfig,
+) -> Option<&'a PresenceRecord> {
+    let mut candidates: Vec<(bool, f64, &'a PresenceRecord)> = all
+        .iter()
+        .map(|(_, record)| {
+            let ready = record
+                .prometheus_probe
+                .as_ref()
+                .map(|probe| probe.ready)
+                .unwrap_or(false);
+            let score = if ready {
+                prometheus_export_score(record, config)
+            } else {
+                weighted_score(record, config)
+            };
+            (ready, score, *record)
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.2.agent_id.cmp(&b.2.agent_id))
+    });
+    candidates.first().map(|(_, _, record)| *record)
+}
+
+fn prometheus_export_score(record: &PresenceRecord, config: &CoordinationConfig) -> f64 {
+    let Some(probe) = record.prometheus_probe.as_ref() else {
+        return f64::MIN;
+    };
+    if !probe.ready {
+        return f64::MIN;
+    }
+    let latency_score = 1_000_000f64 / (1.0 + probe.latency_ms as f64);
+    let bandwidth_score = (probe.bandwidth_mbps.max(0.0).ln_1p() * 100_000.0).max(0.0);
+    latency_score * config.weight_prometheus_latency
+        + bandwidth_score * config.weight_prometheus_bandwidth
+        + weighted_score(record, config) * 0.05
+}
+
 fn select_proxy<'a>(
     all: &'a [(f64, &'a PresenceRecord)],
     leaders: &'a [(f64, &'a PresenceRecord)],
@@ -288,6 +391,7 @@ mod tests {
             is_coordinator: false,
             epoch: 1,
             last_seen_ms: now_ms(),
+            prometheus_probe: None,
         }
     }
 
@@ -333,5 +437,28 @@ mod tests {
         let leaders = vec![(0.9, &a), (0.8, &b)];
         let proxy = select_proxy(&all, &leaders).expect("proxy should exist");
         assert_eq!(proxy.agent_id, "b");
+    }
+
+    #[test]
+    fn prometheus_exporter_prefers_ready_low_latency_high_bandwidth_probe() {
+        let mut fast = mk_record("fast", 20, vec![]);
+        fast.prometheus_probe = Some(PrometheusProbe {
+            ready: true,
+            latency_ms: 4,
+            bandwidth_mbps: 80.0,
+            sampled_at_ms: now_ms(),
+        });
+        let mut slow = mk_record("slow", 4, vec![]);
+        slow.prometheus_probe = Some(PrometheusProbe {
+            ready: true,
+            latency_ms: 25,
+            bandwidth_mbps: 10.0,
+            sampled_at_ms: now_ms(),
+        });
+        let cfg = CoordinationConfig::default();
+        let all = vec![(0.6, &slow), (0.4, &fast)];
+        let exporter =
+            select_prometheus_exporter(&all, &cfg).expect("exporter candidate should exist");
+        assert_eq!(exporter.agent_id, "fast");
     }
 }

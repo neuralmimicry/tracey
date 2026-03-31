@@ -1,6 +1,7 @@
 //! Supervisor process for crash restart and zero-downtime binary handoff.
 
 use crate::config::Config;
+use crate::update::{self, UpdateChannel, UpdateMetadata};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -8,17 +9,41 @@ use tokio::fs;
 use tokio::process::{Child, Command};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SupervisorRequest {
-    binary_path: String,
-    version: String,
-    os: String,
-    arch: String,
+pub struct SupervisorRequest {
+    pub binary_path: String,
+    pub version: String,
+    pub os: String,
+    pub arch: String,
+    #[serde(default)]
+    pub channel: UpdateChannel,
+    #[serde(default)]
+    pub blake3: String,
+    #[serde(default)]
+    pub signature: String,
 }
 
-struct ManagedChild {
-    child: Child,
-    shutdown_path: PathBuf,
-    shutdown_token: String,
+impl SupervisorRequest {
+    pub fn metadata(&self) -> Option<UpdateMetadata> {
+        if self.version.trim().is_empty()
+            || self.os.trim().is_empty()
+            || self.arch.trim().is_empty()
+        {
+            return None;
+        }
+        Some(UpdateMetadata {
+            version: self.version.clone(),
+            os: self.os.clone(),
+            arch: self.arch.clone(),
+            blake3: self.blake3.clone(),
+            channel: self.channel.clone(),
+        })
+    }
+}
+
+pub(crate) struct ManagedChild {
+    pub child: Child,
+    pub shutdown_path: PathBuf,
+    pub shutdown_token: String,
 }
 
 pub async fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,8 +69,8 @@ pub async fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(code = ?status.ok().and_then(|s| s.code()), "agent exited; restarting");
 
                 if let Some(next) = read_update_request(&update_dir).await {
-                    tracing::info!(next = %next.display(), "supervisor switching to updated binary");
-                    current_binary = next;
+                    tracing::info!(next = %next.binary_path, "supervisor switching to updated binary");
+                    current_binary = PathBuf::from(next.binary_path);
                     backoff = Duration::from_millis(250);
                 }
 
@@ -61,11 +86,12 @@ pub async fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = tick.tick() => {
                 if let Some(next) = read_update_request(&update_dir).await {
-                    tracing::info!(next = %next.display(), "supervisor applying zero-downtime update");
-                    match perform_handoff(&mut child, &next, &args, &update_dir, handoff_timeout).await {
+                    tracing::info!(next = %next.binary_path, "supervisor applying zero-downtime update");
+                    let next_binary = PathBuf::from(&next.binary_path);
+                    match perform_handoff(&mut child, &next_binary, &args, &update_dir, handoff_timeout).await {
                         Ok(new_child) => {
                             child = new_child;
-                            current_binary = next;
+                            current_binary = next_binary;
                             backoff = Duration::from_millis(250);
                         }
                         Err(err) => {
@@ -78,21 +104,47 @@ pub async fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn perform_handoff(
+pub(crate) async fn perform_handoff(
     current: &mut ManagedChild,
     next_binary: &Path,
     args: &[String],
     update_dir: &Path,
     timeout: Duration,
 ) -> Result<ManagedChild, std::io::Error> {
+    perform_handoff_with_env(
+        current,
+        next_binary,
+        args,
+        update_dir,
+        timeout,
+        &[],
+        None,
+        "supervisor",
+    )
+    .await
+}
+
+pub(crate) async fn perform_handoff_with_env(
+    current: &mut ManagedChild,
+    next_binary: &Path,
+    args: &[String],
+    update_dir: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+    current_dir: Option<&Path>,
+    updated_from: &str,
+) -> Result<ManagedChild, std::io::Error> {
     let handoff_token = generate_token();
     let handoff_path = update_dir.join(format!("handoff-{}.ready", handoff_token));
 
-    let mut next = spawn_child(
+    let mut next = spawn_child_with_env(
         next_binary,
         args,
         update_dir,
         Some((handoff_path.clone(), handoff_token.clone())),
+        extra_env,
+        current_dir,
+        updated_from,
     )
     .await?;
 
@@ -115,11 +167,23 @@ async fn perform_handoff(
     Ok(next)
 }
 
-async fn spawn_child(
+pub(crate) async fn spawn_child(
     binary: &Path,
     args: &[String],
     update_dir: &Path,
     handoff: Option<(PathBuf, String)>,
+) -> std::io::Result<ManagedChild> {
+    spawn_child_with_env(binary, args, update_dir, handoff, &[], None, "supervisor").await
+}
+
+pub(crate) async fn spawn_child_with_env(
+    binary: &Path,
+    args: &[String],
+    update_dir: &Path,
+    handoff: Option<(PathBuf, String)>,
+    extra_env: &[(String, String)],
+    current_dir: Option<&Path>,
+    updated_from: &str,
 ) -> std::io::Result<ManagedChild> {
     let shutdown_token = generate_token();
     let shutdown_path = update_dir.join(format!("shutdown-{}.token", shutdown_token));
@@ -130,11 +194,18 @@ async fn spawn_child(
         .env("TRACEY_SHUTDOWN_PATH", &shutdown_path)
         .env("TRACEY_SHUTDOWN_TOKEN", &shutdown_token);
 
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
     if let Some((handoff_path, handoff_token)) = handoff {
         command
             .env("TRACEY_HANDOFF_PATH", handoff_path)
             .env("TRACEY_HANDOFF_TOKEN", handoff_token)
-            .env("TRACEY_UPDATED_FROM", "supervisor");
+            .env("TRACEY_UPDATED_FROM", updated_from);
     }
 
     let child = command.spawn()?;
@@ -146,11 +217,11 @@ async fn spawn_child(
     })
 }
 
-async fn request_shutdown(path: &Path, token: &str) {
+pub(crate) async fn request_shutdown(path: &Path, token: &str) {
     let _ = fs::write(path, token.as_bytes()).await;
 }
 
-async fn wait_for_handoff(path: &Path, token: &str, timeout: Duration) -> bool {
+pub(crate) async fn wait_for_handoff(path: &Path, token: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
@@ -166,7 +237,7 @@ async fn wait_for_handoff(path: &Path, token: &str, timeout: Duration) -> bool {
     }
 }
 
-async fn read_update_request(update_dir: &Path) -> Option<PathBuf> {
+pub(crate) async fn read_update_request(update_dir: &Path) -> Option<SupervisorRequest> {
     let request_path = update_dir.join("tracey.supervisor.request.json");
     let raw = fs::read(&request_path).await.ok()?;
     let request: SupervisorRequest = serde_json::from_slice(&raw).ok()?;
@@ -174,35 +245,28 @@ async fn read_update_request(update_dir: &Path) -> Option<PathBuf> {
     if request.binary_path.is_empty() {
         return None;
     }
-    Some(PathBuf::from(request.binary_path))
+    Some(request)
 }
 
 pub async fn write_update_request(
     update_dir: &Path,
     binary_path: &Path,
-    version: &str,
-    os: &str,
-    arch: &str,
+    metadata: &UpdateMetadata,
+    signature: &str,
 ) -> std::io::Result<()> {
     let request = SupervisorRequest {
         binary_path: binary_path.display().to_string(),
-        version: version.to_string(),
-        os: os.to_string(),
-        arch: arch.to_string(),
+        version: metadata.version.clone(),
+        os: metadata.os.clone(),
+        arch: metadata.arch.clone(),
+        channel: metadata.channel.clone(),
+        blake3: metadata.blake3.clone(),
+        signature: signature.to_string(),
     };
     let payload = serde_json::to_vec(&request)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     let request_path = update_dir.join("tracey.supervisor.request.json");
-    write_atomic(&request_path, &payload).await
-}
-
-async fn write_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload).await?;
-    fs::rename(tmp, path).await
+    update::write_atomic(&request_path, &payload).await
 }
 
 fn generate_token() -> String {
@@ -216,15 +280,5 @@ fn generate_token() -> String {
         std::thread::current().id()
     );
     let hash = blake3::hash(seed.as_bytes());
-    to_hex(hash.as_bytes())
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(LUT[(b >> 4) as usize] as char);
-        out.push(LUT[(b & 0x0f) as usize] as char);
-    }
-    out
+    update::to_hex(hash.as_bytes())
 }

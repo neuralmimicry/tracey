@@ -69,6 +69,7 @@ pub struct FuzzyTelemetry {
     pub interval_width: f64,
     pub edge_membership: f64,
     pub security_context: f64,
+    pub metric_context: f64,
     pub aarnn_context: f64,
     pub learned_confidence: f64,
 }
@@ -133,6 +134,7 @@ impl AdaptiveScorer {
         let edge_membership = triangle(z_abs, 0.55, 1.45, 2.45).max(delta_membership * 0.6);
         let severity_membership = ((event.severity.weight() - 0.7) / 0.6).clamp(0.0, 1.0);
         let security_membership = security_context(event);
+        let metric_membership = metric_context(event);
         let aarnn_membership = if is_aarnn_event(event) { 1.0 } else { 0.0 };
 
         let (core_risk, interval_width) = if self.fuzzy.enabled {
@@ -141,6 +143,7 @@ impl AdaptiveScorer {
                 edge_membership,
                 delta_membership,
                 security_membership,
+                metric_membership,
                 severity_membership,
             );
 
@@ -154,6 +157,7 @@ impl AdaptiveScorer {
                 uncertainty,
                 edge_membership,
                 security_membership,
+                metric_membership,
                 aarnn_membership,
             )
         } else {
@@ -184,6 +188,7 @@ impl AdaptiveScorer {
             interval_width,
             edge_membership,
             security_context: security_membership,
+            metric_context: metric_membership,
             aarnn_context: aarnn_membership,
             learned_confidence,
         };
@@ -205,6 +210,7 @@ impl AdaptiveScorer {
         edge_membership: f64,
         novelty_membership: f64,
         security_membership: f64,
+        metric_membership: f64,
         severity_membership: f64,
     ) -> f64 {
         let normal = left_shoulder(z_abs, 0.25, 1.0);
@@ -212,14 +218,19 @@ impl AdaptiveScorer {
         let anomalous = right_shoulder(z_abs, 1.80, 3.30);
 
         let anomaly_strength = anomalous.max((suspicious * 0.72) + (edge_membership * 0.28));
-        let contextual =
-            (0.45 * novelty_membership + 0.35 * security_membership + 0.20 * severity_membership)
-                .clamp(0.0, 1.0);
+        let contextual = (0.34 * novelty_membership
+            + 0.28 * security_membership
+            + 0.22 * metric_membership
+            + 0.16 * severity_membership)
+            .clamp(0.0, 1.0);
         let suppressed = anomaly_strength * (1.0 - normal * 0.35);
 
         let security_pull =
             (self.fuzzy.security_weight * security_membership * 0.25).clamp(0.0, 0.25);
-        (suppressed * (0.78 + security_pull) + contextual * (0.22 + security_pull)).clamp(0.0, 1.0)
+        let metric_pull = (metric_membership * 0.16).clamp(0.0, 0.16);
+        (suppressed * (0.74 + security_pull + metric_pull * 0.5)
+            + contextual * (0.26 + security_pull * 0.7 + metric_pull))
+            .clamp(0.0, 1.0)
     }
 
     fn type_n_refine(
@@ -228,6 +239,7 @@ impl AdaptiveScorer {
         uncertainty: f64,
         edge_membership: f64,
         security_membership: f64,
+        metric_membership: f64,
         aarnn_membership: f64,
     ) -> (f64, f64) {
         let order = self.fuzzy.order.max(1);
@@ -240,6 +252,7 @@ impl AdaptiveScorer {
         let mut interval_width = 0.0;
         let context_bias = (edge_membership * self.fuzzy.edge_bias
             + security_membership * self.fuzzy.security_weight
+            + metric_membership * 0.35
             + aarnn_membership * self.fuzzy.aarnn_weight)
             .clamp(0.0, 1.0);
 
@@ -303,6 +316,53 @@ fn security_context(event: &Event) -> f64 {
     score.clamp(0.0, 1.0)
 }
 
+fn metric_context(event: &Event) -> f64 {
+    let Some(metric) = event.attributes.get("metric").map(String::as_str) else {
+        return 0.0;
+    };
+
+    let signal = event.signal.clamp(0.0, 1.0);
+    let mut score = 0.0;
+    match metric {
+        "gpu_power_w" => {
+            score += right_shoulder(signal, 0.55, 0.88) * 0.32;
+        }
+        "gpu_clock_graphics_mhz" => {
+            score += right_shoulder(signal, 0.50, 0.85) * 0.24;
+        }
+        "gpu_clock_memory_mhz" => {
+            score += right_shoulder(signal, 0.55, 0.88) * 0.20;
+        }
+        "gpu_fan_speed_percent" => {
+            score += right_shoulder(signal, 0.70, 0.92) * 0.18;
+        }
+        "gpu_encoder_util_percent" => {
+            score += right_shoulder(signal, 0.35, 0.75) * 0.30;
+        }
+        "gpu_decoder_util_percent" => {
+            score += right_shoulder(signal, 0.45, 0.85) * 0.22;
+        }
+        "gpu_mem_used_bytes" | "mem_app_used" | "swap_used" => {
+            score += right_shoulder(signal, 0.72, 0.92) * 0.24;
+        }
+        "mem_used" => {
+            score += right_shoulder(signal, 0.75, 0.94) * 0.18;
+        }
+        "mem_bufcache" => {
+            score += triangle(signal, 0.10, 0.45, 0.85) * 0.08;
+        }
+        _ => {}
+    }
+
+    if metric.starts_with("gpu_") {
+        score += 0.05;
+    }
+    if event.source.eq_ignore_ascii_case("embedded") {
+        score += 0.03;
+    }
+    score.clamp(0.0, 1.0)
+}
+
 fn left_shoulder(x: f64, start: f64, end: f64) -> f64 {
     if x <= start {
         1.0
@@ -344,18 +404,16 @@ mod tests {
         AdaptiveScorer::new(8, fuzzy)
     }
 
-    fn warmup(scorer: &mut AdaptiveScorer) {
+    fn warmup_kind(scorer: &mut AdaptiveScorer, kind: EventKind) {
         for i in 0..48u64 {
             let signal = 0.46 + ((i % 7) as f64) * 0.015;
-            let event = Event::new(
-                i + 1,
-                "baseline",
-                EventKind::Observability,
-                signal,
-                Severity::Medium,
-            );
+            let event = Event::new(i + 1, "baseline", kind, signal, Severity::Medium);
             let _ = scorer.score_and_update(&event);
         }
+    }
+
+    fn warmup(scorer: &mut AdaptiveScorer) {
+        warmup_kind(scorer, EventKind::Observability);
     }
 
     #[test]
@@ -417,5 +475,41 @@ mod tests {
             enriched_score.risk,
             plain_score.risk
         );
+    }
+
+    #[test]
+    fn embedded_metric_context_increases_risk_for_same_signal() {
+        let mut plain = scorer_with_order(3);
+        let mut enriched = scorer_with_order(3);
+        warmup_kind(&mut plain, EventKind::SystemMetric);
+        warmup_kind(&mut enriched, EventKind::SystemMetric);
+
+        let plain_event = Event::new(
+            9_201,
+            "embedded",
+            EventKind::SystemMetric,
+            0.68,
+            Severity::Medium,
+        )
+        .with_attr("metric", "gpu_mem_total_bytes");
+        let enriched_event = Event::new(
+            9_202,
+            "embedded",
+            EventKind::SystemMetric,
+            0.68,
+            Severity::Medium,
+        )
+        .with_attr("metric", "gpu_encoder_util_percent")
+        .with_attr("gpu_id", "nvidia:0");
+
+        let plain_score = plain.score_and_update(&plain_event);
+        let enriched_score = enriched.score_and_update(&enriched_event);
+        assert!(
+            enriched_score.risk > plain_score.risk,
+            "expected metric-aware fuzzy context to increase risk (enriched={}, plain={})",
+            enriched_score.risk,
+            plain_score.risk
+        );
+        assert!(enriched_score.telemetry.metric_context > plain_score.telemetry.metric_context);
     }
 }
