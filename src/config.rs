@@ -597,6 +597,7 @@ pub struct Config {
     pub tracey_ban: TraceyBanConfig,
     pub governance: crate::governance::GovernanceConfig,
     pub coordination: CoordinationConfig,
+    pub continuum_autoscaler: ContinuumAutoscalerConfig,
     pub loader: LoaderConfig,
     pub status: StatusConfig,
     pub stimuli: StimuliConfig,
@@ -636,6 +637,7 @@ impl Default for Config {
             tracey_ban: TraceyBanConfig::default(),
             governance: crate::governance::GovernanceConfig::default(),
             coordination: CoordinationConfig::default(),
+            continuum_autoscaler: ContinuumAutoscalerConfig::default(),
             loader: LoaderConfig::default(),
             status: StatusConfig::default(),
             stimuli: StimuliConfig::default(),
@@ -930,6 +932,29 @@ impl Config {
             .coordination
             .weight_prometheus_bandwidth
             .clamp(0.0, 10.0);
+        self.continuum_autoscaler.poll_interval_ms = self
+            .continuum_autoscaler
+            .poll_interval_ms
+            .clamp(1_000, 300_000);
+        self.continuum_autoscaler.local_cpu_usage_pct = self
+            .continuum_autoscaler
+            .local_cpu_usage_pct
+            .clamp(0.0, 100.0);
+        self.continuum_autoscaler.local_memory_usage_pct = self
+            .continuum_autoscaler
+            .local_memory_usage_pct
+            .clamp(0.0, 100.0);
+        self.continuum_autoscaler.slurm_allocated_ratio = self
+            .continuum_autoscaler
+            .slurm_allocated_ratio
+            .clamp(0.0, 1.0);
+        self.continuum_autoscaler.max_recruits_per_tick =
+            self.continuum_autoscaler.max_recruits_per_tick.clamp(1, 16);
+        if self.continuum_autoscaler.base_url.trim().is_empty()
+            || self.continuum_autoscaler.recruit_hosts.is_empty()
+        {
+            self.continuum_autoscaler.enabled = false;
+        }
 
         if self.status.listen_addr.trim().is_empty() {
             self.status.enabled = false;
@@ -1159,6 +1184,120 @@ impl Config {
         }
         if let Some(value) = env_bool_any(&["TRACEY_REFINER_ENABLED", "NM_REFINER_ENABLED"]) {
             self.refiner.enabled = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_CONTINUUM_AUTOSCALER_ENABLED",
+            "NM_TRACEY_CONTINUUM_AUTOSCALER_ENABLED",
+        ]) {
+            self.continuum_autoscaler.enabled = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_CONTINUUM_URL", "NM_TRACEY_CONTINUUM_URL"]) {
+            self.continuum_autoscaler.base_url = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_CONTINUUM_TOKEN", "NM_TRACEY_CONTINUUM_TOKEN"]) {
+            self.continuum_autoscaler.bearer_token = Some(value);
+        }
+        let recruit_hosts = env_csv_any(&["TRACEY_CONTINUUM_HOSTS", "NM_TRACEY_CONTINUUM_HOSTS"]);
+        if !recruit_hosts.is_empty() {
+            self.continuum_autoscaler.recruit_hosts = recruit_hosts;
+        }
+        if let Some(value) = env_any(&["TRACEY_CONTINUUM_USER", "NM_TRACEY_CONTINUUM_USER"]) {
+            self.continuum_autoscaler.recruit_user = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_CONTINUUM_SSH_KEY", "NM_TRACEY_CONTINUUM_SSH_KEY"]) {
+            self.continuum_autoscaler.ssh_key_path = Some(value);
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_NODE_TYPE",
+            "NM_TRACEY_CONTINUUM_NODE_TYPE",
+        ]) {
+            self.continuum_autoscaler.node_type = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_CONTINUUM_REGION", "NM_TRACEY_CONTINUUM_REGION"]) {
+            self.continuum_autoscaler.region = Some(value);
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_TENANT_ID",
+            "NM_TRACEY_CONTINUUM_TENANT_ID",
+        ]) {
+            self.continuum_autoscaler.tenant_id = Some(value);
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_TENANT_NAME",
+            "NM_TRACEY_CONTINUUM_TENANT_NAME",
+        ]) {
+            self.continuum_autoscaler.tenant_name = Some(value);
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_TENANT_ENV",
+            "NM_TRACEY_CONTINUUM_TENANT_ENV",
+        ]) {
+            self.continuum_autoscaler.tenant_environment = Some(value);
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_RECRUIT_TOKEN",
+            "NM_TRACEY_CONTINUUM_RECRUIT_TOKEN",
+        ]) {
+            self.continuum_autoscaler.recruit_token = Some(value);
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_CONTINUUM_AUTO_CONFIGURE",
+            "NM_TRACEY_CONTINUUM_AUTO_CONFIGURE",
+        ]) {
+            self.continuum_autoscaler.auto_configure = value;
+        }
+        if let Some(value) =
+            env_bool_any(&["TRACEY_CONTINUUM_DRY_RUN", "NM_TRACEY_CONTINUUM_DRY_RUN"])
+        {
+            self.continuum_autoscaler.dry_run = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_POLL_INTERVAL_MS",
+            "NM_TRACEY_CONTINUUM_POLL_INTERVAL_MS",
+        ]) {
+            self.continuum_autoscaler.poll_interval_ms = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_LOCAL_CPU_PCT",
+            "NM_TRACEY_CONTINUUM_LOCAL_CPU_PCT",
+        ]) {
+            self.continuum_autoscaler.local_cpu_usage_pct = value as f32;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_LOCAL_MEMORY_PCT",
+            "NM_TRACEY_CONTINUUM_LOCAL_MEMORY_PCT",
+        ]) {
+            self.continuum_autoscaler.local_memory_usage_pct = value as f32;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_COORDINATION_LATENCY_MS",
+            "NM_TRACEY_CONTINUUM_COORDINATION_LATENCY_MS",
+        ]) {
+            self.continuum_autoscaler.coordination_latency_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_PROMETHEUS_LATENCY_MS",
+            "NM_TRACEY_CONTINUUM_PROMETHEUS_LATENCY_MS",
+        ]) {
+            self.continuum_autoscaler.prometheus_latency_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_SLURM_PENDING_JOBS",
+            "NM_TRACEY_CONTINUUM_SLURM_PENDING_JOBS",
+        ]) {
+            self.continuum_autoscaler.slurm_pending_jobs = value as u32;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_SLURM_ALLOCATED_RATIO",
+            "NM_TRACEY_CONTINUUM_SLURM_ALLOCATED_RATIO",
+        ]) {
+            self.continuum_autoscaler.slurm_allocated_ratio = value as f32;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_MAX_RECRUITS_PER_TICK",
+            "NM_TRACEY_CONTINUUM_MAX_RECRUITS_PER_TICK",
+        ]) {
+            self.continuum_autoscaler.max_recruits_per_tick = value as usize;
         }
         if let Some(value) = env_any(&["TRACEY_REFINER_SOURCE", "NM_REFINER_SOURCE"]) {
             self.refiner.source = value;
@@ -1394,6 +1533,62 @@ impl Default for CoordinationConfig {
             weight_capability: 0.5,
             weight_prometheus_latency: 2.5,
             weight_prometheus_bandwidth: 1.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumAutoscalerConfig {
+    pub enabled: bool,
+    pub poll_interval_ms: u64,
+    pub base_url: String,
+    pub bearer_token: Option<String>,
+    pub recruit_hosts: Vec<String>,
+    pub recruit_user: String,
+    pub ssh_key_path: Option<String>,
+    pub node_type: String,
+    pub region: Option<String>,
+    pub tenant_id: Option<String>,
+    pub tenant_name: Option<String>,
+    pub tenant_environment: Option<String>,
+    pub recruit_token: Option<String>,
+    pub auto_configure: bool,
+    pub dry_run: bool,
+    pub local_cpu_usage_pct: f32,
+    pub local_memory_usage_pct: f32,
+    pub coordination_latency_ms: u64,
+    pub prometheus_latency_ms: u64,
+    pub slurm_pending_jobs: u32,
+    pub slurm_allocated_ratio: f32,
+    pub max_recruits_per_tick: usize,
+}
+
+impl Default for ContinuumAutoscalerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 5_000,
+            base_url: String::new(),
+            bearer_token: None,
+            recruit_hosts: Vec::new(),
+            recruit_user: "ubuntu".to_string(),
+            ssh_key_path: None,
+            node_type: "kubernetes".to_string(),
+            region: None,
+            tenant_id: None,
+            tenant_name: None,
+            tenant_environment: None,
+            recruit_token: None,
+            auto_configure: true,
+            dry_run: true,
+            local_cpu_usage_pct: 75.0,
+            local_memory_usage_pct: 80.0,
+            coordination_latency_ms: 40,
+            prometheus_latency_ms: 35,
+            slurm_pending_jobs: 1,
+            slurm_allocated_ratio: 0.80,
+            max_recruits_per_tick: 1,
         }
     }
 }

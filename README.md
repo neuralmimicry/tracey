@@ -1,589 +1,282 @@
-# Tracey Swarm Security
+# Tracey
 
 ![Tracey](src/nmtracey.png)
 
-Tracey is a swarm-style, self-learning monitoring and response system. It coordinates multiple agents to score events, reach consensus, and optionally trigger containment actions.
-Tracey runs on a non-blocking, multi-threaded async runtime and uses all available CPU cores.
+Tracey is an asynchronous swarm runtime for anomaly assessment, posture governance, and controlled response. It combines event ingestion, adaptive fuzzy scoring, multi-agent consensus, elected coordination, bounded JSONL audit storage, and optional update/loader lifecycles for rolling binary replacement.
 
-## Architecture
+## Design Intent
 
-- Sensors generate events and publish them to a shared event bus.
-- Agents subscribe to the bus, score events using adaptive baselines plus Type-n fuzzy inference, and send assessments.
-- The coordinator aggregates assessments, applies policy thresholds, and issues decisions.
-- Learning snapshots are broadcast so agents continuously adapt as conditions change.
-- Discovery uses authenticated gossip to detect peer agents on the local network.
-- Asset feeds let you report unmanaged hosts from approved telemetry sources (DHCP, DNS, NetFlow, CMDB, etc.).
-- Inventory correlates asset observations with agent presence to flag unmanaged hosts.
-- Optional adaptive tuning keeps alert volumes stable without ML models.
-- A minimal `tracey-loader` can supervise the mutable `tracey` core and redistribute signed production cores between peers.
-- Optional OTA updates let the agent switchover to new code safely (signed bundles + handoff).
-- Optional mTLS update delivery pulls signed bundles from a secured update service.
-- Optional telemetry integration scrapes local Prometheus/OTel metrics endpoints and feeds them into the swarm.
-- Optional embedded collectors read `/proc` and `/sys` for CPU, memory, thermal, disk, and network signals, with Jetson add-ons when available.
+The codebase is organised around five main goals:
 
-## Key Modules
+1. Ingest heterogeneous host, telemetry, security, and external inventory signals without blocking the runtime.
+2. Convert those inputs into a shared `Event` model so every downstream subsystem reasons over the same payload shape.
+3. Use multiple scoring agents and quorum-based coordination instead of a single detector deciding in isolation.
+4. Gate disruptive behaviour through governance posture, elected leadership, and explicit response-policy controls.
+5. Preserve a durable, bounded, auditable record of what the runtime saw and what it decided.
 
-- `src/sensors.rs` simulates system, network, user, and automation signals.
-- `src/swarm/agent.rs` scores events and produces assessments.
-- `src/swarm/coordinator.rs` enforces consensus and response policy.
-- `src/swarm/learning.rs` maintains online stats and merges baselines.
-- `src/discovery.rs` authenticates agent presence via UDP gossip.
-- `src/tracey_ban.rs` provides TraceyBan-compatible jails, regex filtering, action hooks, ban persistence, and cross-agent ban-intel sharing.
-- `src/tracey_guard.rs` translates TraceyGuard probe-agent behaviors into Tracey's async runtime, including probe orchestration, fuzzy fault scoring, TMR checks, and distributed fault-intel gossip.
-- `src/embedded.rs` gathers local embedded metrics from `/proc` and `/sys`.
-- `src/assets.rs` ingests external asset observations (JSONL feed).
-- `src/storage.rs` writes JSONL records for events, decisions, learning snapshots, and inventory.
+## Current Implementation Profile
 
-## Running
+Tracey already includes real integrations, but it also contains deliberate synthetic exercise paths. In practical terms, the project currently behaves as an experimental operations runtime rather than a finished production appliance.
 
-```bash
-cargo run
-```
+The current code does all of the following:
 
-Tracey writes JSONL records to `tracey.log.jsonl` by default.
+- always starts four synthetic sensors (`system_cpu`, `network_flow`, `user_actions`, `automation`)
+- enables Linux embedded collectors by default when running on Linux
+- enables `TraceyGuard` by default and falls back to synthetic GPU identities when no real devices are discovered
+- enables authenticated discovery gossip by default on UDP `47990`
+- enables the HTTP status surface by default on `0.0.0.0:48000`
+- leaves `auth.mode` off by default, which means status and TraceyGuard control routes are unauthenticated unless you explicitly enable OIDC
+- enables the Prometheus log exporter by default, which probes `http://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
 
-Run the supervised loader entrypoint with:
+That default profile is useful for local evaluation and continuous self-exercise, but it is not a hardened deployment baseline.
 
-```bash
-cargo run --bin tracey-loader
-```
+## Default-On and Default-Off Subsystems
 
-## Configuration
+| Area | Default state | Notes |
+| --- | --- | --- |
+| Synthetic sensors | On | No configuration flag currently disables them. |
+| Embedded collectors | On | Linux-only; publishes CPU, memory, disk, network, process, battery, Jetson, and GPU metrics. |
+| TraceyGuard | On | Discovers GPUs where possible, otherwise creates synthetic devices and synthetic probe activity. |
+| Discovery gossip | On | Broadcast UDP with a shared-key MAC; default key is a development placeholder. |
+| Status API | On | Binds to `0.0.0.0:48000`; authorisation is off until OIDC is enabled. |
+| Prometheus log export | On | Depends on status being enabled; exposes `/metrics` and signed `/prometheus/ingest`. |
+| Coordination and governance | On | Leader election, proxy selection, and posture voting run automatically. |
+| Telemetry ingest | Off | Prometheus scraping and OTLP receivers are disabled until configured. |
+| Refiner tracking | Off | Health polling and security-feed ingestion are opt-in. |
+| Asset feed | Off | JSONL host-observation ingestion is opt-in. |
+| TraceyBan | Off | Jail logic, actions, and cross-agent ban intelligence are opt-in. |
+| OTA update manager | Off | Local and remote update checks are disabled until configured. |
+| Stimuli/AER bridge | Off | UDP AER ingest/egress is disabled until configured. |
 
-Set `TRACEY_CONFIG` to a JSON config file path.
+## Runtime Entry Points
 
-Example:
+### `tracey`
 
-```json
-{
-  "agent_id": "tracey-prod-01",
-  "agents": 8,
-  "event_rate_ms": 120,
-  "assessment_quorum": 5,
-  "decision_threshold": 0.72,
-  "fuzzy": {
-    "enabled": true,
-    "order": 3,
-    "uncertainty": 0.55,
-    "edge_bias": 0.70,
-    "aarnn_weight": 0.22,
-    "security_weight": 0.28
-  },
-  "active_response": false,
-  "shutdown_enabled": false,
-  "discovery": {
-    "enabled": true,
-    "bind_addr": "0.0.0.0:47990",
-    "broadcast_addr": "255.255.255.255:47990",
-    "shared_key": "rotate-this-key",
-    "announce_interval_ms": 1500,
-    "ttl_ms": 10000
-  },
-  "asset_feed": {
-    "enabled": true,
-    "path": "asset_feed.jsonl",
-    "poll_interval_ms": 3000,
-    "source": "cmdb"
-  },
-  "inventory": {
-    "agent_ttl_ms": 30000,
-    "host_ttl_ms": 120000,
-    "unmanaged_resend_ms": 30000
-  },
-  "refiner": {
-    "enabled": true,
-    "source": "refiner",
-    "service_name": "refiner",
-    "health_url": "http://127.0.0.1:5001/api/health",
-    "security_feed_path": "refiner_security_feed.jsonl",
-    "poll_interval_ms": 5000,
-    "timeout_ms": 2500
-  },
-  "tuning": {
-    "enabled": true,
-    "target_alert_rate": 0.08,
-    "adjustment_rate": 0.05,
-    "min_threshold": 0.55,
-    "max_threshold": 0.95,
-    "window_ms": 10000
-  },
-  "update": {
-    "enabled": true,
-    "update_dir": "updates",
-    "bundle_name": "tracey.update",
-    "signature_name": "tracey.update.sig",
-    "metadata_name": "tracey.update.meta.json",
-    "local_channel": "production",
-    "shared_key": "rotate-this-key",
-    "poll_interval_ms": 5000,
-    "handoff_timeout_ms": 10000,
-    "remote": {
-      "enabled": true,
-      "base_url": "https://updates.example.com/tracey",
-      "metadata_path": "tracey.update.meta.json",
-      "bundle_path": "tracey.update",
-      "signature_path": "tracey.update.sig",
-      "ca_cert_path": "certs/ca.pem",
-      "client_identity_path": "certs/client.pem",
-      "timeout_ms": 8000
-    }
-  },
-  "loader": {
-    "enabled": true,
-    "state_dir": "loader",
-    "discovery_bind_addr": "0.0.0.0:47989",
-    "discovery_broadcast_addr": "255.255.255.255:47989",
-    "transfer_listen_addr": "0.0.0.0:47988",
-    "rollback_window_ms": 120000
-  },
-  "telemetry": {
-    "enabled": true,
-    "prometheus_enabled": true,
-    "endpoints": ["http://127.0.0.1:9100/metrics"],
-    "scrape_interval_ms": 5000,
-    "max_samples": 200,
-    "allow_prefixes": ["process_", "node_", "system_", "cpu", "mem", "load", "http_", "otelcol_"],
-    "allow_exact": [],
-    "autodiscover_local": true,
-    "allow_remote": false,
-    "source": "telemetry",
-    "timeout_ms": 2000,
-    "prefer_prometheus": true,
-    "dedup_ttl_ms": 30000,
-    "otlp": {
-      "enabled": true,
-      "grpc_addr": "127.0.0.1:4317",
-      "http_addr": "127.0.0.1:4318",
-      "enable_grpc": true,
-      "enable_http": true
-    }
-  },
-  "embedded": {
-    "enabled": true,
-    "interval_ms": 2000,
-    "jetson_enabled": true,
-    "max_thermals": 8,
-    "max_disks": 8,
-    "max_interfaces": 8,
-    "process_enabled": true,
-    "process_top_n": 5,
-    "process_window_ms": 5000,
-    "process_max": 2048,
-    "gpu_enabled": true,
-    "gpu_sysfs_enabled": true,
-    "gpu_nvml_enabled": true,
-    "gpu_rocm_enabled": true,
-    "gpu_max_devices": 8
-  },
-  "tracey_ban": {
-    "enabled": true,
-    "state_path": "tracey.tracey_ban.state.json",
-    "max_advertised_ips": 64,
-    "remote_ttl_ms": 15000,
-    "unban_check_ms": 1000,
-    "persist_interval_ms": 3000,
-    "auto_elevate_root": true,
-    "sudo_program": "sudo",
-    "sudo_non_interactive": true,
-    "use_sudo_for_actions": true,
-    "inherit_global_fuzzy": true,
-    "min_samples": 12,
-    "fuzzy_min_risk": 0.62,
-    "fuzzy_min_confidence": 0.30,
-    "fuzzy_retry_reduction": 0.55,
-    "jails": [
-      {
-        "name": "ssh",
-        "enabled": true,
-        "backend": "hybrid",
-        "log_paths": ["/var/log/auth.log"],
-        "filter_files": [],
-        "fail_regex": [
-          "(?i)failed password.*from (?P<host>(?:\\d{1,3}\\.){3}\\d{1,3})"
-        ],
-        "ignore_regex": [],
-        "prefilter_regex": null,
-        "max_retry": 5,
-        "find_time_ms": 600000,
-        "ban_time_ms": 900000,
-        "ban_increment": true,
-        "ban_multiplier": 2.0,
-        "ban_max_time_ms": 7200000,
-        "ban_randomize_ms": 15000,
-        "ignore_ips": ["127.0.0.1", "::1", "10.0.0.1"],
-        "poll_interval_ms": 1000,
-        "event_ip_keys": ["ip", "src_ip", "client_ip", "remote_addr"],
-        "action_start": null,
-        "action_stop": null,
-        "action_ban": "nft add element inet filter tracey_ban { <ip> }",
-        "action_unban": "nft delete element inet filter tracey_ban { <ip> }",
-        "shell": "/bin/sh",
-        "action_timeout_ms": 5000
-      }
-    ]
-  },
-  "tracey_guard": {
-    "enabled": true,
-    "scheduler_poll_ms": 200,
-    "max_parallel_tasks": 32,
-    "overhead_budget_pct": 2.0,
-    "max_devices": 32,
-    "synthetic_devices": 1,
-    "default_sm_count": 16,
-    "max_advertised_faults": 64,
-    "remote_fault_ttl_ms": 120000,
-    "deep_dive_max_faults": 256,
-    "probes": {
-      "fma": { "enabled": true, "period_ms": 60000, "sm_coverage": 1.0, "priority": 1, "timeout_ms": 500 },
-      "tensor_core": { "enabled": true, "period_ms": 60000, "sm_coverage": 1.0, "priority": 1, "timeout_ms": 1000 },
-      "transcendental": { "enabled": true, "period_ms": 120000, "sm_coverage": 0.5, "priority": 2, "timeout_ms": 500 },
-      "aes": { "enabled": true, "period_ms": 300000, "sm_coverage": 0.25, "priority": 3, "timeout_ms": 2000 },
-      "memory": { "enabled": true, "period_ms": 600000, "sm_coverage": 1.0, "priority": 4, "timeout_ms": 5000 },
-      "register_file": { "enabled": true, "period_ms": 120000, "sm_coverage": 1.0, "priority": 2, "timeout_ms": 500 },
-      "shared_memory": { "enabled": true, "period_ms": 300000, "sm_coverage": 0.5, "priority": 3, "timeout_ms": 1000 }
-    },
-    "tmr": {
-      "enabled": true,
-      "interval_ms": 600000,
-      "timeout_ms": 30000,
-      "triples_per_interval": 3
-    },
-    "correlation": {
-      "window_ms": 300000,
-      "min_confidence": 0.60,
-      "healthy_to_suspect": 0.95,
-      "suspect_to_quarantine": 0.80,
-      "quarantine_to_healthy": 0.98,
-      "immediate_quarantine_failures": 3,
-      "deep_test_passes": 128
-    }
-  },
-  "governance": {
-    "enabled": true,
-    "vote_interval_ms": 1500,
-    "vote_ttl_ms": 5000,
-    "quorum": 3,
-    "decision_threshold": 0.6,
-    "min_confidence": 0.5,
-    "relaxed_risk": 0.2,
-    "strict_risk": 0.7,
-    "lockdown_risk": 0.9,
-    "rebel": {
-      "enabled": true,
-      "probability": 0.03,
-      "max_streak": 2,
-      "cooldown_ms": 10000
-    }
-  },
-  "coordination": {
-    "enabled": true,
-    "max_coordinators": 2,
-    "election_interval_ms": 1000,
-    "presence_ttl_ms": 8000,
-    "weight_cpu": 1.0,
-    "weight_latency": 1.5,
-    "weight_hash": 0.1,
-    "weight_capability": 0.5
-  },
-  "status": {
-    "enabled": true,
-    "listen_addr": "0.0.0.0:48000",
-    "public_addr": "10.0.0.10:48000",
-    "proxy_timeout_ms": 1500
-  },
-  "auth": {
-    "mode": "oidc",
-    "protect_status": true,
-    "protect_otlp_http": true,
-    "protect_otlp_grpc": false,
-    "oidc": {
-      "issuer": "https://auth.neuralmimicry.ai",
-      "jwks_url": null,
-      "client_id": "tracey",
-      "audiences": ["tracey"],
-      "required_scopes": ["tracey:read"],
-      "cache_ttl_ms": 60000,
-      "leeway_sec": 60,
-      "http_timeout_ms": 3000
-    }
-  },
-  "stimuli": {
-    "enabled": true,
-    "listen_addr": "0.0.0.0:48100",
-    "peer_addr": "10.0.0.20:48101",
-    "flush_interval_ms": 500,
-    "posture_interval_ms": 2000,
-    "max_batch": 128,
-    "max_packet_bytes": 8192
-  },
-  "storage": {
-    "log_path": "tracey.log.jsonl",
-    "max_bytes": 25000000,
-    "max_total_bytes": 100000000,
-    "retain_lines": 5000,
-    "compact_interval_ms": 30000,
-    "rotate_archives": 3,
-    "summary_top_keys": 25
-  }
-}
-```
+Primary runtime entry point.
 
-### Type-n Fuzzy Anomaly Scoring
+- `cargo run`
+- `cargo run -- --version`
+- `cargo run -- sign-update --bundle ./tracey-new --version 0.2.0 --key '<shared-key>'`
 
-Tracey applies Type-n fuzzy logic in each swarm agent before consensus:
+### `tracey --supervisor`
 
-- Type-1 fuzzy memberships map baseline deviation into normal/suspicious/anomalous sets.
-- Higher orders (`fuzzy.order > 1`) recursively model uncertainty bands for edge-case signals.
-- AARNN events and Refiner security-feed context (CVE/CVSS/finding severity) contribute to fuzzy risk weighting.
-- Swarm intelligence is preserved: fuzzy scores are still aggregated by quorum in the coordinator.
-- Decision records now include fuzzy telemetry (`telemetry.mean_core_risk`, `telemetry.mean_interval_width`, `telemetry.mean_security_context`, `telemetry.mean_aarnn_context`, `telemetry.fuzzy_order`).
+Crash-restart and zero-downtime handoff wrapper around the same runtime binary.
 
-Environment overrides:
-- `TRACEY_FUZZY_ENABLED` / `NM_FUZZY_ENABLED`
-- `TRACEY_FUZZY_ORDER` / `NM_FUZZY_ORDER`
-- `TRACEY_FUZZY_UNCERTAINTY` / `NM_FUZZY_UNCERTAINTY`
-- `TRACEY_FUZZY_EDGE_BIAS` / `NM_FUZZY_EDGE_BIAS`
-- `TRACEY_FUZZY_AARNN_WEIGHT` / `NM_FUZZY_AARNN_WEIGHT`
-- `TRACEY_FUZZY_SECURITY_WEIGHT` / `NM_FUZZY_SECURITY_WEIGHT`
-- `TRACEY_BAN_ENABLED` / `NM_TRACEY_BAN_ENABLED`
-- `TRACEY_BAN_STATE_PATH` / `NM_TRACEY_BAN_STATE_PATH`
-- `TRACEY_BAN_MAX_ADVERTISED_IPS` / `NM_TRACEY_BAN_MAX_ADVERTISED_IPS`
-- `TRACEY_BAN_REMOTE_TTL_MS` / `NM_TRACEY_BAN_REMOTE_TTL_MS`
-- `TRACEY_BAN_UNBAN_CHECK_MS` / `NM_TRACEY_BAN_UNBAN_CHECK_MS`
-- `TRACEY_BAN_PERSIST_INTERVAL_MS` / `NM_TRACEY_BAN_PERSIST_INTERVAL_MS`
-- `TRACEY_BAN_AUTO_ELEVATE_ROOT` / `NM_TRACEY_BAN_AUTO_ELEVATE_ROOT`
-- `TRACEY_BAN_SUDO_PROGRAM` / `NM_TRACEY_BAN_SUDO_PROGRAM`
-- `TRACEY_BAN_SUDO_NON_INTERACTIVE` / `NM_TRACEY_BAN_SUDO_NON_INTERACTIVE`
-- `TRACEY_BAN_USE_SUDO_FOR_ACTIONS` / `NM_TRACEY_BAN_USE_SUDO_FOR_ACTIONS`
-- `TRACEY_BAN_INHERIT_GLOBAL_FUZZY` / `NM_TRACEY_BAN_INHERIT_GLOBAL_FUZZY`
-- `TRACEY_BAN_MIN_SAMPLES` / `NM_TRACEY_BAN_MIN_SAMPLES`
-- `TRACEY_BAN_FUZZY_MIN_RISK` / `NM_TRACEY_BAN_FUZZY_MIN_RISK`
-- `TRACEY_BAN_FUZZY_MIN_CONFIDENCE` / `NM_TRACEY_BAN_FUZZY_MIN_CONFIDENCE`
-- `TRACEY_BAN_FUZZY_RETRY_REDUCTION` / `NM_TRACEY_BAN_FUZZY_RETRY_REDUCTION`
-- `TRACEY_BAN_FUZZY_ENABLED` / `NM_TRACEY_BAN_FUZZY_ENABLED`
-- `TRACEY_BAN_FUZZY_ORDER` / `NM_TRACEY_BAN_FUZZY_ORDER`
-- `TRACEY_BAN_FUZZY_UNCERTAINTY` / `NM_TRACEY_BAN_FUZZY_UNCERTAINTY`
-- `TRACEY_BAN_FUZZY_EDGE_BIAS` / `NM_TRACEY_BAN_FUZZY_EDGE_BIAS`
-- `TRACEY_BAN_FUZZY_AARNN_WEIGHT` / `NM_TRACEY_BAN_FUZZY_AARNN_WEIGHT`
-- `TRACEY_BAN_FUZZY_SECURITY_WEIGHT` / `NM_TRACEY_BAN_FUZZY_SECURITY_WEIGHT`
+- `cargo run -- --supervisor`
 
-### Distributed TraceyBan Runtime
+The supervisor watches the child process, consumes staged update requests from `update_dir`, and swaps binaries after the replacement process writes the expected handoff token.
 
-Tracey now includes a native Rust TraceyBan-compatible subsystem:
+### `tracey-loader`
 
-- Multi-jail processing with file and event backends (`polling`, `tracey_event`, `hybrid`).
-- Regex/ignore-regex matching plus optional ingestion of upstream TraceyBan filter files.
-- Ban lifecycle management (`max_retry`, `find_time`, `ban_time`, incremental ban duration, randomized jitter).
-- Type-n fuzzy risk scoring is applied per jail using Tracey's `AdaptiveScorer`; fuzzy risk/confidence dynamically reduce retry thresholds for high-confidence attack signals.
-- Privilege detection and optional auto-elevation (`sudo`) for root-protected logs and firewall-rule action execution.
-- Optional shell action hooks on start/stop/ban/unban.
-- Persistent ban and log offset state for restart continuity.
-- Cross-agent ban-intel propagation through signed discovery announcements so peer ban state influences local ban thresholds.
-- Status API reporting of local and remote ban counts/samples.
+Separate durable loader binary intended for service deployments.
 
-### Storage Log Rotation
+- `cargo run --bin tracey-loader`
+- `cargo run --bin tracey-loader -- --version`
 
-Tracey protects disk and write performance for JSONL audit logs:
+The loader supervises a mutable Tracey core, verifies its own integrity manifest, serves distributable production cores to peers, and rolls back failed promotions during a probation window.
 
-- When `storage.max_bytes` is exceeded, logs are automatically rotated (or compacted when rotation is disabled).
-- `storage.rotate_archives` bounds archive count (`tracey.log.jsonl.1`, `.2`, etc.) and stale archives beyond the limit are pruned during housekeeping.
-- `storage.max_total_bytes` caps total bytes across the active log plus archives; oldest archives are pruned first when over budget.
-- Set `storage.rotate_archives = 0` to disable archive rotation and use in-place pruning/compaction only.
+## End-to-End Workflow Summary
 
-Storage env override:
-- `TRACEY_STORAGE_MAX_BYTES` / `NM_STORAGE_MAX_BYTES`
-- `TRACEY_STORAGE_MAX_TOTAL_BYTES` / `NM_STORAGE_MAX_TOTAL_BYTES`
-- `TRACEY_STORAGE_ROTATE_ARCHIVES` / `NM_STORAGE_ROTATE_ARCHIVES`
+1. `Config::load()` assembles defaults, optional JSON from `TRACEY_CONFIG`, environment overrides, and a final sanitisation pass.
+2. `run_tracey()` wires shutdown, storage, inventory, channels, governance state, coordination, and optional subsystems.
+3. Producers publish `Event` values or inventory records.
+4. Swarm agents score events with online baselines and Type-n fuzzy refinement.
+5. The coordinator aggregates assessments, finalises decisions on quorum or expiry, and broadcasts learning/directive updates.
+6. Governance votes adjust posture, which in turn gates active response, shutdown eligibility, update allowance, and remote telemetry allowance.
+7. Discovery shares signed peer presence plus optional ban, fault, Slurm, and Prometheus probe metadata.
+8. Status and control endpoints expose the local or proxied view of the cluster.
+9. Storage writes JSONL records asynchronously and keeps disk use bounded by rotation or compaction.
+10. Optional update, supervisor, and loader paths handle staged binary replacement.
 
-### Asset Feed Format (JSONL)
+`[WORKFLOW_ANALYSIS.md](WORKFLOW_ANALYSIS.md)` contains the code-backed detailed walkthrough.
 
-Each line is a JSON object with optional fields:
+## Interfaces and Default Ports
 
-```json
-{"host_id":"router-01","ip":"10.0.0.1","mac":"00:11:22:33:44:55","hostname":"router-01","os":"network-os","source":"cmdb"}
-```
+| Surface | Default bind | Protocol | Purpose | Security note |
+| --- | --- | --- | --- | --- |
+| Status API | `0.0.0.0:48000` | HTTP | `/status`, `/health`, `/ready`, TraceyGuard views and control, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is never OIDC-gated. |
+| Discovery | `0.0.0.0:47990` to broadcast `255.255.255.255:47990` | UDP | Peer presence, capability, ban, fault, Slurm, and Prometheus-probe gossip | Shared-key authenticated, but not encrypted. |
+| Loader gossip | `0.0.0.0:47989` | UDP | Loader peer announcements for distributable cores | Shared-key authenticated, not encrypted. |
+| Loader transfer | `0.0.0.0:47988` | HTTP | Health, loader status, current core metadata, signature, and bundle | Plain HTTP; integrity is checked after download. |
+| Stimuli bridge | `0.0.0.0:48100` | UDP | AER ingress and egress | Disabled by default. |
+| OTLP gRPC | `127.0.0.1:4317` | gRPC | OTLP metrics ingest | Disabled by default; OIDC protection is optional and off until auth is enabled. |
+| OTLP HTTP | `127.0.0.1:4318` | HTTP | OTLP metrics ingest | Disabled by default; route authorisation only matters when auth is enabled. |
 
-For unmanaged detection, set `agent_id` to match the `host_id` used in your asset feeds.
+### Status surface routes
 
-### Refiner Security Feed Format (JSONL)
+When `status.enabled` is true, the Axum server exposes:
 
-Tracey can tail a Refiner security feed (for example from Trivy/Falco/Snyk export transforms) and convert findings into swarm events.
+- `/status`, `/health`, `/ready`: JSON status snapshots; followers may proxy these to the selected proxy address
+- `/tracey_guard` and `/tracey_guard/deepdive`: TraceyGuard status snapshots
+- `/control/tracey_guard`: runtime control updates for TraceyGuard
+- `/metrics`: Prometheus exposition for the elected pertinent-log exporter
+- `/prometheus/ingest`: signed follower-to-exporter batch intake
 
-```json
-{"service":"refiner","image":"ghcr.io/neuralmimicry/refiner:latest","severity":"high","cvss":8.6,"cve":"CVE-2026-12345","title":"openssl vulnerable dependency","scanner":"trivy","status":"open","finding_id":"trivy-001"}
-```
+### Loader transfer routes
 
-Refiner tracking can also be configured via environment variables:
-- `TRACEY_REFINER_ENABLED` / `NM_REFINER_ENABLED`
-- `TRACEY_REFINER_HEALTH_URL` / `NM_REFINER_HEALTH_URL`
-- `TRACEY_REFINER_SECURITY_FEED_PATH` / `NM_REFINER_SECURITY_FEED_PATH`
-- `TRACEY_REFINER_POLL_INTERVAL_MS` / `NM_REFINER_POLL_INTERVAL_MS`
-- `TRACEY_REFINER_TIMEOUT_MS` / `NM_REFINER_TIMEOUT_MS`
+When `tracey-loader` is running, the transfer server exposes:
 
-## OTA Update Bundle (Safe Handoff)
+- `/health`
+- `/loader/status`
+- `/loader/core/metadata`
+- `/loader/core/signature`
+- `/loader/core/bundle`
 
-Place the following files into `update_dir`:
+The bundle-serving routes only respond when the local core is considered distributable, which in the current implementation means a production-channel core with no pending rollback probation.
 
-- `tracey.update` (new agent binary for this OS/arch)
-- `tracey.update.meta.json` (metadata)
-- `tracey.update.sig` (signature over metadata + binary)
+## Event Producers and Their Roles
 
-Metadata format:
+| Producer | Module | Default | Output |
+| --- | --- | --- | --- |
+| Synthetic baseline generators | `src/sensors.rs` | On | Four synthetic `Event` streams for system, network, user, and automation activity |
+| Linux embedded collectors | `src/embedded.rs` | On | Host and GPU metrics with normalised signals plus raw values in attributes |
+| Prometheus scraper and OTLP receivers | `src/telemetry.rs` | Off | Observability events derived from scraped or pushed metrics |
+| Refiner health and finding ingestion | `src/refiner_tracking.rs` | Off | Health and security-feed events |
+| TraceyBan jail runtime | `src/tracey_ban.rs` | Off | Ban and unban events plus persisted ban intelligence |
+| TraceyGuard runtime | `src/tracey_guard.rs` | On | Synthetic probe and fault events tied to GPU identities |
+| Stimuli/AER bridge | `src/stimuli.rs` | Off | Inbound `aarnn` events and outbound AER frames |
+| Asset feed | `src/assets.rs` | Off | Host observations into inventory rather than the event bus |
+| Discovery | `src/discovery.rs` | On | Agent presence into coordination and inventory rather than the event bus |
 
-```json
-{
-  "version": "0.2.0",
-  "os": "linux",
-  "arch": "x86_64",
-  "blake3": "<hex of blake3(binary)>",
-  "channel": "production"
-}
-```
+## Configuration Model
 
-Signature is a keyed blake3 hash over `metadata_bytes || binary_bytes` using `shared_key`.
+Configuration precedence is:
 
-Handoff: the old process spawns the new binary, waits for readiness, then shuts down.
+`defaults < JSON file from TRACEY_CONFIG < environment overrides < sanitisation`
 
-### mTLS Remote Delivery
+Important characteristics of the current implementation:
 
-When `update.remote.enabled` is true, Tracey downloads the bundle/metadata/signature over HTTPS with mTLS. The files are still verified locally before any switchover.
+- most environment overrides have both `TRACEY_*` and `NM_*` spellings
+- sanitisation clamps unsafe numeric values and disables some subsystems when key prerequisites are missing
+- relative filesystem paths are resolved from the current working directory
+- installed systemd services deliberately set the working directory to the Tracey state directory, so relative paths land inside the service state tree
 
-### Sign Updates Offline
+A minimal hardened starting point usually needs to:
+
+1. rotate `discovery.shared_key` and `update.shared_key`, or disable those subsystems
+2. move `status.listen_addr` to loopback or place it behind a reverse proxy
+3. enable OIDC if the status or OTLP surfaces are reachable beyond a tightly controlled network
+4. decide whether synthetic sensors, TraceyGuard synthetic fallback, and Prometheus exporter probing are acceptable for the environment
+5. disable any default-on subsystem that is not wanted operationally
+
+See `[docs/CONFIGURATION_REFERENCE.md](docs/CONFIGURATION_REFERENCE.md)` for a detailed section-by-section reference.
+
+## Storage, Files, and Persistence
+
+### Standard runtime
+
+By default the main runtime writes JSONL records to `tracey.log.jsonl` and may create archive files such as `tracey.log.jsonl.1`, `tracey.log.jsonl.2`, and so on.
+
+Record types currently written by storage are:
+
+- `event`
+- `decision`
+- `learning`
+- `ban_update`
+- `agent_presence`
+- `host_observation`
+- `unmanaged_host`
+- `tuning_update`
+- `update_record`
+- `governance_update`
+- `log_summary` (inserted during in-place compaction)
+
+### Update manager
+
+The OTA update path uses `update.update_dir` and expects:
+
+- `tracey.update`
+- `tracey.update.meta.json`
+- `tracey.update.sig`
+
+### Loader state tree
+
+`tracey-loader` uses `loader.state_dir` and maintains, among other files:
+
+- `loader/current/tracey-core`
+- `loader/current/tracey-core.meta.json`
+- `loader/current/tracey-core.sig`
+- `loader/rollback/tracey-core.previous*`
+- `loader/staging/*`
+- `loader/tracey-loader.manifest.json`
+- `loader/tracey-loader.rollback.json`
+
+## Update and Loader Behaviour
+
+### Main runtime update manager
+
+The built-in update manager can:
+
+- read a locally staged bundle from `update_dir`
+- optionally download metadata, bundle, and signature over HTTPS with mTLS
+- verify metadata and bundle integrity using a keyed BLAKE3 digest
+- reject OS, architecture, or channel mismatches
+- perform direct handoff when unsupervised
+- write a supervisor request when running under `TRACEY_SUPERVISED`
+
+### Supervisor mode
+
+`tracey --supervisor` keeps the runtime in a child process, restarts it on exit, and handles zero-downtime handoff when a staged update request appears.
+
+### Loader mode
+
+`tracey-loader` adds a longer-lived service model:
+
+- verifies the loader binary against its local integrity manifest
+- seeds metadata and signature for an existing core if only the binary is present
+- announces current production-core metadata over UDP gossip
+- serves current production cores over HTTP to peers
+- fetches newer production cores from peers, verifies them locally, and hands over without stopping the service
+- maintains a rollback probation window before redistributing a newly promoted core
+- restores the previous signed core automatically when a newly promoted core crashes during probation
+
+A new loader deployment must be bootstrapped with a core binary at `loader/current/tracey-core`. If metadata and signature are missing, the loader generates them locally using the configured shared key.
+
+## Service Installation Script
+
+`scripts/install-service.sh` automates Linux `systemd` installation.
+
+What the script does in the current implementation:
+
+- resolves or builds `tracey` and `tracey-loader`
+- installs `tracey-loader` as the service entry point
+- installs a mutable Tracey core into the state directory
+- writes a minimal JSON config with `agent_id`, `update.local_channel`, `loader.state_dir`, and optional `bootstrap_version`
+- writes an optional environment file for later overrides
+- writes a `systemd` unit with `WorkingDirectory` set to the Tracey state directory
+- enables and optionally starts the service
+- in system scope, prefers `sudo` and disables a conflicting user-scope Tracey service when necessary
+
+See `[docs/OPERATIONS.md](docs/OPERATIONS.md)` for operational detail.
+
+## Security and Compliance Notes
+
+The repository contains real security controls, but several surfaces are intentionally permissive until explicitly hardened.
+
+Important examples:
+
+- OIDC support exists, but `auth.mode` defaults to `off`
+- discovery, update, loader gossip, and Prometheus follower forwarding use symmetric shared-key MACs rather than asymmetric signatures
+- the loader transfer server and status server are plain HTTP unless you add TLS externally
+- `/metrics` is not OIDC-gated and should be protected with network controls or a reverse proxy
+- `TraceyBan` action hooks run shell commands from configuration and may require root access
+
+Detailed guidance is in `[SECURITY.md](SECURITY.md)`. Compliance posture notes are in `[COMPLIANCE.md](COMPLIANCE.md)`.
+
+## Documentation Map
+
+- `[WORKFLOW_ANALYSIS.md](WORKFLOW_ANALYSIS.md)`: detailed architecture, workflows, subsystem interactions, and current caveats
+- `[docs/CONFIGURATION_REFERENCE.md](docs/CONFIGURATION_REFERENCE.md)`: configuration sections, defaults, sanitisation behaviour, and key override patterns
+- `[docs/OPERATIONS.md](docs/OPERATIONS.md)`: commands, files, interfaces, service installation, and day-two operations
+- `[SECURITY.md](SECURITY.md)`: security model, implemented controls, and hardening guidance
+- `[COMPLIANCE.md](COMPLIANCE.md)`: compliance-support mapping and evidence considerations
+
+## Local Verification
+
+Last locally verified on **31 March 2026**:
 
 ```bash
-tracey sign-update --bundle ./tracey-new --version 0.2.0 --os linux --arch x86_64 --channel production --out updates --key "<shared_key>"
+cargo test --all-targets
 ```
 
-This produces `tracey.update`, `tracey.update.meta.json`, and `tracey.update.sig` in `updates/`.
-
-### Loader/Core Split
-
-`tracey-loader` is the durable background service. It keeps a small self-integrity manifest, runs the mutable `tracey` core, and performs zero-downtime handoffs for both local OTA staging and peer-to-peer production rollouts.
-
-Peer rollouts follow these rules:
-
-- loaders only advertise same-OS/arch core metadata and transfer endpoints over authenticated UDP gossip
-- only production cores are redistributed automatically
-- a host configured with `update.local_channel = "development"` will not overwrite its local core with production code and will not serve its core to peers
-- if a peer advertises a newer production core for the same OS/arch, the loader fetches the signed bundle, verifies it locally, and hands over to it without stopping the service
-- newly activated cores stay in a rollback probation window (`loader.rollback_window_ms`) and are not redistributed until they survive that window
-- if a newly received core fails to load or crashes during the probation window, the loader restores the previous signed core automatically
-
-The legacy `tracey --supervisor` entrypoint still exists, but `tracey-loader` is the recommended service mode.
-
-### Service Installation (systemd)
-
-On Linux systems running systemd, use the installer script to install Tracey as a background service. The script installs `tracey-loader` as the service entrypoint, seeds the mutable core into the writable service state tree, creates a stable config with an explicit `agent_id`, writes a systemd unit, and enables the service.
-
-Default install:
-
-```bash
-./scripts/install-service.sh
-```
-
-`--scope auto` now prefers a system service so Tracey starts at boot under `multi-user.target`. If the installer is not already running as root, it will request `sudo` for the privileged install steps.
-When installing system scope, the installer will also disable a conflicting `systemctl --user` Tracey service for the current user so the default loader ports are not double-bound.
-
-System service:
-
-```bash
-sudo ./scripts/install-service.sh
-```
-
-User service:
-
-```bash
-./scripts/install-service.sh --scope user
-```
-
-Preview without changing the host:
-
-```bash
-./scripts/install-service.sh --dry-run
-```
-
-By default the installer writes:
-
-- system scope: `/usr/local/bin/tracey-loader`, `/etc/tracey/tracey.json`, `/var/lib/tracey/loader/current/tracey-core`, `/etc/systemd/system/tracey.service`
-- user scope: `~/.local/bin/tracey-loader`, `~/.config/tracey/tracey.json`, `~/.local/state/tracey/loader/current/tracey-core`, `~/.config/systemd/user/tracey.service`
-
-Override paths with `--core-binary`, `--loader-binary`, `--loader-install-path`, `--core-install-path`, `--config`, `--state-dir`, `--unit-path`, and `--env-file`.
-
-### Telemetry Integration (Prometheus + OTLP)
-
-If your host exposes Prometheus-style metrics (including many OTel Collector setups), enable `telemetry` and provide endpoints. By default, Tracey will autodiscover common local endpoints when enabled and will only scrape loopback addresses unless `allow_remote` is true.
-
-For OTLP-native ingest, enable `telemetry.otlp` and point your OTel SDK/collector exporter to `grpc_addr` or `http_addr` on the Tracey host. When both Prometheus and OTLP metrics are present, Tracey prefers Prometheus and de-duplicates OTLP samples within `dedup_ttl_ms` using attribute-based keys (metric name + labels/attributes) to keep overhead minimal.
-
-### Governance (Swarm-Driven Rules)
-
-When `governance.enabled` is true, swarm agents vote on a shared operational posture (relaxed/balanced/strict/lockdown) and the coordinator enforces rule changes accordingly. This drives dynamic enforcement of key settings such as `active_response`, `shutdown_enabled`, update gating, and telemetry controls. The decisions are logged as `governance_update` records.
-
-Optional `governance.rebel` introduces rare contrarian votes (bounded by probability and cooldown) to simulate byzantine behavior and keep the consensus process robust over time.
-
-### Coordinator Election + Split Brain + Load Sharing
-
-The coordinator role is elected across agents using weighted scoring (capabilities + observed latency + hash tie‑breaks). If partitions occur, each partition will elect its own coordinators (split brain). When connectivity is restored, all agents converge on the same top‑K coordinators and non‑leaders step down automatically.
-
-The score includes a hash component (shared discovery key + `agent_id`) to provide deterministic tie‑breaks.
-
-With `max_coordinators > 1`, leaders load‑share by deterministically partitioning events across the top‑K coordinators.
-
-The swarm also tracks a lowest‑latency proxy (preferably among current coordinators) to service external status queries.
-
-### Status RPC (Proxied)
-
-Tracey exposes a lightweight status endpoint. Requests to any agent are proxied to the elected lowest‑latency proxy, with a local fallback if the proxy is unreachable.
-
-```bash
-curl http://agent-host:48000/status
-curl http://agent-host:48000/tracey_guard
-curl http://agent-host:48000/tracey_guard/deepdive
-curl -X POST http://agent-host:48000/control/tracey_guard \
-  -H 'content-type: application/json' \
-  -d '{"enabled":true,"deep_dive":true,"overhead_budget_pct":2.5,"tmr_enabled":true,"force_scan":true}'
-```
-
-Set `status.public_addr` when the listen address is not routable (for example, `0.0.0.0` or a private bind).
-
-TraceyGuard routes:
-- `GET /tracey_guard` returns the current TraceyGuard runtime snapshot.
-- `GET /tracey_guard/deepdive` returns the same deep-dive payload used by NMC dashboard drilldowns.
-- `POST /control/tracey_guard` applies runtime controls without restarting the agent.
-
-### OIDC Auth (Status + OTLP)
-
-Tracey can enforce OIDC bearer tokens on `/status` and OTLP ingest endpoints. Enable via config or environment variables:
-
-- `NM_AUTH_MODE=oidc` (or `TRACEY_AUTH_MODE=oidc`)
-- `NM_OIDC_ISSUER`, `NM_OIDC_JWKS_URL` (optional), `NM_OIDC_CLIENT_ID`
-- `NM_OIDC_ALLOWED_AUDIENCES` or `NM_OIDC_AUDIENCE`
-- `NM_OIDC_REQUIRED_SCOPES`
-- `NM_OIDC_PROTECT_STATUS=1`, `NM_OIDC_PROTECT_OTLP_HTTP=1`, `NM_OIDC_PROTECT_OTLP_GRPC=1`
-
-### TraceyGuard Runtime Env Overrides
-
-- `TRACEY_GUARD_ENABLED` / `NM_TRACEY_GUARD_ENABLED`
-- `TRACEY_GUARD_OVERHEAD_PCT` / `NM_TRACEY_GUARD_OVERHEAD_PCT`
-- `TRACEY_GUARD_POLL_MS` / `NM_TRACEY_GUARD_POLL_MS`
-- `TRACEY_GUARD_REMOTE_TTL_MS` / `NM_TRACEY_GUARD_REMOTE_TTL_MS`
-
-### AER Stimuli Bridge (Tracey <-> AARNN)
-
-Tracey can exchange spiking stimuli with AARNN using Address-Event Representation (AER) over UDP. It encodes swarm events as AER spikes and can ingest AER spikes from AARNN as observability events.
-
-Default address ranges:
-- Tracey event spikes: base `0x1000` with kind/severity strides.
-- Tracey posture spikes: base `0x1100` (relaxed/balanced/strict/lockdown).
-- AARNN output spikes (ingest): base `0x4000`.
-
-Use matching base values on AARNN so both sides interpret addresses consistently.
-
-## Safety Notes
-
-Tracey does not self-propagate or probe exploits. Use approved deployment channels (MDM, SSH, GPO, package managers) and authorized telemetry sources.
-
-To enable active response, set `active_response` and wire actions to your own containment pipeline.
-
-## Tracey is enabled by:
-![NeuralMimicry](src/nm512.png) ![AARNN](src/nmaarnn.png)
+Result: **99 tests passed, 0 failed**.

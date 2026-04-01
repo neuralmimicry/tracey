@@ -3,6 +3,7 @@
 pub mod aer;
 pub mod assets;
 pub mod auth;
+pub mod autoscaler;
 pub mod bus;
 pub mod capabilities;
 pub mod config;
@@ -179,6 +180,13 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         shutdown_listener.clone(),
         &config.discovery.shared_key,
     );
+    let continuum_autoscaler = autoscaler::spawn_continuum_autoscaler(
+        config.continuum_autoscaler.clone(),
+        config.agent_id.clone(),
+        coordination_role.clone(),
+        slurm_runtime.clone(),
+        shutdown_listener.clone(),
+    );
 
     for id in 0..config.agents {
         let agent = Agent::new(
@@ -228,6 +236,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     tracey_guard: Some(tracey_guard.clone()),
                     slurm: slurm_runtime.clone(),
                     prometheus_export: prometheus_export_handle.clone(),
+                    continuum_autoscaler: Some(continuum_autoscaler.clone()),
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));

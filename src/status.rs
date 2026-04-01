@@ -36,6 +36,7 @@ pub struct StatusService {
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
     pub slurm: crate::slurm::SlurmRuntimeHandle,
     pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
+    pub continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +83,8 @@ struct StatusSnapshot {
     tracey_guard: Option<crate::tracey_guard::TraceyGuardStatusSnapshot>,
     #[serde(default)]
     slurm: Option<crate::slurm::SlurmSnapshot>,
+    #[serde(default)]
+    continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerSnapshot>,
 }
 
 pub async fn spawn_status(
@@ -287,6 +290,11 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         None
     };
     let slurm = service.slurm.snapshot().await;
+    let continuum_autoscaler = if let Some(autoscaler) = &service.continuum_autoscaler {
+        Some(autoscaler.snapshot().await)
+    } else {
+        None
+    };
     let local_probe = role.prometheus_probe.clone();
 
     StatusSnapshot {
@@ -329,6 +337,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
             .collect(),
         tracey_guard,
         slurm,
+        continuum_autoscaler,
     }
 }
 
