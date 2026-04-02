@@ -567,6 +567,7 @@ These metrics matter beyond observability because TraceyGuard uses embedded GPU 
 The code is trying to bring TraceyGuard-style GPU health probing into Tracey’s async runtime while preserving:
 
 - periodic probe scheduling
+- adaptive cadence that expands in low-risk periods and compresses under fault pressure
 - workload-aware sampling
 - fuzzy risk scoring over probe results
 - remote fault corroboration via gossip
@@ -589,12 +590,14 @@ That makes TraceyGuard a meaningful scheduler/correlation prototype, but not yet
 1. discover real GPU identities if possible, otherwise create synthetic devices
 2. maintain per-device telemetry context from embedded GPU events
 3. build per-probe schedules from config
-4. dispatch scheduled probes subject to an overhead budget and max-parallel semaphore
-5. score probe results with a dedicated adaptive scorer
-6. update a Beta-distribution-style reliability model per device
-7. transition device states based on reliability, confidence, remote corroboration, and failure streaks
-8. publish local faults into the fault-intel hub and to the event bus
-9. refresh a bounded status snapshot
+4. derive a smoothed scheduler signal from device state, recent probe failures, telemetry stress, deep-dive mode, and overhead pressure
+5. arm lightweight random audit probes so long quiet windows still get irregular spot-checks outside the normal due schedule
+6. dispatch scheduled probes and random audits subject to the adaptive cadence, the overhead budget, and the max-parallel semaphore
+7. score probe results with a dedicated adaptive scorer
+8. update a Beta-distribution-style reliability model per device
+9. transition device states based on reliability, confidence, remote corroboration, and failure streaks
+10. publish local faults into the fault-intel hub and to the event bus
+11. refresh a bounded status snapshot that now includes the current adaptive poll interval, target poll interval, and scheduler signal
 
 ### TMR workflow
 

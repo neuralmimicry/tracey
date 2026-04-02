@@ -267,7 +267,7 @@ TraceyGuard is enabled by default.
 | Field | Default | Notes |
 | --- | --- | --- |
 | `tracey_guard.enabled` | `true` | Enables the TraceyGuard runtime. |
-| `tracey_guard.scheduler_poll_ms` | `200` | Probe scheduler loop cadence. |
+| `tracey_guard.scheduler_poll_ms` | `200` | Minimum probe scheduler loop cadence; the runtime stretches above this when fleet risk is low and converges back toward it as risk rises. |
 | `tracey_guard.max_parallel_tasks` | `32` | Concurrent probe-task limit. |
 | `tracey_guard.overhead_budget_pct` | `2.0` | Intended runtime overhead budget. |
 | `tracey_guard.max_devices` | `32` | Maximum devices tracked. |
@@ -276,6 +276,10 @@ TraceyGuard is enabled by default.
 | `tracey_guard.max_advertised_faults` | `64` | Maximum faults advertised over discovery. |
 | `tracey_guard.remote_fault_ttl_ms` | `120_000` | Remote fault-intel retention. |
 | `tracey_guard.deep_dive_max_faults` | `256` | Snapshot cap for deeper fault detail. |
+
+The TraceyGuard scheduler now derives its effective poll interval from recent probe outcomes, device lifecycle state, fuzzy risk, telemetry stress, deep-dive mode, and budget pressure. Low-risk healthy fleets drift toward less frequent polling; suspect, quarantined, or fault-active fleets tighten polling and shorten effective probe periods with a gradual recovery back to lower overhead once risk subsides.
+
+Even when the main cadence stretches out, TraceyGuard also injects lightweight random audit probes at irregular times so quiet windows do not become fully predictable. Those audits are biased toward cheaper, higher-priority probes and stay bounded by the same overhead posture.
 
 ### TMR settings
 

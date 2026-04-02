@@ -9,11 +9,12 @@ use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
 use crate::swarm::AdaptiveScorer;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::RandomState};
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 
 static TRACEY_GUARD_EVENT_COUNTER: AtomicU64 = AtomicU64::new(30_000_000);
 
@@ -137,6 +138,9 @@ struct DeviceState {
     probe_pass_count: u64,
     probe_fail_count: u64,
     probe_error_count: u64,
+    last_risk: f64,
+    last_confidence: f64,
+    last_probe_ms: u64,
     scorer: AdaptiveScorer,
 }
 
@@ -155,6 +159,9 @@ impl DeviceState {
             probe_pass_count: 0,
             probe_fail_count: 0,
             probe_error_count: 0,
+            last_risk: 0.0,
+            last_confidence: 0.0,
+            last_probe_ms: 0,
             scorer: AdaptiveScorer::new(12, cfg.probes_fuzzy_profile()),
         }
     }
@@ -252,6 +259,12 @@ impl DeviceState {
         }
     }
 
+    fn observe_probe_score(&mut self, ts_ms: u64, risk: f64, confidence: f64) {
+        self.last_risk = (self.last_risk * 0.35 + risk * 0.65).clamp(0.0, 1.0);
+        self.last_confidence = (self.last_confidence * 0.35 + confidence * 0.65).clamp(0.0, 1.0);
+        self.last_probe_ms = ts_ms;
+    }
+
     fn transition_to(&mut self, target: TraceyGuardGpuState, reason: &str) {
         if self.state == target {
             return;
@@ -271,6 +284,7 @@ struct ScheduledProbe {
     gpu_id: String,
     sm_id: u32,
     timeout_ms: u64,
+    random_audit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -282,8 +296,158 @@ struct ProbeScheduleState {
     priority: u8,
     timeout_ms: u64,
     enabled: bool,
-    next_fire_ms: u64,
+    last_fire_ms: u64,
+    last_effective_period_ms: u64,
     cursor: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveScheduleProfile {
+    signal: f64,
+    poll_ms: u64,
+    target_poll_ms: u64,
+    period_scale: f64,
+    coverage_scale: f64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveSchedulerState {
+    signal: f64,
+    last_update_ms: u64,
+}
+
+impl AdaptiveSchedulerState {
+    fn new(now: u64) -> Self {
+        Self {
+            signal: 0.0,
+            last_update_ms: now,
+        }
+    }
+
+    fn profile(
+        &mut self,
+        config: &TraceyGuardConfig,
+        raw_signal: f64,
+        used_ratio: f64,
+        budget_ceiling: f64,
+        now: u64,
+    ) -> AdaptiveScheduleProfile {
+        self.signal = smooth_scheduler_signal(self.signal, raw_signal, self.last_update_ms, now);
+        self.last_update_ms = now;
+
+        let target_poll_ms =
+            adaptive_scheduler_poll_ms(config, raw_signal, used_ratio, budget_ceiling);
+        let poll_ms = adaptive_scheduler_poll_ms(config, self.signal, used_ratio, budget_ceiling);
+
+        AdaptiveScheduleProfile {
+            signal: self.signal,
+            poll_ms,
+            target_poll_ms,
+            period_scale: adaptive_schedule_period_scale(self.signal, used_ratio, budget_ceiling),
+            coverage_scale: adaptive_schedule_coverage_scale(self.signal),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RecentProbeOutcome {
+    ts_ms: u64,
+    probe_state: ProbeState,
+    risk: f64,
+    confidence: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RandomAuditState {
+    next_fire_ms: u64,
+    sequence: u64,
+    armed: bool,
+    entropy: RandomState,
+}
+
+impl RandomAuditState {
+    fn new() -> Self {
+        Self {
+            next_fire_ms: 0,
+            sequence: 0,
+            armed: false,
+            entropy: RandomState::new(),
+        }
+    }
+
+    fn arm_if_needed(
+        &mut self,
+        now: u64,
+        fastest_effective_period_ms: u64,
+        profile: AdaptiveScheduleProfile,
+    ) {
+        if !self.armed {
+            self.reschedule(now, fastest_effective_period_ms, profile);
+        }
+    }
+
+    fn is_due(&self, now: u64) -> bool {
+        self.armed && now >= self.next_fire_ms
+    }
+
+    fn due_in_ms(&self, now: u64) -> u64 {
+        if !self.armed {
+            return u64::MAX;
+        }
+        self.next_fire_ms.saturating_sub(now)
+    }
+
+    fn reschedule(
+        &mut self,
+        now: u64,
+        fastest_effective_period_ms: u64,
+        profile: AdaptiveScheduleProfile,
+    ) {
+        let sample = self.next_unit("tracey_guard_random_audit_interval");
+        let interval = random_audit_interval_ms(profile, fastest_effective_period_ms, sample);
+        self.next_fire_ms = now.saturating_add(interval);
+        self.armed = true;
+    }
+
+    fn next_index(&mut self, upper: usize, salt: &str) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        (self.next_u64(salt) as usize) % upper
+    }
+
+    fn next_weighted_index(&mut self, weights: &[u64], salt: &str) -> Option<usize> {
+        let total: u64 = weights.iter().copied().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut pick = self.next_u64(salt) % total;
+        for (index, weight) in weights.iter().copied().enumerate() {
+            if weight == 0 {
+                continue;
+            }
+            if pick < weight {
+                return Some(index);
+            }
+            pick -= weight;
+        }
+        None
+    }
+
+    fn next_unit(&mut self, salt: &str) -> f64 {
+        let raw = self.next_u64(salt);
+        ((raw as f64) + 1.0) / ((u64::MAX as f64) + 2.0)
+    }
+
+    fn next_u64(&mut self, salt: &str) -> u64 {
+        let mut hasher = self.entropy.build_hasher();
+        hasher.write_u64(self.sequence);
+        hasher.write_u64(self.next_fire_ms);
+        hasher.write_u64(std::process::id() as u64);
+        hasher.write(salt.as_bytes());
+        self.sequence = self.sequence.saturating_add(1);
+        hasher.finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -375,6 +539,9 @@ pub struct TraceyGuardSummary {
     pub deep_dive: bool,
     pub overhead_budget_pct: f64,
     pub scheduler_poll_ms: u64,
+    pub scheduler_target_poll_ms: u64,
+    pub scheduler_signal: f64,
+    pub scheduler_period_scale: f64,
     pub total_devices: usize,
     pub healthy_devices: usize,
     pub suspect_devices: usize,
@@ -584,6 +751,7 @@ pub struct TraceyGuardRuntimeHandle {
     control: Arc<RwLock<TraceyGuardControlState>>,
     snapshot: Arc<RwLock<TraceyGuardStatusSnapshot>>,
     fault_hub: FaultIntelHub,
+    control_notify: Arc<Notify>,
 }
 
 impl TraceyGuardRuntimeHandle {
@@ -600,6 +768,7 @@ impl TraceyGuardRuntimeHandle {
             })),
             snapshot: Arc::new(RwLock::new(TraceyGuardStatusSnapshot::default())),
             fault_hub: FaultIntelHub::new(remote_fault_ttl_ms),
+            control_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -636,6 +805,7 @@ impl TraceyGuardRuntimeHandle {
             control.force_scan_epoch = control.force_scan_epoch.saturating_add(1);
         }
         control.updated_ms = now_ms();
+        self.control_notify.notify_waiters();
         control.clone()
     }
 }
@@ -659,11 +829,13 @@ pub fn spawn_tracey_guard(
     }));
     let snapshot = Arc::new(RwLock::new(TraceyGuardStatusSnapshot::default()));
     let fault_hub = FaultIntelHub::new(config.remote_fault_ttl_ms);
+    let control_notify = Arc::new(Notify::new());
 
     let handle = TraceyGuardRuntimeHandle {
         control: control.clone(),
         snapshot: snapshot.clone(),
         fault_hub: fault_hub.clone(),
+        control_notify: control_notify.clone(),
     };
 
     tokio::spawn(async move {
@@ -676,6 +848,7 @@ pub fn spawn_tracey_guard(
             control,
             snapshot,
             fault_hub,
+            control_notify,
         )
         .await;
     });
@@ -692,6 +865,7 @@ async fn run_tracey_guard_runtime(
     control: Arc<RwLock<TraceyGuardControlState>>,
     snapshot: Arc<RwLock<TraceyGuardStatusSnapshot>>,
     fault_hub: FaultIntelHub,
+    control_notify: Arc<Notify>,
 ) {
     // Device discovery intentionally supports synthetic fallback so TraceyGuard can
     // still exercise scheduling/fuzzy/correlation logic on CPU-only hosts.
@@ -720,7 +894,6 @@ async fn run_tracey_guard_runtime(
         .collect();
 
     let mut schedules = build_schedules(&config);
-    let mut scheduler_tick = tokio::time::interval(Duration::from_millis(config.scheduler_poll_ms));
     let mut tmr_tick = tokio::time::interval(Duration::from_millis(config.tmr.interval_ms));
 
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel::<ProbeExecution>(4096);
@@ -729,6 +902,9 @@ async fn run_tracey_guard_runtime(
     let mut bus_rx = bus.subscribe();
     let mut last_force_scan_epoch = 0u64;
     let mut budget_window: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut recent_outcomes: VecDeque<RecentProbeOutcome> = VecDeque::new();
+    let mut scheduler_state = AdaptiveSchedulerState::new(now_ms());
+    let mut random_audit_state = RandomAuditState::new();
 
     let mut per_probe_counters: HashMap<ProbeType, ProbeCounters> = ProbeType::all()
         .into_iter()
@@ -740,18 +916,65 @@ async fn run_tracey_guard_runtime(
     let fault_snapshot_limit = config.deep_dive_max_faults.max(LOCAL_SNAPSHOT_MAX_FAULTS);
 
     // Single async event loop:
-    // - scheduler tick dispatches probe kernels
+    // - scheduler wake dispatches due probe kernels and occasional random audits
     // - probe channel ingests completed results
     // - event bus intake refreshes telemetry context
     // - TMR tick runs cross-device consensus checks
     loop {
+        let control_state = control.read().await.clone();
+        let now = now_ms();
+        let used_ratio = update_budget_and_ratio(&mut budget_window, now, 60_000);
+        trim_recent_outcomes(&mut recent_outcomes, now, config.correlation.window_ms);
+        let budget_ceiling = (control_state.overhead_budget_pct / 100.0).clamp(0.001, 0.99);
+        let force_scan = control_state.force_scan_epoch != last_force_scan_epoch;
+        let raw_signal = if control_state.enabled {
+            compute_scheduler_signal(
+                &device_state,
+                &telemetry_ctx,
+                &recent_outcomes,
+                &control_state,
+                &config,
+                now,
+                force_scan,
+            )
+        } else {
+            0.0
+        };
+        let profile = scheduler_state.profile(&config, raw_signal, used_ratio, budget_ceiling, now);
+        let fastest_effective_period_ms =
+            fastest_effective_schedule_period_ms(&schedules, &devices, &telemetry_ctx, profile);
+        if control_state.enabled && !force_scan {
+            random_audit_state.arm_if_needed(now, fastest_effective_period_ms, profile);
+        }
+        let random_audit_due =
+            control_state.enabled && !force_scan && random_audit_state.is_due(now);
+        let random_audit_wait_ms = if control_state.enabled && !force_scan {
+            random_audit_state.due_in_ms(now)
+        } else {
+            profile.poll_ms
+        };
+        let scheduler_wait_ms = next_scheduler_wait_ms(
+            &schedules,
+            &devices,
+            &telemetry_ctx,
+            profile,
+            now,
+            force_scan,
+        )
+        .min(random_audit_wait_ms);
+        let scheduler_sleep = tokio::time::sleep(Duration::from_millis(scheduler_wait_ms));
+        tokio::pin!(scheduler_sleep);
+
         tokio::select! {
             _ = shutdown.wait() => {
                 tracing::info!("tracey_guard runtime shutting down");
                 break;
             }
-            _ = scheduler_tick.tick() => {
-                let control_state = control.read().await.clone();
+            _ = &mut scheduler_sleep => {
+                if force_scan {
+                    last_force_scan_epoch = control_state.force_scan_epoch;
+                }
+
                 if !control_state.enabled {
                     refresh_snapshot(
                         &snapshot,
@@ -760,17 +983,10 @@ async fn run_tracey_guard_runtime(
                         &device_state,
                         &fault_hub,
                         &timeline,
-                        config.scheduler_poll_ms,
+                        profile,
                         fault_snapshot_limit,
                     ).await;
                     continue;
-                }
-                let now = now_ms();
-                let used_ratio = update_budget_and_ratio(&mut budget_window, now, 60_000);
-                let budget_ceiling = (control_state.overhead_budget_pct / 100.0).clamp(0.001, 0.99);
-                let force_scan = control_state.force_scan_epoch != last_force_scan_epoch;
-                if force_scan {
-                    last_force_scan_epoch = control_state.force_scan_epoch;
                 }
 
                 if used_ratio < budget_ceiling || force_scan {
@@ -778,60 +994,41 @@ async fn run_tracey_guard_runtime(
                         &mut schedules,
                         &devices,
                         &telemetry_ctx,
+                        profile,
                         now,
                         force_scan,
                     );
                     for task in scheduled {
-                        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                        if !dispatch_probe_task(
+                            task,
+                            &semaphore,
+                            &probe_tx,
+                            &telemetry_ctx,
+                            control_state.deep_dive,
+                        ) {
                             break;
-                        };
-                        let tx = probe_tx.clone();
-                        let ctx = telemetry_ctx
-                            .get(&task.gpu_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        let deep_dive = control_state.deep_dive;
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let start = Instant::now();
-                            let execution_id = format!(
-                                "tracey_guard-{}-{}-{}-{}",
-                                task.probe_type.as_str(),
-                                task.gpu_id,
-                                task.sm_id,
-                                now_ms(),
-                            );
-                            let execution_id_for_probe = execution_id.clone();
-                            let task_for_probe = task.clone();
-                            let probe_future = tokio::task::spawn_blocking(move || {
-                                execute_probe_kernel(
-                                    &execution_id_for_probe,
-                                    task_for_probe.probe_type,
-                                    &task_for_probe.gpu_id,
-                                    task_for_probe.sm_id,
-                                    &ctx,
-                                    deep_dive,
-                                )
-                            });
-
-                            let mut result = match tokio::time::timeout(
-                                Duration::from_millis(task.timeout_ms.max(100)),
-                                probe_future,
-                            )
-                            .await
-                            {
-                                Ok(Ok(result)) => result,
-                                Ok(Err(_join)) => {
-                                    probe_terminal_result(&execution_id, &task, ProbeState::Error)
-                                }
-                                Err(_timeout) => {
-                                    probe_terminal_result(&execution_id, &task, ProbeState::Timeout)
-                                }
-                            };
-                            result.execution_time_ns = start.elapsed().as_nanos() as u64;
-                            let _ = tx.send(result).await;
-                        });
+                        }
                     }
+                }
+
+                if random_audit_due {
+                    if used_ratio < (budget_ceiling * 1.10).clamp(0.001, 0.99)
+                        && let Some(task) = build_random_audit_task(
+                            &mut schedules,
+                            &devices,
+                            &telemetry_ctx,
+                            &mut random_audit_state,
+                        )
+                    {
+                        let _ = dispatch_probe_task(
+                            task,
+                            &semaphore,
+                            &probe_tx,
+                            &telemetry_ctx,
+                            control_state.deep_dive,
+                        );
+                    }
+                    random_audit_state.reschedule(now, fastest_effective_period_ms, profile);
                 }
 
                 refresh_snapshot(
@@ -841,10 +1038,11 @@ async fn run_tracey_guard_runtime(
                     &device_state,
                     &fault_hub,
                     &timeline,
-                    config.scheduler_poll_ms,
+                    profile,
                     fault_snapshot_limit,
                 ).await;
             }
+            _ = control_notify.notified() => {}
             Some(mut execution) = probe_rx.recv() => {
                 let Some(device) = device_state.get_mut(&execution.gpu_id) else {
                     continue;
@@ -886,6 +1084,7 @@ async fn run_tracey_guard_runtime(
                 execution.risk = scored.risk;
                 execution.confidence = scored.confidence;
                 execution.severity = severity;
+                device.observe_probe_score(execution.ts_ms, execution.risk, execution.confidence);
 
                 event = event
                     .with_attr("fuzzy_risk", format!("{:.5}", execution.risk))
@@ -989,6 +1188,12 @@ async fn run_tracey_guard_runtime(
                 }
 
                 budget_window.push_back((now_ms(), execution.execution_time_ns));
+                recent_outcomes.push_back(RecentProbeOutcome {
+                    ts_ms: execution.ts_ms,
+                    probe_state: execution.probe_state,
+                    risk: execution.risk,
+                    confidence: execution.confidence,
+                });
             }
             Ok(event) = bus_rx.recv() => {
                 ingest_telemetry_context(&event, &mut telemetry_ctx);
@@ -1018,7 +1223,7 @@ async fn refresh_snapshot(
     device_state: &HashMap<String, DeviceState>,
     fault_hub: &FaultIntelHub,
     timeline: &VecDeque<TimelineBucket>,
-    scheduler_poll_ms: u64,
+    profile: AdaptiveScheduleProfile,
     fault_snapshot_limit: usize,
 ) {
     // Snapshot assembly is read-mostly and bounded to keep status endpoints fast.
@@ -1082,7 +1287,10 @@ async fn refresh_snapshot(
         enabled: control.enabled,
         deep_dive: control.deep_dive,
         overhead_budget_pct: control.overhead_budget_pct,
-        scheduler_poll_ms,
+        scheduler_poll_ms: profile.poll_ms,
+        scheduler_target_poll_ms: profile.target_poll_ms,
+        scheduler_signal: profile.signal,
+        scheduler_period_scale: profile.period_scale,
         total_devices: device_state.len(),
         healthy_devices,
         suspect_devices,
@@ -1139,6 +1347,65 @@ struct DiscoveredDevice {
     sm_count: u32,
 }
 
+fn dispatch_probe_task(
+    task: ScheduledProbe,
+    semaphore: &Arc<Semaphore>,
+    probe_tx: &tokio::sync::mpsc::Sender<ProbeExecution>,
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    deep_dive: bool,
+) -> bool {
+    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        return false;
+    };
+    let tx = probe_tx.clone();
+    let ctx = telemetry_ctx.get(&task.gpu_id).cloned().unwrap_or_default();
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let start = Instant::now();
+        let dispatch_kind = if task.random_audit {
+            "random_audit"
+        } else {
+            "scheduled"
+        };
+        let execution_id = format!(
+            "tracey_guard-{}-{}-{}-{}-{}",
+            dispatch_kind,
+            task.probe_type.as_str(),
+            task.gpu_id,
+            task.sm_id,
+            now_ms(),
+        );
+        let execution_id_for_probe = execution_id.clone();
+        let task_for_probe = task.clone();
+        let probe_future = tokio::task::spawn_blocking(move || {
+            execute_probe_kernel(
+                &execution_id_for_probe,
+                task_for_probe.probe_type,
+                &task_for_probe.gpu_id,
+                task_for_probe.sm_id,
+                &ctx,
+                deep_dive,
+            )
+        });
+
+        let mut result = match tokio::time::timeout(
+            Duration::from_millis(task.timeout_ms.max(100)),
+            probe_future,
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_join)) => probe_terminal_result(&execution_id, &task, ProbeState::Error),
+            Err(_timeout) => probe_terminal_result(&execution_id, &task, ProbeState::Timeout),
+        };
+        result.execution_time_ns = start.elapsed().as_nanos() as u64;
+        let _ = tx.send(result).await;
+    });
+
+    true
+}
+
 fn build_schedules(config: &TraceyGuardConfig) -> Vec<ProbeScheduleState> {
     let now = now_ms();
     ProbeType::all()
@@ -1152,7 +1419,8 @@ fn build_schedules(config: &TraceyGuardConfig) -> Vec<ProbeScheduleState> {
                 priority: cfg.priority,
                 timeout_ms: cfg.timeout_ms,
                 enabled: cfg.enabled,
-                next_fire_ms: now,
+                last_fire_ms: now.saturating_sub(cfg.period_ms),
+                last_effective_period_ms: cfg.period_ms,
                 cursor: 0,
             }
         })
@@ -1163,21 +1431,28 @@ fn schedule_due_tasks(
     schedules: &mut [ProbeScheduleState],
     devices: &[DiscoveredDevice],
     telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    profile: AdaptiveScheduleProfile,
     now: u64,
     force_scan: bool,
 ) -> Vec<ScheduledProbe> {
     let mut out = Vec::new();
     schedules.sort_by_key(|schedule| (schedule.priority, schedule.period_ms));
+    let avg_utilization = average_utilization(devices, telemetry_ctx);
+    let utilization_scale = utilization_multiplier(avg_utilization);
     for schedule in schedules.iter_mut() {
         if !schedule.enabled {
             continue;
         }
-        if !force_scan && now < schedule.next_fire_ms {
+        let effective_period = effective_schedule_period_ms(
+            schedule.period_ms,
+            utilization_scale,
+            profile.period_scale,
+        );
+        schedule.last_effective_period_ms = effective_period;
+        if !force_scan && now < schedule.last_fire_ms.saturating_add(effective_period) {
             continue;
         }
 
-        let avg_utilization = average_utilization(devices, telemetry_ctx);
-        let period_multiplier = utilization_multiplier(avg_utilization);
         for device in devices {
             let util = telemetry_ctx
                 .get(&device.gpu_id)
@@ -1186,7 +1461,10 @@ fn schedule_due_tasks(
             let effective_coverage = if force_scan {
                 schedule.sm_coverage
             } else {
-                sm_coverage_for_utilization(schedule.sm_coverage, util)
+                coverage_with_scale(
+                    sm_coverage_for_utilization(schedule.sm_coverage, util),
+                    profile.coverage_scale,
+                )
             };
             let sms = sample_sms(device.sm_count, effective_coverage, schedule.cursor);
             schedule.cursor = schedule.cursor.wrapping_add(1);
@@ -1196,13 +1474,172 @@ fn schedule_due_tasks(
                     gpu_id: device.gpu_id.clone(),
                     sm_id: sm,
                     timeout_ms: schedule.timeout_ms,
+                    random_audit: false,
                 });
             }
         }
-        let effective_period = ((schedule.period_ms as f64) * period_multiplier) as u64;
-        schedule.next_fire_ms = now.saturating_add(effective_period.max(100));
+        schedule.last_fire_ms = now;
     }
     out
+}
+
+fn build_random_audit_task(
+    schedules: &mut [ProbeScheduleState],
+    devices: &[DiscoveredDevice],
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    random_audit_state: &mut RandomAuditState,
+) -> Option<ScheduledProbe> {
+    if devices.is_empty() {
+        return None;
+    }
+
+    let selectable_indices: Vec<usize> = schedules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schedule)| schedule.enabled.then_some(index))
+        .collect();
+    if selectable_indices.is_empty() {
+        return None;
+    }
+
+    let weights: Vec<u64> = selectable_indices
+        .iter()
+        .map(|index| random_audit_weight(&schedules[*index]))
+        .collect();
+    let chosen_offset =
+        random_audit_state.next_weighted_index(&weights, "tracey_guard_random_audit_probe")?;
+    let schedule_index = selectable_indices[chosen_offset];
+    let device =
+        &devices[random_audit_state.next_index(devices.len(), "tracey_guard_random_audit_device")];
+    let sm_upper = device.sm_count.max(1) as usize;
+    let schedule = &mut schedules[schedule_index];
+    let util = telemetry_ctx
+        .get(&device.gpu_id)
+        .map(|ctx| ctx.util_pct)
+        .unwrap_or_default();
+    let sm_bias = if util >= 90.0 { 1 } else { 3 };
+    let sm_id = (random_audit_state.next_index(sm_upper, "tracey_guard_random_audit_sm") as u32
+        + schedule.cursor
+        + random_audit_state.next_index(sm_bias, "tracey_guard_random_audit_offset") as u32)
+        % device.sm_count.max(1);
+    schedule.cursor = schedule.cursor.wrapping_add(1);
+
+    Some(ScheduledProbe {
+        probe_type: schedule.probe_type,
+        gpu_id: device.gpu_id.clone(),
+        sm_id,
+        timeout_ms: schedule.timeout_ms,
+        random_audit: true,
+    })
+}
+
+fn next_scheduler_wait_ms(
+    schedules: &[ProbeScheduleState],
+    devices: &[DiscoveredDevice],
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    profile: AdaptiveScheduleProfile,
+    now: u64,
+    force_scan: bool,
+) -> u64 {
+    if force_scan {
+        return 0;
+    }
+
+    let until_due = next_schedule_due_ms(schedules, devices, telemetry_ctx, profile, now);
+    until_due.min(profile.poll_ms)
+}
+
+fn next_schedule_due_ms(
+    schedules: &[ProbeScheduleState],
+    devices: &[DiscoveredDevice],
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    profile: AdaptiveScheduleProfile,
+    now: u64,
+) -> u64 {
+    let avg_utilization = average_utilization(devices, telemetry_ctx);
+    let utilization_scale = utilization_multiplier(avg_utilization);
+    schedules
+        .iter()
+        .filter(|schedule| schedule.enabled)
+        .map(|schedule| {
+            let effective_period = effective_schedule_period_ms(
+                schedule.period_ms,
+                utilization_scale,
+                profile.period_scale,
+            );
+            schedule
+                .last_fire_ms
+                .saturating_add(effective_period)
+                .saturating_sub(now)
+        })
+        .min()
+        .unwrap_or(profile.poll_ms)
+}
+
+fn effective_schedule_period_ms(
+    base_period_ms: u64,
+    utilization_scale: f64,
+    period_scale: f64,
+) -> u64 {
+    ((base_period_ms as f64) * utilization_scale * period_scale)
+        .round()
+        .clamp(100.0, 3_600_000.0) as u64
+}
+
+fn fastest_effective_schedule_period_ms(
+    schedules: &[ProbeScheduleState],
+    devices: &[DiscoveredDevice],
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    profile: AdaptiveScheduleProfile,
+) -> u64 {
+    let avg_utilization = average_utilization(devices, telemetry_ctx);
+    let utilization_scale = utilization_multiplier(avg_utilization);
+    schedules
+        .iter()
+        .filter(|schedule| schedule.enabled)
+        .map(|schedule| {
+            effective_schedule_period_ms(
+                schedule.period_ms,
+                utilization_scale,
+                profile.period_scale,
+            )
+        })
+        .min()
+        .unwrap_or(profile.poll_ms.max(5_000))
+}
+
+fn random_audit_weight(schedule: &ProbeScheduleState) -> u64 {
+    let priority_weight = 12u64.saturating_sub(schedule.priority as u64).max(1);
+    let timeout_weight = (4_000u64 / schedule.timeout_ms.max(250)).max(1);
+    let cadence_weight = (180_000u64 / schedule.period_ms.max(1_000)).clamp(1, 32);
+    priority_weight * 32 + timeout_weight * 8 + cadence_weight
+}
+
+fn random_audit_mean_ms(profile: AdaptiveScheduleProfile, fastest_effective_period_ms: u64) -> u64 {
+    let multiplier = lerp(0.45, 1.35, profile.signal.powf(0.78));
+    let min_mean_ms = profile.poll_ms.saturating_mul(8).max(15_000);
+    let max_mean_ms = fastest_effective_period_ms
+        .saturating_mul(2)
+        .max(min_mean_ms)
+        .clamp(min_mean_ms, 240_000);
+    ((fastest_effective_period_ms as f64) * multiplier)
+        .round()
+        .clamp(min_mean_ms as f64, max_mean_ms as f64) as u64
+}
+
+fn random_audit_interval_ms(
+    profile: AdaptiveScheduleProfile,
+    fastest_effective_period_ms: u64,
+    unit_sample: f64,
+) -> u64 {
+    let mean_ms = random_audit_mean_ms(profile, fastest_effective_period_ms) as f64;
+    let sample = unit_sample.clamp(1e-9, 1.0 - 1e-9);
+    let interval_ms = (-sample.ln()) * mean_ms;
+    let min_interval_ms = (mean_ms * 0.20)
+        .max((profile.poll_ms as f64) * 2.0)
+        .max(5_000.0);
+    let max_interval_ms = (mean_ms * 3.0).max(min_interval_ms).min(300_000.0);
+    interval_ms.round().clamp(min_interval_ms, max_interval_ms) as u64
 }
 
 /// Mirrors TraceyGuard probe-agent scheduler behavior:
@@ -1231,6 +1668,203 @@ fn sm_coverage_for_utilization(base_coverage: f64, utilization: f64) -> f64 {
         base_coverage
     };
     coverage.clamp(0.05, 1.0)
+}
+
+fn coverage_with_scale(base_coverage: f64, coverage_scale: f64) -> f64 {
+    (base_coverage * coverage_scale).clamp(0.05, 1.0)
+}
+
+fn compute_scheduler_signal(
+    device_state: &HashMap<String, DeviceState>,
+    telemetry_ctx: &HashMap<String, DeviceTelemetryContext>,
+    recent_outcomes: &VecDeque<RecentProbeOutcome>,
+    control: &TraceyGuardControlState,
+    config: &TraceyGuardConfig,
+    now: u64,
+    force_scan: bool,
+) -> f64 {
+    if force_scan {
+        return 1.0;
+    }
+
+    if device_state.is_empty() {
+        return if control.deep_dive { 0.60 } else { 0.0 };
+    }
+
+    let mut worst_state = 0.0_f64;
+    let mut worst_reliability_gap = 0.0_f64;
+    let mut worst_failure_streak = 0.0_f64;
+    let mut worst_recent_risk = 0.0_f64;
+    let mut worst_stress = 0.0_f64;
+    let mut total_stress = 0.0_f64;
+
+    let failure_limit = config.correlation.immediate_quarantine_failures.max(1) as f64;
+    let freshness_window_ms = config.correlation.window_ms.max(1) as f64;
+
+    for (gpu_id, state) in device_state {
+        worst_state = worst_state.max(device_state_pressure(state.state));
+        worst_reliability_gap =
+            worst_reliability_gap.max((1.0 - state.reliability()).clamp(0.0, 1.0));
+        worst_failure_streak = worst_failure_streak
+            .max((state.consecutive_failures as f64 / failure_limit).clamp(0.0, 1.0));
+
+        let age_ratio = if state.last_probe_ms == 0 {
+            1.0
+        } else {
+            (now.saturating_sub(state.last_probe_ms) as f64 / freshness_window_ms).clamp(0.0, 1.0)
+        };
+        let freshness = 1.0 - age_ratio;
+        let recent_risk = state.last_risk * (0.35 + state.last_confidence * 0.65) * freshness;
+        worst_recent_risk = worst_recent_risk.max(recent_risk.clamp(0.0, 1.0));
+
+        let stress = telemetry_ctx.get(gpu_id).map(compute_stress).unwrap_or(0.0);
+        worst_stress = worst_stress.max(stress);
+        total_stress += stress;
+    }
+
+    let avg_stress = total_stress / device_state.len() as f64;
+    let fleet_stress = worst_stress.max(avg_stress * 0.75);
+    let outcome_pressure =
+        recent_outcome_pressure(recent_outcomes, now, config.correlation.window_ms);
+
+    let blended = (worst_state * 0.30
+        + worst_recent_risk * 0.24
+        + outcome_pressure * 0.20
+        + fleet_stress * 0.14
+        + worst_reliability_gap * 0.08
+        + worst_failure_streak * 0.04)
+        .clamp(0.0, 1.0);
+
+    let mut signal = blended
+        .max(worst_state * 0.95)
+        .max(worst_recent_risk * 0.88)
+        .max(outcome_pressure * 0.90)
+        .clamp(0.0, 1.0);
+    if control.deep_dive {
+        signal = signal.max(0.65);
+    }
+    signal
+}
+
+fn device_state_pressure(state: TraceyGuardGpuState) -> f64 {
+    match state {
+        TraceyGuardGpuState::Healthy => 0.0,
+        TraceyGuardGpuState::Suspect => 0.48,
+        TraceyGuardGpuState::DeepTest => 0.62,
+        TraceyGuardGpuState::Quarantined => 0.82,
+        TraceyGuardGpuState::Condemned => 1.0,
+    }
+}
+
+fn recent_outcome_pressure(
+    outcomes: &VecDeque<RecentProbeOutcome>,
+    now: u64,
+    window_ms: u64,
+) -> f64 {
+    if outcomes.is_empty() {
+        return 0.0;
+    }
+
+    let window_ms = window_ms.max(1) as f64;
+    let mut weighted_state = 0.0;
+    let mut weighted_risk = 0.0;
+    let mut total_weight = 0.0;
+
+    for outcome in outcomes {
+        let age_ratio = (now.saturating_sub(outcome.ts_ms) as f64 / window_ms).clamp(0.0, 1.0);
+        let freshness = 1.0 - age_ratio;
+        if freshness <= 0.0 {
+            continue;
+        }
+
+        let state_pressure = match outcome.probe_state {
+            ProbeState::Pass => 0.0,
+            ProbeState::Error => 0.55,
+            ProbeState::Fail => 0.85,
+            ProbeState::Timeout => 1.0,
+        };
+        let weight = freshness * (0.35 + outcome.confidence * 0.65);
+        total_weight += weight;
+        weighted_state += state_pressure * weight;
+        weighted_risk += outcome.risk * weight;
+    }
+
+    if total_weight <= f64::EPSILON {
+        0.0
+    } else {
+        (((weighted_state / total_weight) * 0.55) + ((weighted_risk / total_weight) * 0.45))
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn trim_recent_outcomes(outcomes: &mut VecDeque<RecentProbeOutcome>, now: u64, window_ms: u64) {
+    while let Some(outcome) = outcomes.front() {
+        if now.saturating_sub(outcome.ts_ms) > window_ms {
+            outcomes.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn smooth_scheduler_signal(current: f64, raw: f64, last_update_ms: u64, now: u64) -> f64 {
+    let elapsed_ms = now.saturating_sub(last_update_ms).max(1) as f64;
+    let ramp_window_ms = if raw > current { 750.0 } else { 12_000.0 };
+    let step = (elapsed_ms / ramp_window_ms).clamp(0.02, 1.0);
+    (current + (raw - current) * step).clamp(0.0, 1.0)
+}
+
+fn adaptive_scheduler_poll_ms(
+    config: &TraceyGuardConfig,
+    signal: f64,
+    used_ratio: f64,
+    budget_ceiling: f64,
+) -> u64 {
+    let (min_poll_ms, max_poll_ms) = scheduler_poll_bounds(config);
+    let eased = signal.powf(0.78);
+    let mut poll_ms = lerp(max_poll_ms as f64, min_poll_ms as f64, eased);
+    let relief = budget_relief(used_ratio, budget_ceiling);
+    poll_ms *= 1.0 + relief * 0.45 * (1.0 - eased);
+    poll_ms
+        .round()
+        .clamp(min_poll_ms as f64, max_poll_ms as f64) as u64
+}
+
+fn adaptive_schedule_period_scale(signal: f64, used_ratio: f64, budget_ceiling: f64) -> f64 {
+    let eased = signal.powf(0.88);
+    let mut scale = lerp(1.8, 0.35, eased);
+    let relief = budget_relief(used_ratio, budget_ceiling);
+    scale *= 1.0 + relief * 0.35 * (1.0 - eased);
+    scale.clamp(0.30, 2.50)
+}
+
+fn adaptive_schedule_coverage_scale(signal: f64) -> f64 {
+    lerp(0.78, 1.15, signal.powf(0.92)).clamp(0.60, 1.20)
+}
+
+fn scheduler_poll_bounds(config: &TraceyGuardConfig) -> (u64, u64) {
+    let min_poll_ms = config.scheduler_poll_ms.max(50);
+    let fastest_probe_period_ms = ProbeType::all()
+        .into_iter()
+        .map(|probe| config.probe_cfg(probe).period_ms)
+        .min()
+        .unwrap_or(min_poll_ms);
+    let max_poll_ms = min_poll_ms
+        .saturating_mul(20)
+        .min(fastest_probe_period_ms.saturating_div(4).max(min_poll_ms))
+        .clamp(min_poll_ms, 30_000);
+    (min_poll_ms, max_poll_ms)
+}
+
+fn budget_relief(used_ratio: f64, budget_ceiling: f64) -> f64 {
+    if budget_ceiling <= 0.0 {
+        return 0.0;
+    }
+    (((used_ratio / budget_ceiling).clamp(0.0, 2.0) - 0.65) / 0.35).clamp(0.0, 1.0)
+}
+
+fn lerp(start: f64, end: f64, amount: f64) -> f64 {
+    start + (end - start) * amount.clamp(0.0, 1.0)
 }
 
 fn average_utilization(
@@ -1924,7 +2558,8 @@ mod tests {
                 priority: 4,
                 timeout_ms: 1_000,
                 enabled: true,
-                next_fire_ms: 0,
+                last_fire_ms: 0,
+                last_effective_period_ms: 1_000,
                 cursor: 0,
             },
             ProbeScheduleState {
@@ -1934,7 +2569,8 @@ mod tests {
                 priority: 1,
                 timeout_ms: 1_000,
                 enabled: true,
-                next_fire_ms: 0,
+                last_fire_ms: 0,
+                last_effective_period_ms: 1_000,
                 cursor: 0,
             },
         ];
@@ -1951,7 +2587,20 @@ mod tests {
             },
         );
 
-        let tasks = schedule_due_tasks(&mut schedules, &devices, &telemetry, now_ms(), false);
+        let tasks = schedule_due_tasks(
+            &mut schedules,
+            &devices,
+            &telemetry,
+            AdaptiveScheduleProfile {
+                signal: 0.0,
+                poll_ms: 200,
+                target_poll_ms: 200,
+                period_scale: 1.0,
+                coverage_scale: 1.0,
+            },
+            now_ms(),
+            false,
+        );
         assert!(!tasks.is_empty());
         assert_eq!(tasks[0].probe_type, ProbeType::Fma);
         // 95% utilization reduces coverage by 60% (to 40% of base), 8 SMs -> ~3.
@@ -1962,6 +2611,210 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn random_audit_can_dispatch_when_regular_schedule_is_not_due() {
+        let now = now_ms();
+        let mut schedules = vec![ProbeScheduleState {
+            probe_type: ProbeType::Fma,
+            period_ms: 60_000,
+            sm_coverage: 1.0,
+            priority: 1,
+            timeout_ms: 500,
+            enabled: true,
+            last_fire_ms: now,
+            last_effective_period_ms: 60_000,
+            cursor: 0,
+        }];
+        let devices = vec![DiscoveredDevice {
+            gpu_id: "gpu-0".to_string(),
+            sm_count: 8,
+        }];
+        let telemetry = HashMap::new();
+        let profile = AdaptiveScheduleProfile {
+            signal: 0.0,
+            poll_ms: 4_000,
+            target_poll_ms: 4_000,
+            period_scale: 1.8,
+            coverage_scale: 0.78,
+        };
+
+        let regular = schedule_due_tasks(&mut schedules, &devices, &telemetry, profile, now, false);
+        assert!(regular.is_empty());
+
+        let mut random_audit = RandomAuditState::new();
+        random_audit.arm_if_needed(now, 60_000, profile);
+        let audit =
+            build_random_audit_task(&mut schedules, &devices, &telemetry, &mut random_audit)
+                .expect("expected a random audit task");
+        assert_eq!(audit.probe_type, ProbeType::Fma);
+        assert_eq!(audit.gpu_id, "gpu-0");
+        assert!(audit.sm_id < 8);
+        assert!(audit.random_audit);
+    }
+
+    #[test]
+    fn random_audit_interval_varies_and_stays_bounded() {
+        let profile = AdaptiveScheduleProfile {
+            signal: 0.0,
+            poll_ms: 4_000,
+            target_poll_ms: 4_000,
+            period_scale: 1.8,
+            coverage_scale: 0.78,
+        };
+        let fastest_period_ms = 90_000;
+        let near_interval = random_audit_interval_ms(profile, fastest_period_ms, 0.90);
+        let far_interval = random_audit_interval_ms(profile, fastest_period_ms, 0.10);
+
+        assert!(near_interval >= 5_000);
+        assert!(far_interval <= 300_000);
+        assert_ne!(near_interval, far_interval);
+    }
+
+    #[test]
+    fn adaptive_scheduler_relaxes_when_fleet_is_healthy() {
+        let config = TraceyGuardConfig::default();
+        let control = TraceyGuardControlState {
+            enabled: true,
+            deep_dive: false,
+            overhead_budget_pct: config.overhead_budget_pct,
+            tmr_enabled: true,
+            max_parallel_tasks: config.max_parallel_tasks,
+            force_scan_epoch: 0,
+            updated_ms: 0,
+        };
+        let mut state = AdaptiveSchedulerState::new(0);
+        let device_state = HashMap::from([(
+            "gpu-0".to_string(),
+            DeviceState::new("gpu-0".to_string(), 16, &config),
+        )]);
+        let telemetry = HashMap::from([("gpu-0".to_string(), DeviceTelemetryContext::default())]);
+
+        let raw_signal = compute_scheduler_signal(
+            &device_state,
+            &telemetry,
+            &VecDeque::new(),
+            &control,
+            &config,
+            5_000,
+            false,
+        );
+        let profile = state.profile(
+            &config,
+            raw_signal,
+            0.0,
+            config.overhead_budget_pct / 100.0,
+            5_000,
+        );
+
+        assert!(raw_signal < 0.01);
+        assert!(profile.poll_ms > config.scheduler_poll_ms);
+        assert!(profile.period_scale > 1.0);
+        assert!(profile.coverage_scale < 1.0);
+    }
+
+    #[test]
+    fn adaptive_scheduler_accelerates_for_recent_fault_pressure() {
+        let config = TraceyGuardConfig::default();
+        let control = TraceyGuardControlState {
+            enabled: true,
+            deep_dive: false,
+            overhead_budget_pct: config.overhead_budget_pct,
+            tmr_enabled: true,
+            max_parallel_tasks: config.max_parallel_tasks,
+            force_scan_epoch: 0,
+            updated_ms: 0,
+        };
+        let mut state = AdaptiveSchedulerState::new(0);
+        let mut device = DeviceState::new("gpu-0".to_string(), 16, &config);
+        device.state = TraceyGuardGpuState::Quarantined;
+        device.last_risk = 0.97;
+        device.last_confidence = 0.92;
+        device.last_probe_ms = 10_000;
+        device.consecutive_failures = config.correlation.immediate_quarantine_failures;
+
+        let device_state = HashMap::from([("gpu-0".to_string(), device)]);
+        let telemetry = HashMap::from([(
+            "gpu-0".to_string(),
+            DeviceTelemetryContext {
+                temp_c: 88.0,
+                power_w: 320.0,
+                util_pct: 72.0,
+                ecc_error_count: 2,
+                ..DeviceTelemetryContext::default()
+            },
+        )]);
+        let recent_outcomes = VecDeque::from([RecentProbeOutcome {
+            ts_ms: 10_050,
+            probe_state: ProbeState::Fail,
+            risk: 0.96,
+            confidence: 0.90,
+        }]);
+
+        let raw_signal = compute_scheduler_signal(
+            &device_state,
+            &telemetry,
+            &recent_outcomes,
+            &control,
+            &config,
+            10_100,
+            false,
+        );
+        let relaxed_profile = AdaptiveSchedulerState::new(0).profile(
+            &config,
+            0.0,
+            0.0,
+            config.overhead_budget_pct / 100.0,
+            10_100,
+        );
+        let profile = state.profile(
+            &config,
+            raw_signal,
+            0.005,
+            config.overhead_budget_pct / 100.0,
+            10_100,
+        );
+
+        assert!(
+            raw_signal >= 0.75,
+            "expected high scheduler signal, got {raw_signal}"
+        );
+        assert!(profile.poll_ms < relaxed_profile.poll_ms);
+        assert!(profile.period_scale < relaxed_profile.period_scale);
+        assert!(profile.coverage_scale >= 1.0);
+    }
+
+    #[test]
+    fn adaptive_scheduler_recovers_gradually_after_spike() {
+        let config = TraceyGuardConfig::default();
+        let mut state = AdaptiveSchedulerState::new(0);
+        let high_profile = state.profile(
+            &config,
+            1.0,
+            0.0,
+            config.overhead_budget_pct / 100.0,
+            10_000,
+        );
+        let early_recovery = state.profile(
+            &config,
+            0.0,
+            0.0,
+            config.overhead_budget_pct / 100.0,
+            11_000,
+        );
+        let later_recovery = state.profile(
+            &config,
+            0.0,
+            0.0,
+            config.overhead_budget_pct / 100.0,
+            25_000,
+        );
+
+        assert!(high_profile.poll_ms <= config.scheduler_poll_ms);
+        assert!(early_recovery.poll_ms > high_profile.poll_ms);
+        assert!(early_recovery.poll_ms < scheduler_poll_bounds(&config).1);
+        assert!(later_recovery.poll_ms > early_recovery.poll_ms);
     }
 
     #[test]
