@@ -71,6 +71,14 @@ run() {
   fi
 }
 
+run_capture() {
+  if ((${#RUN_PREFIX[@]})); then
+    "${RUN_PREFIX[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
 write_file() {
   local path="$1"
   local mode="$2"
@@ -120,6 +128,226 @@ read_loader_state_dir_from_config() {
   local path="$1"
   [[ -r "$path" ]] || return 0
   sed -n 's/.*"state_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$path" | head -n 1
+}
+
+extract_host_from_socket_addr() {
+  local addr="$1"
+  if [[ "$addr" =~ ^\[([^]]+)\]:[0-9]+$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ "$addr" == *:* ]]; then
+    printf '%s\n' "${addr%:*}"
+  else
+    printf '%s\n' "$addr"
+  fi
+}
+
+extract_port_from_socket_addr() {
+  local addr="$1"
+  local port
+  if [[ "$addr" =~ ^\[[^]]+\]:([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  elif [[ "$addr" =~ :([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  ((port >= 1 && port <= 65535)) || return 1
+  printf '%s\n' "$port"
+}
+
+is_loopback_socket_addr() {
+  local host
+  host=$(extract_host_from_socket_addr "$1")
+  case "${host,,}" in
+    127.*|localhost|::1|0:0:0:0:0:0:0:1|::ffff:127.*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+can_manage_firewall() {
+  [[ $(id -u) -eq 0 || ${#RUN_PREFIX[@]} -gt 0 ]]
+}
+
+read_status_settings_from_config() {
+  local path="$1"
+  [[ -r "$path" ]] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    local line key value
+    while IFS= read -r line; do
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "$key" in
+        enabled)
+          if [[ "$value" == "false" ]]; then
+            STATUS_ENABLED=0
+          else
+            STATUS_ENABLED=1
+          fi
+          ;;
+        listen_addr)
+          STATUS_LISTEN_ADDR="$value"
+          ;;
+      esac
+    done < <(
+      python3 - "$path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path, "r", encoding="utf-8"))
+status = data.get("status")
+enabled = True
+listen_addr = "0.0.0.0:48000"
+
+if isinstance(status, dict):
+    if "enabled" in status:
+        enabled = bool(status["enabled"])
+    if isinstance(status.get("listen_addr"), str):
+        listen_addr = status["listen_addr"].strip()
+
+print(f"enabled={'true' if enabled else 'false'}")
+print(f"listen_addr={listen_addr}")
+PY
+    )
+    return 0
+  fi
+
+  local status_block listen_addr
+  status_block=$(sed -n '/"status"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/p' "$path" || true)
+  [[ -n "$status_block" ]] || return 0
+
+  if printf '%s\n' "$status_block" | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*false'; then
+    STATUS_ENABLED=0
+  fi
+  listen_addr=$(printf '%s\n' "$status_block" \
+    | sed -n 's/.*"listen_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1)
+  if [[ -n "$listen_addr" ]]; then
+    STATUS_LISTEN_ADDR="$listen_addr"
+  fi
+}
+
+resolve_status_firewall_target() {
+  STATUS_ENABLED=1
+  STATUS_LISTEN_ADDR="0.0.0.0:48000"
+  STATUS_FIREWALL_PORT=
+  FIREWALL_MANAGER=
+  FIREWALL_STATUS="not required"
+
+  if [[ -e "$CONFIG_PATH" && "$FORCE_CONFIG" -eq 0 ]]; then
+    read_status_settings_from_config "$CONFIG_PATH"
+  fi
+
+  if (( ! STATUS_ENABLED )) || [[ -z "$STATUS_LISTEN_ADDR" ]]; then
+    FIREWALL_STATUS="not required (status API disabled)"
+    return 0
+  fi
+
+  if is_loopback_socket_addr "$STATUS_LISTEN_ADDR"; then
+    FIREWALL_STATUS="not required (status API bound to $STATUS_LISTEN_ADDR)"
+    return 0
+  fi
+
+  if ! STATUS_FIREWALL_PORT=$(extract_port_from_socket_addr "$STATUS_LISTEN_ADDR"); then
+    FIREWALL_STATUS="manual check required (unable to parse $STATUS_LISTEN_ADDR)"
+    warn "could not determine a firewall port from status.listen_addr=$STATUS_LISTEN_ADDR"
+    return 0
+  fi
+
+  FIREWALL_STATUS="pending tcp/$STATUS_FIREWALL_PORT"
+}
+
+ensure_status_firewall_access() {
+  [[ -n "$STATUS_FIREWALL_PORT" ]] || return 0
+
+  if ((DRY_RUN)); then
+    FIREWALL_STATUS="dry-run (would ensure tcp/$STATUS_FIREWALL_PORT is allowed)"
+    return 0
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    local ufw_status
+    ufw_status=$(run_capture ufw status 2>/dev/null || true)
+    if [[ "$ufw_status" == "Status: active"* ]]; then
+      FIREWALL_MANAGER="ufw"
+      if ! can_manage_firewall; then
+        FIREWALL_STATUS="manual action required for ufw (tcp/$STATUS_FIREWALL_PORT)"
+        warn "ufw is active but this install is not running with privileges to open tcp/$STATUS_FIREWALL_PORT"
+        return 0
+      fi
+      if printf '%s\n' "$ufw_status" | grep -Eq "(^|[[:space:]])${STATUS_FIREWALL_PORT}/tcp([[:space:]]|$)"; then
+        FIREWALL_STATUS="allowed via ufw (already present)"
+        return 0
+      fi
+      log "opening ufw for Tracey status API on tcp/$STATUS_FIREWALL_PORT"
+      if run ufw allow "${STATUS_FIREWALL_PORT}/tcp" comment "Tracey status API"; then
+        FIREWALL_STATUS="allowed via ufw"
+      else
+        FIREWALL_STATUS="manual action required for ufw (tcp/$STATUS_FIREWALL_PORT)"
+        warn "failed to open ufw for tcp/$STATUS_FIREWALL_PORT; allow it manually"
+      fi
+      return 0
+    fi
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 \
+    && run_capture firewall-cmd --state >/dev/null 2>&1
+  then
+    local runtime_allowed=0
+    local permanent_allowed=0
+    local firewalld_failed=0
+
+    FIREWALL_MANAGER="firewalld"
+    if ! can_manage_firewall; then
+      FIREWALL_STATUS="manual action required for firewalld (tcp/$STATUS_FIREWALL_PORT)"
+      warn "firewalld is active but this install is not running with privileges to open tcp/$STATUS_FIREWALL_PORT"
+      return 0
+    fi
+    if run_capture firewall-cmd --quiet --query-port="${STATUS_FIREWALL_PORT}/tcp"; then
+      runtime_allowed=1
+    fi
+    if run_capture firewall-cmd --quiet --permanent --query-port="${STATUS_FIREWALL_PORT}/tcp"; then
+      permanent_allowed=1
+    fi
+    if ((runtime_allowed && permanent_allowed)); then
+      FIREWALL_STATUS="allowed via firewalld (already present)"
+      return 0
+    fi
+
+    log "opening firewalld for Tracey status API on tcp/$STATUS_FIREWALL_PORT"
+    if (( ! runtime_allowed )) \
+      && ! run firewall-cmd --add-port="${STATUS_FIREWALL_PORT}/tcp"
+    then
+      firewalld_failed=1
+    fi
+    if (( ! permanent_allowed )) \
+      && ! run firewall-cmd --permanent --add-port="${STATUS_FIREWALL_PORT}/tcp"
+    then
+      firewalld_failed=1
+    fi
+
+    if (( firewalld_failed )); then
+      FIREWALL_STATUS="manual action required for firewalld (tcp/$STATUS_FIREWALL_PORT)"
+      warn "failed to open firewalld for tcp/$STATUS_FIREWALL_PORT; allow it manually"
+    else
+      FIREWALL_STATUS="allowed via firewalld"
+    fi
+    return 0
+  fi
+
+  if systemctl is-active --quiet nftables 2>/dev/null; then
+    FIREWALL_MANAGER="nftables"
+    FIREWALL_STATUS="manual action required for nftables (tcp/$STATUS_FIREWALL_PORT)"
+    warn "nftables appears active; allow tcp/$STATUS_FIREWALL_PORT manually for status.listen_addr=$STATUS_LISTEN_ADDR"
+    return 0
+  fi
+
+  FIREWALL_MANAGER="none"
+  FIREWALL_STATUS="no active supported firewall detected for tcp/$STATUS_FIREWALL_PORT"
 }
 
 build_release_binaries() {
@@ -597,6 +825,12 @@ print_summary() {
   log "  state dir:      $STATE_DIR"
   log "  unit:           $UNIT_PATH"
   log "  env file:       $ENV_FILE"
+  if (( STATUS_ENABLED )); then
+    log "  status bind:    $STATUS_LISTEN_ADDR"
+  else
+    log "  status bind:    disabled"
+  fi
+  log "  firewall:       $FIREWALL_STATUS"
   log "  agent_id:       $AGENT_ID"
   log "  core channel:   $CORE_CHANNEL"
   if [[ -n "$BOOTSTRAP_VERSION" ]]; then
@@ -622,6 +856,11 @@ CONFIG_PATH=
 STATE_DIR=
 UNIT_PATH=
 ENV_FILE=
+STATUS_ENABLED=1
+STATUS_LISTEN_ADDR=
+STATUS_FIREWALL_PORT=
+FIREWALL_MANAGER=
+FIREWALL_STATUS=
 AGENT_ID=
 CORE_CHANNEL=
 BOOTSTRAP_VERSION=
@@ -753,6 +992,7 @@ resolve_core_channel
 maybe_detect_bootstrap_version
 resolve_paths
 resolve_loader_paths
+resolve_status_firewall_target
 print_summary
 ensure_privileged_access
 resolve_scope_conflicts
@@ -765,6 +1005,7 @@ refresh_loader_integrity_manifest
 refresh_core_bootstrap_artifacts
 maybe_write_config
 maybe_write_env_file
+ensure_status_firewall_access
 write_unit
 enable_service
 
@@ -782,6 +1023,10 @@ if [[ "$SCOPE" == "user" ]]; then
 fi
 
 log
+if [[ -n "$FIREWALL_MANAGER" ]]; then
+  log "firewall manager: $FIREWALL_MANAGER"
+fi
+log "firewall status: $FIREWALL_STATUS"
 if ((DRY_RUN)); then
   log "dry-run complete"
 else

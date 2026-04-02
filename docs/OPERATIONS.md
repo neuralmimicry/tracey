@@ -392,6 +392,8 @@ By default the installer writes a minimal JSON config containing:
 - optional `loader.bootstrap_version`
 - `prometheus_log_export.server_url = "http://prometheus.neuralmimicry.ai"`
 
+The generated config relies on the built-in default status surface of `0.0.0.0:48000` unless an existing config is being preserved.
+
 It does **not** write discovery or update shared keys automatically.
 
 ### Generated environment file
@@ -422,6 +424,15 @@ The installer also manages common scope conflicts:
 - when installing a system service, it disables a conflicting user service of the same name if one is active or enabled
 - when installing a user service, it refuses to proceed if a system service of the same name is already active or enabled
 - in user scope, it warns if `loginctl enable-linger` is not set for the user
+
+### Firewall handling
+
+The installer derives the effective `status.listen_addr` before writing or reusing the service config.
+
+- if the status API is disabled or bound only to loopback, it does not change the firewall
+- if the status API binds to a non-loopback address, it checks `ufw` first and then `firewalld`
+- when a supported firewall is active and the installer has privileges, it opens `tcp/<status-port>` so the status API remains reachable
+- when a supported firewall is active but the installer is unprivileged, or when `nftables` is active without a supported front-end, it warns and reports the exact manual port to allow
 
 ## Hardening Checklist
 

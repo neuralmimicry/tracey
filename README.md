@@ -269,6 +269,7 @@ What the script does in the current implementation:
 - writes a minimal JSON config with `agent_id`, `update.local_channel`, `loader.state_dir`, and optional `bootstrap_version`
 - writes an optional environment file for later overrides
 - writes a `systemd` unit with `WorkingDirectory` set to the Tracey state directory
+- resolves the effective `status.listen_addr` and, when it is not loopback-only, checks the local firewall and opens the status TCP port when `ufw` or `firewalld` is active
 - enables and optionally starts the service
 - in system scope, prefers `sudo` and disables a conflicting user-scope Tracey service when necessary
 
