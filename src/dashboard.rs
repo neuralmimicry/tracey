@@ -1440,10 +1440,12 @@ fn render_overview_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme
 }
 
 fn render_locations_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let banner_height = u16::from(location_inference_banner_text(app).is_some());
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
+            Constraint::Length(banner_height),
             Constraint::Length(9),
             Constraint::Min(18),
             Constraint::Length(1),
@@ -1451,15 +1453,16 @@ fn render_locations_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
         .split(area);
 
     render_header(frame, outer[0], app, theme);
+    render_location_inference_banner(frame, outer[1], app, theme);
 
     let summary = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(outer[1]);
+        .split(outer[2]);
     render_local_location_panel(frame, summary[0], app, theme);
     render_location_summary_panel(frame, summary[1], app, theme);
-    render_location_map_panel(frame, outer[2], app, theme);
-    render_footer(frame, outer[3], app, theme);
+    render_location_map_panel(frame, outer[3], app, theme);
+    render_footer(frame, outer[4], app, theme);
 }
 
 fn effective_self_location(app: &TraceyTopApp) -> Option<AgentLocationSnapshot> {
@@ -1480,6 +1483,15 @@ fn effective_self_location(app: &TraceyTopApp) -> Option<AgentLocationSnapshot> 
     ))
 }
 
+fn location_inference_banner_text(app: &TraceyTopApp) -> Option<&'static str> {
+    app.status
+        .as_ref()
+        .filter(|status| status.location.agent_id.trim().is_empty())
+        .map(|_| {
+            "client-side fallback inference active: self location synthesized from target url and local runtime hints"
+        })
+}
+
 fn effective_peer_locations(
     app: &TraceyTopApp,
     self_location: Option<&AgentLocationSnapshot>,
@@ -1493,6 +1505,31 @@ fn effective_peer_locations(
         peers.retain(|peer| peer.agent_id != self_location.agent_id);
     }
     peers
+}
+
+fn render_location_inference_banner(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let Some(text) = location_inference_banner_text(app) else {
+        return;
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            " FALLBACK ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.warn)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {text}"),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
@@ -3183,6 +3220,24 @@ mod tests {
             location.status_addr.as_deref(),
             Some("http://127.0.0.1:48000/status")
         );
+    }
+
+    #[test]
+    fn fallback_banner_appears_when_server_location_is_missing() {
+        let app = test_app("http://127.0.0.1:48000/status", test_status("cortex-1000"));
+
+        let banner = location_inference_banner_text(&app).expect("fallback banner");
+        assert!(banner.contains("client-side fallback inference active"));
+    }
+
+    #[test]
+    fn fallback_banner_is_hidden_when_server_location_exists() {
+        let mut status = test_status("cortex-1000");
+        status.location.agent_id = "cortex-1000".to_string();
+        status.location.host = "cortex".to_string();
+        let app = test_app("http://127.0.0.1:48000/status", status);
+
+        assert!(location_inference_banner_text(&app).is_none());
     }
 
     #[test]
