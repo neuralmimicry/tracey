@@ -263,6 +263,7 @@ A new loader deployment must be bootstrapped with a core binary at `loader/curre
 What the script does in the current implementation:
 
 - resolves or builds `tracey` and `tracey-loader`
+- installs a PATH-visible `tracey` command for CLI and `tracey --tui` access
 - installs `tracey-loader` as the service entry point
 - installs a mutable Tracey core into the state directory
 - writes a minimal JSON config with `agent_id`, `update.local_channel`, `loader.state_dir`, and optional `bootstrap_version`

@@ -17,6 +17,7 @@ Options:
   --binary PATH                Alias for --core-binary PATH.
   --core-binary PATH           Source Tracey core binary to install.
   --loader-binary PATH         Source Tracey loader binary to install.
+  --cli-install-path PATH      Destination path for the user-invocable `tracey` command.
   --install-path PATH          Alias for --loader-install-path PATH.
   --loader-install-path PATH   Destination path for the installed loader binary.
   --core-install-path PATH     Destination path for the installed core binary.
@@ -113,6 +114,12 @@ validate_path() {
   local path="$2"
   [[ "$path" != *$'\n'* ]] || die "$label must not contain newlines"
   [[ "$path" != *[[:space:]]* ]] || die "$label must not contain whitespace: $path"
+}
+
+read_loader_state_dir_from_config() {
+  local path="$1"
+  [[ -r "$path" ]] || return 0
+  sed -n 's/.*"state_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$path" | head -n 1
 }
 
 build_release_binaries() {
@@ -350,6 +357,7 @@ resolve_paths() {
 
   case "$SCOPE" in
     system)
+      CLI_INSTALL_PATH="${CLI_INSTALL_PATH:-/usr/local/bin/tracey}"
       LOADER_INSTALL_PATH="${LOADER_INSTALL_PATH:-/usr/local/bin/tracey-loader}"
       CONFIG_PATH="${CONFIG_PATH:-/etc/tracey/tracey.json}"
       STATE_DIR="${STATE_DIR:-/var/lib/tracey}"
@@ -358,6 +366,7 @@ resolve_paths() {
       WANTED_BY="multi-user.target"
       ;;
     user)
+      CLI_INSTALL_PATH="${CLI_INSTALL_PATH:-$HOME/.local/bin/tracey}"
       LOADER_INSTALL_PATH="${LOADER_INSTALL_PATH:-$HOME/.local/bin/tracey-loader}"
       CONFIG_PATH="${CONFIG_PATH:-$config_home/tracey/tracey.json}"
       STATE_DIR="${STATE_DIR:-$state_home/tracey}"
@@ -371,12 +380,42 @@ resolve_paths() {
 
   validate_path "core binary source" "$CORE_BINARY_SOURCE"
   validate_path "loader binary source" "$LOADER_BINARY_SOURCE"
+  validate_path "cli install path" "$CLI_INSTALL_PATH"
   validate_path "loader install path" "$LOADER_INSTALL_PATH"
   validate_path "core install path" "$CORE_INSTALL_PATH"
   validate_path "config path" "$CONFIG_PATH"
   validate_path "state dir" "$STATE_DIR"
   validate_path "unit path" "$UNIT_PATH"
   validate_path "env file" "$ENV_FILE"
+
+  [[ "$CLI_INSTALL_PATH" != "$LOADER_INSTALL_PATH" ]] || die "cli install path must differ from loader install path"
+  [[ "$CLI_INSTALL_PATH" != "$CORE_INSTALL_PATH" ]] || die "cli install path must differ from core install path"
+}
+
+resolve_loader_paths() {
+  local loader_manifest_name
+  local loader_state_dir
+  loader_manifest_name="tracey-loader.manifest.json"
+  loader_state_dir="loader"
+
+  if [[ -e "$CONFIG_PATH" && "$FORCE_CONFIG" -eq 0 ]]; then
+    loader_state_dir=$(read_loader_state_dir_from_config "$CONFIG_PATH")
+    loader_state_dir="${loader_state_dir:-loader}"
+  fi
+
+  if [[ "$loader_state_dir" = /* ]]; then
+    LOADER_ROOT_PATH="$loader_state_dir"
+  else
+    LOADER_ROOT_PATH="$STATE_DIR/$loader_state_dir"
+  fi
+  LOADER_MANIFEST_PATH="$LOADER_ROOT_PATH/$loader_manifest_name"
+  LOADER_CURRENT_METADATA_PATH="$LOADER_ROOT_PATH/current/tracey-core.meta.json"
+  LOADER_CURRENT_SIGNATURE_PATH="$LOADER_ROOT_PATH/current/tracey-core.sig"
+
+  validate_path "loader root path" "$LOADER_ROOT_PATH"
+  validate_path "loader manifest path" "$LOADER_MANIFEST_PATH"
+  validate_path "loader current metadata path" "$LOADER_CURRENT_METADATA_PATH"
+  validate_path "loader current signature path" "$LOADER_CURRENT_SIGNATURE_PATH"
 }
 
 render_config() {
@@ -445,6 +484,23 @@ WantedBy=${WANTED_BY}
 CFG
 }
 
+render_cli_wrapper() {
+  local config_q state_q core_q
+  printf -v config_q '%q' "$CONFIG_PATH"
+  printf -v state_q '%q' "$STATE_DIR"
+  printf -v core_q '%q' "$CORE_INSTALL_PATH"
+
+  cat <<CFG
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tracey-service-wrapper: keeps CLI invocations pinned to the installed service state.
+export TRACEY_CONFIG=${config_q}
+cd ${state_q}
+exec ${core_q} "\$@"
+CFG
+}
+
 install_loader_binary() {
   run mkdir -p "$(dirname "$LOADER_INSTALL_PATH")"
   if [[ "$LOADER_BINARY_SOURCE" == "$LOADER_INSTALL_PATH" ]]; then
@@ -461,6 +517,27 @@ install_core_binary() {
     return
   fi
   run install -D -m 0755 "$CORE_BINARY_SOURCE" "$CORE_INSTALL_PATH"
+}
+
+install_cli_wrapper() {
+  local content
+  content=$(render_cli_wrapper)
+  write_file "$CLI_INSTALL_PATH" 0755 "$content"
+}
+
+refresh_loader_integrity_manifest() {
+  if [[ -e "$LOADER_MANIFEST_PATH" ]]; then
+    run rm -f "$LOADER_MANIFEST_PATH"
+  fi
+}
+
+refresh_core_bootstrap_artifacts() {
+  if [[ -e "$LOADER_CURRENT_METADATA_PATH" ]]; then
+    run rm -f "$LOADER_CURRENT_METADATA_PATH"
+  fi
+  if [[ -e "$LOADER_CURRENT_SIGNATURE_PATH" ]]; then
+    run rm -f "$LOADER_CURRENT_SIGNATURE_PATH"
+  fi
 }
 
 maybe_write_config() {
@@ -512,8 +589,10 @@ print_summary() {
   log "  service:        $UNIT_NAME"
   log "  loader source:  $LOADER_BINARY_SOURCE"
   log "  core source:    $CORE_BINARY_SOURCE"
+  log "  cli path:       $CLI_INSTALL_PATH"
   log "  loader path:    $LOADER_INSTALL_PATH"
   log "  core path:      $CORE_INSTALL_PATH"
+  log "  loader root:    $LOADER_ROOT_PATH"
   log "  config:         $CONFIG_PATH"
   log "  state dir:      $STATE_DIR"
   log "  unit:           $UNIT_PATH"
@@ -525,15 +604,20 @@ print_summary() {
   fi
 }
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 
 SCOPE=auto
 SERVICE_NAME=tracey
 CORE_BINARY_SOURCE=
 LOADER_BINARY_SOURCE=
+CLI_INSTALL_PATH=
 LOADER_INSTALL_PATH=
 CORE_INSTALL_PATH=
+LOADER_ROOT_PATH=
+LOADER_MANIFEST_PATH=
+LOADER_CURRENT_METADATA_PATH=
+LOADER_CURRENT_SIGNATURE_PATH=
 CONFIG_PATH=
 STATE_DIR=
 UNIT_PATH=
@@ -570,6 +654,11 @@ while (($#)); do
       shift
       (($#)) || die "--loader-binary requires a value"
       LOADER_BINARY_SOURCE="$1"
+      ;;
+    --cli-install-path)
+      shift
+      (($#)) || die "--cli-install-path requires a value"
+      CLI_INSTALL_PATH="$1"
       ;;
     --install-path|--loader-install-path)
       shift
@@ -663,6 +752,7 @@ ensure_binary_sources
 resolve_core_channel
 maybe_detect_bootstrap_version
 resolve_paths
+resolve_loader_paths
 print_summary
 ensure_privileged_access
 resolve_scope_conflicts
@@ -670,6 +760,9 @@ resolve_scope_conflicts
 run mkdir -p "$STATE_DIR"
 install_loader_binary
 install_core_binary
+install_cli_wrapper
+refresh_loader_integrity_manifest
+refresh_core_bootstrap_artifacts
 maybe_write_config
 maybe_write_env_file
 write_unit
