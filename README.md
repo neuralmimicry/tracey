@@ -26,7 +26,7 @@ The current code does all of the following:
 - enables authenticated discovery gossip by default on UDP `47990`
 - enables the HTTP status surface by default on `0.0.0.0:48000`
 - leaves `auth.mode` off by default, which means status and TraceyGuard control routes are unauthenticated unless you explicitly enable OIDC
-- enables the Prometheus log exporter by default, which probes `http://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
+- enables the Prometheus log exporter by default, which probes `https://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
 
 That default profile is useful for local evaluation and continuous self-exercise, but it is not a hardened deployment baseline.
 
@@ -54,15 +54,17 @@ That default profile is useful for local evaluation and continuous self-exercise
 
 Primary runtime entry point.
 
-- `cargo run`
-- `cargo run -- --version`
-- `cargo run -- sign-update --bundle ./tracey-new --version 0.2.0 --key '<shared-key>'`
+- `cargo run --bin tracey`
+- `cargo run --bin tracey -- --tui`
+- `cargo run --bin tracey -- --tui --status http://127.0.0.1:48000 --log-path ./tracey.log.jsonl`
+- `cargo run --bin tracey -- --version`
+- `cargo run --bin tracey -- sign-update --bundle ./tracey-new --version 0.2.0 --key '<shared-key>'`
 
 ### `tracey --supervisor`
 
 Crash-restart and zero-downtime handoff wrapper around the same runtime binary.
 
-- `cargo run -- --supervisor`
+- `cargo run --bin tracey -- --supervisor`
 
 The supervisor watches the child process, consumes staged update requests from `update_dir`, and swaps binaries after the replacement process writes the expected handoff token.
 
@@ -74,6 +76,28 @@ Separate durable loader binary intended for service deployments.
 - `cargo run --bin tracey-loader -- --version`
 
 The loader supervises a mutable Tracey core, verifies its own integrity manifest, serves distributable production cores to peers, and rolls back failed promotions during a probation window.
+
+### `tracey --tui`
+
+Preferred operator TUI entrypoint, inspired by `btop` and built around Tracey's status and activity surfaces.
+
+- `cargo run --bin tracey -- --tui`
+- `cargo run --bin tracey -- --tui --status http://127.0.0.1:48000 --log-path ./tracey.log.jsonl`
+- `cargo run --bin tracey -- --tui --no-log`
+
+`tracey --tui` reads `/status` for governance, coordination, TraceyGuard, Slurm, and autoscaler snapshots, then tails the JSONL storage log for signal history, recent decisions, and hot processes.
+
+When `--status` is omitted, the dashboard prefers a reachable local `tracey` or loader-managed `tracey-core` agent if one is already running, so `--tui` stays attach-only instead of starting duplicate collectors.
+
+No-scheme loopback targets default to `http://`; other no-scheme dashboard targets default to `https://`. The header shows `🔒 https` or `🔓 http` for the active status connection.
+
+The dashboard now has two pages: the original overview and a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency.
+
+Location confidence improves when the runtime can see direct hints. `TRACEY_SITE`, `TRACEY_BUILDING`, `TRACEY_ROOM`, and `TRACEY_GEO` are consumed automatically, propagated through discovery capability tags, and reused by the location page when peers are close enough to share the same inferred room/building/site.
+
+The dashboard expects at least a `120x33` terminal. Smaller windows render a resize notice instead of a broken layout.
+
+`tracey-top` remains available as a thin compatibility wrapper around the same dashboard.
 
 ## End-to-End Workflow Summary
 

@@ -47,6 +47,8 @@ pub struct AgentPresence {
     pub ts_ms: u64,
     pub addr: Option<String>,
     pub status_addr: Option<String>,
+    #[serde(default)]
+    pub observed_addr: Option<String>,
     pub ban_advertisement: Option<crate::tracey_ban::BanAdvertisement>,
     pub fault_advertisement: Option<crate::tracey_guard::FaultAdvertisement>,
     #[serde(default)]
@@ -195,6 +197,7 @@ pub async fn spawn_discovery(
                         ts_ms: announcement.ts_ms,
                         addr: announcement.addr,
                         status_addr: announcement.status_addr,
+                        observed_addr: Some(peer.to_string()),
                         ban_advertisement: announcement.ban_advertisement.clone(),
                         fault_advertisement: announcement.fault_advertisement.clone(),
                         slurm: announcement.slurm.clone(),

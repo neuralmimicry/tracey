@@ -14,7 +14,7 @@ use crate::swarm::Decision;
 use crate::swarm::LearningSnapshot;
 use crate::tuning::TuningUpdate;
 use crate::update::UpdateRecord;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
@@ -44,7 +44,7 @@ pub enum StorageRecord {
     GovernanceUpdate { payload: GovernanceUpdate },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BanUpdateRecord {
     pub ts_ms: u64,
     pub jail: String,

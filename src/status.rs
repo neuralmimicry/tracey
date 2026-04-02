@@ -4,9 +4,10 @@
 //! status/control endpoints with optional auth gating.
 
 use crate::auth::AuthGate;
-use crate::coordination::CoordinatorRole;
+use crate::coordination::{Coordination, CoordinatorRole};
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
+use crate::location::AgentLocationSnapshot;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -28,9 +29,11 @@ enum ProxySnapshotParseError {
 #[derive(Clone)]
 pub struct StatusService {
     pub agent_id: String,
+    pub coordination: Coordination,
     pub coordination_role: Arc<tokio::sync::RwLock<CoordinatorRole>>,
     pub governance_state: Arc<tokio::sync::RwLock<GovernanceState>>,
     pub client: reqwest::Client,
+    pub status_addr: Option<String>,
     pub auth: AuthGate,
     pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
@@ -45,6 +48,8 @@ struct StatusSnapshot {
     #[serde(default)]
     status: Option<String>,
     agent_id: String,
+    #[serde(default)]
+    status_addr: Option<String>,
     is_coordinator: bool,
     leader_rank: usize,
     leader_count: usize,
@@ -85,6 +90,10 @@ struct StatusSnapshot {
     slurm: Option<crate::slurm::SlurmSnapshot>,
     #[serde(default)]
     continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerSnapshot>,
+    #[serde(default)]
+    location: AgentLocationSnapshot,
+    #[serde(default)]
+    peer_locations: Vec<AgentLocationSnapshot>,
 }
 
 pub async fn spawn_status(
@@ -278,6 +287,7 @@ async fn forward_to_proxy(
 
 async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> StatusSnapshot {
     let state = service.governance_state.read().await;
+    let presence = service.coordination.presence_snapshot().await;
     let ban_snapshot = if let Some(ban_intel) = &service.ban_intel {
         ban_intel.snapshot(16).await
     } else {
@@ -296,11 +306,18 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         None
     };
     let local_probe = role.prometheus_probe.clone();
+    let (location, peer_locations) = crate::location::infer_cluster_locations(
+        &service.agent_id,
+        role,
+        service.status_addr.as_deref(),
+        &presence,
+    );
 
     StatusSnapshot {
         ts_ms: now_ms(),
         status: Some(status_for_posture(state.posture)),
         agent_id: service.agent_id.clone(),
+        status_addr: service.status_addr.clone(),
         is_coordinator: role.is_coordinator,
         leader_rank: role.leader_rank,
         leader_count: role.leader_count,
@@ -338,6 +355,8 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         tracey_guard,
         slurm,
         continuum_autoscaler,
+        location,
+        peer_locations,
     }
 }
 

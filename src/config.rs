@@ -194,7 +194,7 @@ impl Default for PrometheusLogExportConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            server_url: "http://prometheus.neuralmimicry.ai".to_string(),
+            server_url: "https://prometheus.neuralmimicry.ai".to_string(),
             probe_path: "/-/ready".to_string(),
             probe_interval_ms: 5_000,
             probe_timeout_ms: 1_500,

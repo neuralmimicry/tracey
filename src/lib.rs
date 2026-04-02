@@ -8,6 +8,7 @@ pub mod bus;
 pub mod capabilities;
 pub mod config;
 pub mod coordination;
+pub mod dashboard;
 pub mod discovery;
 pub mod embedded;
 pub mod event;
@@ -15,6 +16,7 @@ pub mod governance;
 pub mod gpu;
 pub mod inventory;
 pub mod loader;
+pub mod location;
 pub mod prometheus_export;
 pub mod refiner_tracking;
 pub mod security;
@@ -62,6 +64,23 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
     }
     if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
         println!("{}", package_version());
+        return Ok(());
+    }
+
+    if args.iter().any(|arg| arg == "--tui") {
+        let result = tokio::task::spawn_blocking(move || {
+            dashboard::run_tracey_tui(args).map_err(|err| err.to_string())
+        })
+        .await
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("tracey tui task failed: {}", err),
+            )
+        })?;
+        if let Err(message) = result {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, message).into());
+        }
         return Ok(());
     }
 
@@ -130,8 +149,9 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
     let auth_system = auth::AuthSystem::from_config(&config.auth);
     let slurm_runtime = slurm::spawn_slurm_runtime(shutdown_listener.clone()).await;
 
-    let local_capabilities =
-        capabilities::Capabilities::local().with_extra_tags(slurm_runtime.capability_tags().await);
+    let local_capabilities = capabilities::Capabilities::local()
+        .with_extra_tags(location::local_capability_tags())
+        .with_extra_tags(slurm_runtime.capability_tags().await);
 
     let coordination = coordination::Coordination::new(
         config.agent_id.clone(),
@@ -224,9 +244,11 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     });
                 let service = status::StatusService {
                     agent_id: config.agent_id.clone(),
+                    coordination: coordination.clone(),
                     coordination_role: coordination_role.clone(),
                     governance_state: governance_state.clone(),
                     client,
+                    status_addr: status_public.clone(),
                     auth: auth_system.status_gate(),
                     ban_intel: if config.tracey_ban.enabled {
                         Some(ban_intel.clone())

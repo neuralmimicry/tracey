@@ -53,8 +53,12 @@ pub struct PresenceRecord {
     pub agent_id: String,
     pub score: u64,
     pub cpu_cores: usize,
+    pub os: String,
+    pub arch: String,
     pub latency_ms: u64,
+    pub advertise_addr: Option<String>,
     pub status_addr: Option<String>,
+    pub observed_addr: Option<String>,
     pub tags: Vec<String>,
     pub is_coordinator: bool,
     pub epoch: u64,
@@ -139,8 +143,12 @@ impl Coordination {
                 agent_id: presence.agent_id,
                 score: presence.score.unwrap_or(0),
                 cpu_cores: presence.capabilities.cpu_cores,
+                os: presence.capabilities.os,
+                arch: presence.capabilities.arch,
                 latency_ms,
+                advertise_addr: presence.addr,
                 status_addr: presence.status_addr,
+                observed_addr: presence.observed_addr,
                 tags: presence.capabilities.tags,
                 is_coordinator: presence.is_coordinator.unwrap_or(false),
                 epoch: presence.coordinator_epoch.unwrap_or(0),
@@ -153,6 +161,54 @@ impl Coordination {
     #[allow(dead_code)]
     pub async fn is_coordinator(&self) -> bool {
         self.role.read().await.is_coordinator
+    }
+
+    pub async fn presence_snapshot(&self) -> Vec<PresenceRecord> {
+        let now = now_ms();
+        let local = self.role.read().await.clone();
+        let local_probe = self.local_prometheus_probe.read().await.clone();
+
+        let mut records: Vec<PresenceRecord> =
+            self.presence.read().await.values().cloned().collect();
+        if let Some(local_record) = records
+            .iter_mut()
+            .find(|record| record.agent_id == local.agent_id)
+        {
+            local_record.score = local.score;
+            local_record.cpu_cores = self.local_capabilities.cpu_cores;
+            local_record.os = self.local_capabilities.os.clone();
+            local_record.arch = self.local_capabilities.arch.clone();
+            local_record.latency_ms = 0;
+            local_record.tags = self.local_capabilities.tags.clone();
+            local_record.is_coordinator = local.is_coordinator;
+            local_record.epoch = local.epoch;
+            local_record.last_seen_ms = now;
+            local_record.prometheus_probe = local_probe.clone();
+        } else {
+            records.push(PresenceRecord {
+                agent_id: local.agent_id.clone(),
+                score: local.score,
+                cpu_cores: self.local_capabilities.cpu_cores,
+                os: self.local_capabilities.os.clone(),
+                arch: self.local_capabilities.arch.clone(),
+                latency_ms: 0,
+                advertise_addr: None,
+                status_addr: None,
+                observed_addr: None,
+                tags: self.local_capabilities.tags.clone(),
+                is_coordinator: local.is_coordinator,
+                epoch: local.epoch,
+                last_seen_ms: now,
+                prometheus_probe: local_probe,
+            });
+        }
+
+        records.sort_by(|left, right| {
+            left.latency_ms
+                .cmp(&right.latency_ms)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        records
     }
 
     /// Runs periodic role elections while governance permits coordination.
@@ -186,8 +242,12 @@ impl Coordination {
             agent_id: local.agent_id.clone(),
             score: local.score,
             cpu_cores: self.local_capabilities.cpu_cores,
+            os: self.local_capabilities.os.clone(),
+            arch: self.local_capabilities.arch.clone(),
             latency_ms: 0,
+            advertise_addr: None,
             status_addr: None,
+            observed_addr: None,
             tags: self.local_capabilities.tags.clone(),
             is_coordinator: local.is_coordinator,
             epoch: local.epoch,
@@ -385,8 +445,12 @@ mod tests {
             agent_id: agent_id.to_string(),
             score: 123,
             cpu_cores: 8,
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
             latency_ms,
+            advertise_addr: Some(format!("{}:48000", agent_id)),
             status_addr: Some(format!("{}:48000", agent_id)),
+            observed_addr: Some(format!("{}:47990", agent_id)),
             tags: tags.into_iter().map(|v| v.to_string()).collect(),
             is_coordinator: false,
             epoch: 1,
