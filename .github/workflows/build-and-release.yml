@@ -1,0 +1,257 @@
+---
+name: Build and Release
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: >-
+          Publish a GitHub release from the selected v* tag ref
+        required: true
+        type: boolean
+        default: false
+      draft_release:
+        description: "Mark a manually published release as draft"
+        required: true
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark a manually published release as prerelease"
+        required: true
+        type: boolean
+        default: false
+      sign_update_bundle:
+        description: >-
+          Generate signed tracey.update artifacts when TRACEY_UPDATE_KEY is
+          configured
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: build-and-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check build
+        run: cargo check --locked --all-targets
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Smoke test TUI help
+        run: cargo run --locked --bin tracey -- --tui --help
+
+      - name: Validate release scripts
+        run: bash -n scripts/install-service.sh scripts/package-release.sh
+
+  package-release:
+    name: package-release
+    needs: verify
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+      artifact_version: ${{ steps.meta.outputs.artifact_version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Compute artifact metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(
+            sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1
+          )
+          short_sha="${GITHUB_SHA::0:7}"
+          release_tag=""
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF#refs/tags/}"
+            artifact_version="${release_tag#v}"
+          else
+            artifact_version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}.${short_sha}"
+          fi
+
+          if [[ -n "$release_tag" && \
+                "$artifact_version" != "$cargo_version" ]]; then
+            echo "::error::Tag ${release_tag} does not match Cargo.toml"
+            echo "::error::version ${cargo_version}"
+            exit 1
+          fi
+
+          artifact_name="tracey-release-${artifact_version}-linux-x86_64"
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "artifact_version=$artifact_version" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Package release artifacts
+        shell: bash
+        env:
+          TRACEY_UPDATE_KEY: ${{ secrets.TRACEY_UPDATE_KEY }}
+          MANUAL_SIGN_REQUEST: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.sign_update_bundle }}
+        run: |
+          set -euo pipefail
+          args=(
+            --version "${{ steps.meta.outputs.artifact_version }}"
+            --output-dir "./dist"
+          )
+
+          if [[ -n "${{ steps.meta.outputs.release_tag }}" && \
+                -n "${TRACEY_UPDATE_KEY:-}" ]]; then
+            args+=(--sign-update)
+          elif [[ "${MANUAL_SIGN_REQUEST}" == "true" ]]; then
+            if [[ -z "${TRACEY_UPDATE_KEY:-}" ]]; then
+              echo "::error::TRACEY_UPDATE_KEY secret is required"
+              echo "::error::when sign_update_bundle is enabled"
+              exit 1
+            fi
+            args+=(--sign-update)
+          fi
+
+          chmod +x scripts/package-release.sh
+          ./scripts/package-release.sh "${args[@]}"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: publish-release
+    needs: package-release
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    permissions:
+      contents: write
+    steps:
+      - name: Validate publish target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ needs.package-release.outputs.release_tag }}" ]]; then
+            echo "::error::Publishing requires a v* tag ref"
+            exit 1
+          fi
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.package-release.outputs.artifact_name }}
+          path: ./dist
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
+          DRAFT_RELEASE: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.draft_release }}
+          MANUAL_PRERELEASE: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=(dist/*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No packaged artifacts were downloaded"
+            exit 1
+          fi
+
+          title="Tracey ${RELEASE_TAG}"
+          prerelease="${MANUAL_PRERELEASE}"
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" && \
+                "${RELEASE_TAG}" == *-* ]]; then
+            prerelease="true"
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+            exit 0
+          fi
+
+          args=(
+            "${RELEASE_TAG}"
+            "${files[@]}"
+            --target "${GITHUB_SHA}"
+            --title "${title}"
+            --generate-notes
+          )
+
+          if [[ "${DRAFT_RELEASE}" == "true" ]]; then
+            args+=(--draft)
+          fi
+          if [[ "${prerelease}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}"

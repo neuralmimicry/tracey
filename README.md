@@ -274,6 +274,20 @@ What the script does in the current implementation:
 
 See `[docs/OPERATIONS.md](docs/OPERATIONS.md)` for operational detail.
 
+## GitHub Release Workflow
+
+GitHub Actions release automation lives in `.github/workflows/build-and-release.yml`.
+
+Current behavior:
+
+- every pull request and push to `main` runs the Rust verification job
+- pushing a `v*` tag packages release artifacts and publishes a GitHub release
+- manual `workflow_dispatch` runs can package artifacts from any ref
+- manual publishing is allowed only when the workflow is run against a `v*` tag ref
+- release packaging emits a Linux `tracey`/`tracey-loader` tarball, checksum file, and optional signed `tracey.update` bundle
+
+If the repository secret `TRACEY_UPDATE_KEY` is configured, tagged releases automatically attach signed update artifacts compatible with the loader/update pipeline.
+
 ## Security and Compliance Notes
 
 The repository contains real security controls, but several surfaces are intentionally permissive until explicitly hardened.
