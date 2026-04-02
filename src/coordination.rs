@@ -51,6 +51,7 @@ pub struct CoordinatorRole {
 #[derive(Clone, Debug)]
 pub struct PresenceRecord {
     pub agent_id: String,
+    pub agent_version: Option<String>,
     pub score: u64,
     pub cpu_cores: usize,
     pub os: String,
@@ -72,6 +73,7 @@ pub struct Coordination {
     role: Arc<RwLock<CoordinatorRole>>,
     presence: Arc<RwLock<HashMap<String, PresenceRecord>>>,
     local_capabilities: Capabilities,
+    local_version: String,
     local_prometheus_probe: Arc<RwLock<Option<PrometheusProbe>>>,
 }
 
@@ -82,6 +84,7 @@ impl Coordination {
         config: CoordinationConfig,
         shared_key: &str,
         local_capabilities: Capabilities,
+        local_version: String,
     ) -> Self {
         let score = score_agent(&agent_id, shared_key);
         let role = CoordinatorRole {
@@ -107,6 +110,7 @@ impl Coordination {
             role: Arc::new(RwLock::new(role)),
             presence: Arc::new(RwLock::new(HashMap::new())),
             local_capabilities,
+            local_version,
             local_prometheus_probe: Arc::new(RwLock::new(None)),
         }
     }
@@ -141,6 +145,7 @@ impl Coordination {
             presence.agent_id.clone(),
             PresenceRecord {
                 agent_id: presence.agent_id,
+                agent_version: presence.agent_version,
                 score: presence.score.unwrap_or(0),
                 cpu_cores: presence.capabilities.cpu_cores,
                 os: presence.capabilities.os,
@@ -174,6 +179,7 @@ impl Coordination {
             .iter_mut()
             .find(|record| record.agent_id == local.agent_id)
         {
+            local_record.agent_version = Some(self.local_version.clone());
             local_record.score = local.score;
             local_record.cpu_cores = self.local_capabilities.cpu_cores;
             local_record.os = self.local_capabilities.os.clone();
@@ -187,6 +193,7 @@ impl Coordination {
         } else {
             records.push(PresenceRecord {
                 agent_id: local.agent_id.clone(),
+                agent_version: Some(self.local_version.clone()),
                 score: local.score,
                 cpu_cores: self.local_capabilities.cpu_cores,
                 os: self.local_capabilities.os.clone(),
@@ -240,6 +247,7 @@ impl Coordination {
         let local_probe = self.local_prometheus_probe.read().await.clone();
         map.entry(local.agent_id.clone()).or_insert(PresenceRecord {
             agent_id: local.agent_id.clone(),
+            agent_version: Some(self.local_version.clone()),
             score: local.score,
             cpu_cores: self.local_capabilities.cpu_cores,
             os: self.local_capabilities.os.clone(),
@@ -255,6 +263,7 @@ impl Coordination {
             prometheus_probe: local_probe.clone(),
         });
         if let Some(entry) = map.get_mut(&local.agent_id) {
+            entry.agent_version = Some(self.local_version.clone());
             entry.prometheus_probe = local_probe.clone();
             entry.last_seen_ms = now;
         }
@@ -443,6 +452,7 @@ mod tests {
     fn mk_record(agent_id: &str, latency_ms: u64, tags: Vec<&str>) -> PresenceRecord {
         PresenceRecord {
             agent_id: agent_id.to_string(),
+            agent_version: Some(crate::package_version().to_string()),
             score: 123,
             cpu_cores: 8,
             os: "linux".to_string(),

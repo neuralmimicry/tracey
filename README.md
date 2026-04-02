@@ -60,6 +60,8 @@ Primary runtime entry point.
 - `cargo run --bin tracey -- --version`
 - `cargo run --bin tracey -- sign-update --bundle ./tracey-new --version 0.2.0 --key '<shared-key>'`
 
+`tracey --version` returns the runtime build version, formatted as `major.minor.build`. For source builds, the `build` component is derived from the git commit count, so it advances on each commit. The Cargo package version remains the release-version source of truth for packaging and signed update metadata.
+
 ### `tracey --supervisor`
 
 Crash-restart and zero-downtime handoff wrapper around the same runtime binary.

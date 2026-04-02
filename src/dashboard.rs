@@ -683,6 +683,8 @@ struct StatusSnapshot {
     #[serde(default)]
     status_addr: Option<String>,
     agent_id: String,
+    #[serde(default)]
+    agent_version: Option<String>,
     is_coordinator: bool,
     leader_rank: usize,
     leader_count: usize,
@@ -1468,7 +1470,11 @@ fn render_locations_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
 fn effective_self_location(app: &TraceyTopApp) -> Option<AgentLocationSnapshot> {
     let status = app.status.as_ref()?;
     if !status.location.agent_id.trim().is_empty() {
-        return Some(status.location.clone());
+        let mut location = status.location.clone();
+        if location.agent_version.is_none() {
+            location.agent_version = status.agent_version.clone();
+        }
+        return Some(location);
     }
 
     let status_addr = status
@@ -1476,11 +1482,10 @@ fn effective_self_location(app: &TraceyTopApp) -> Option<AgentLocationSnapshot> 
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .or(Some(app.options.status_url.as_str()));
-    Some(infer_single_agent_location(
-        &status.agent_id,
-        status_addr,
-        status.is_coordinator,
-    ))
+    let mut location =
+        infer_single_agent_location(&status.agent_id, status_addr, status.is_coordinator);
+    location.agent_version = status.agent_version.clone();
+    Some(location)
 }
 
 fn location_inference_banner_text(app: &TraceyTopApp) -> Option<&'static str> {
@@ -1534,10 +1539,23 @@ fn render_location_inference_banner(
 
 fn render_header(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
     let block = panel_block(" tracey tui ", theme);
+    let lines = build_header_lines(app, theme);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn build_header_lines<'a>(app: &'a TraceyTopApp, theme: Theme) -> Vec<Line<'a>> {
     let status = app.status.as_ref();
     let agent = status
         .map(|value| value.agent_id.as_str())
         .unwrap_or("status-unavailable");
+    let version = status
+        .and_then(|value| value.agent_version.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("v{value}"))
+        .unwrap_or_else(|| "v?".to_string());
     let posture = status
         .map(|value| value.posture.as_str())
         .unwrap_or("offline");
@@ -1562,7 +1580,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme
         .unwrap_or("configured target");
     let transport = StatusTransport::from_url(&app.options.status_url);
 
-    let lines = vec![
+    vec![
         Line::from(vec![
             Span::styled("agent ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -1571,6 +1589,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw("  "),
+            Span::styled(version, Style::default().fg(theme.muted)),
             Span::raw("  "),
             Span::styled("posture ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -1611,12 +1631,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme
             Span::styled("refresh ", Style::default().fg(theme.muted)),
             Span::raw(format!("{}ms", app.options.refresh_interval.as_millis())),
         ]),
-    ];
-
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
+    ]
 }
 
 fn render_resize_notice(frame: &mut Frame, area: Rect, theme: Theme) {
@@ -2733,6 +2748,14 @@ fn build_location_map_lines(app: &TraceyTopApp, width: usize, height: u16) -> Ve
 
 fn location_map_node(node: &AgentLocationSnapshot) -> String {
     let lock = if node.secure_status { "🔒" } else { "🔓" };
+    let version = format!(
+        "ver={}",
+        node.agent_version
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("v{value}"))
+            .unwrap_or_else(|| "v?".to_string())
+    );
     let latency = node
         .latency_ms
         .map(|value| format!("{value}ms"))
@@ -2742,6 +2765,7 @@ fn location_map_node(node: &AgentLocationSnapshot) -> String {
     let mut parts = vec![
         if node.is_self { "self" } else { "peer" }.to_string(),
         node.host.clone(),
+        version,
         lock.to_string(),
         format!("lat={latency}"),
         format!("role={}", node.relation),
@@ -2971,6 +2995,7 @@ mod tests {
             status: Some("healthy".to_string()),
             status_addr: None,
             agent_id: agent_id.to_string(),
+            agent_version: Some(crate::package_version().to_string()),
             is_coordinator: true,
             leader_rank: 0,
             leader_count: 1,
@@ -3220,6 +3245,10 @@ mod tests {
             location.status_addr.as_deref(),
             Some("http://127.0.0.1:48000/status")
         );
+        assert_eq!(
+            location.agent_version.as_deref(),
+            Some(crate::package_version())
+        );
     }
 
     #[test]
@@ -3252,7 +3281,55 @@ mod tests {
 
         assert!(text.contains("fuzzy location graph"));
         assert!(text.contains("self"));
+        assert!(text.contains(&format!("ver=v{}", crate::package_version())));
         assert!(text.contains("role=self"));
         assert!(!text.contains("location inference unavailable"));
+    }
+
+    #[test]
+    fn header_lines_show_agent_version_discreetly() {
+        let app = test_app(
+            "https://tracey.example.com:48000/status",
+            test_status("cortex-1000"),
+        );
+        let text = build_header_lines(&app, Theme::default())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains(&format!("v{}", crate::package_version())));
+        assert!(text.contains("agent cortex-1000"));
+    }
+
+    #[test]
+    fn location_map_shows_peer_versions() {
+        let mut status = test_status("cortex-1000");
+        status.location.agent_id = "cortex-1000".to_string();
+        status.location.agent_version = Some("1.2.3".to_string());
+        status.location.host = "cortex".to_string();
+        status.location.relation = "self,coord".to_string();
+        status.location.is_self = true;
+        status.location.is_coordinator = true;
+        status.peer_locations.push(AgentLocationSnapshot {
+            agent_id: "peer-2000".to_string(),
+            agent_version: Some("2.4.6".to_string()),
+            host: "peerbox".to_string(),
+            relation: "peer".to_string(),
+            latency_ms: Some(8),
+            secure_status: true,
+            ..AgentLocationSnapshot::default()
+        });
+        let app = test_app("https://tracey.example.com:48000/status", status);
+
+        let text = build_location_map_lines(&app, 120, 12)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("ver=v1.2.3"));
+        assert!(text.contains("ver=v2.4.6"));
+        assert!(text.contains("peerbox"));
     }
 }

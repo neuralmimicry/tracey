@@ -18,6 +18,7 @@ use tokio::net::UdpSocket;
 const MAX_FUTURE_SKEW_MS: u64 = 30_000;
 const MAX_AGENT_ID_LEN: usize = 128;
 const MAX_ADDR_LEN: usize = 256;
+const MAX_VERSION_LEN: usize = 64;
 const MAX_TAGS: usize = 64;
 const MAX_TAG_LEN: usize = 64;
 const DISCOVERY_PREVIEW_BYTES: usize = 160;
@@ -25,6 +26,8 @@ const DISCOVERY_PREVIEW_BYTES: usize = 160;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentAnnouncement {
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_version: Option<String>,
     pub ts_ms: u64,
     pub addr: Option<String>,
     pub status_addr: Option<String>,
@@ -44,6 +47,8 @@ pub struct AgentAnnouncement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentPresence {
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_version: Option<String>,
     pub ts_ms: u64,
     pub addr: Option<String>,
     pub status_addr: Option<String>,
@@ -65,6 +70,7 @@ pub struct AgentPresence {
 pub async fn spawn_discovery(
     config: DiscoveryConfig,
     agent_id: String,
+    agent_version: String,
     inventory: Inventory,
     mut shutdown: ShutdownListener,
     governance_state: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
@@ -125,6 +131,7 @@ pub async fn spawn_discovery(
                     };
                     let announcement = build_announcement(
                         &agent_id,
+                        &agent_version,
                         &config,
                         &announcement_capabilities,
                         &shared_key,
@@ -194,6 +201,7 @@ pub async fn spawn_discovery(
 
                     let presence = AgentPresence {
                         agent_id: announcement.agent_id,
+                        agent_version: announcement.agent_version,
                         ts_ms: announcement.ts_ms,
                         addr: announcement.addr,
                         status_addr: announcement.status_addr,
@@ -232,6 +240,7 @@ pub async fn spawn_discovery(
 
 fn build_announcement(
     agent_id: &str,
+    agent_version: &str,
     config: &DiscoveryConfig,
     capabilities: &Capabilities,
     key: &[u8; 32],
@@ -245,6 +254,7 @@ fn build_announcement(
     let addr = config.advertise_addr.clone();
     let signature = sign_payload(
         agent_id,
+        agent_version,
         ts_ms,
         addr.as_deref(),
         capabilities,
@@ -256,6 +266,7 @@ fn build_announcement(
     );
     AgentAnnouncement {
         agent_id: agent_id.to_string(),
+        agent_version: Some(agent_version.to_string()),
         ts_ms,
         addr,
         status_addr: status_addr.map(|v| v.to_string()),
@@ -290,7 +301,27 @@ fn valid_signature(announcement: &AgentAnnouncement, key: &[u8; 32]) -> bool {
         prometheus_exporter_bandwidth_mbps: None,
         prometheus_probe: announcement.prometheus_probe.clone(),
     };
-    let expected = sign_payload(
+    if let Some(agent_version) = announcement
+        .agent_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let expected = sign_payload(
+            &announcement.agent_id,
+            agent_version,
+            announcement.ts_ms,
+            announcement.addr.as_deref(),
+            &announcement.capabilities,
+            &role,
+            announcement.status_addr.as_deref(),
+            announcement.ban_advertisement.as_ref(),
+            announcement.fault_advertisement.as_ref(),
+            key,
+        );
+        return normalize_eq(&announcement.signature, &expected);
+    }
+
+    let legacy = sign_payload_legacy(
         &announcement.agent_id,
         announcement.ts_ms,
         announcement.addr.as_deref(),
@@ -301,7 +332,7 @@ fn valid_signature(announcement: &AgentAnnouncement, key: &[u8; 32]) -> bool {
         announcement.fault_advertisement.as_ref(),
         key,
     );
-    normalize_eq(&announcement.signature, &expected)
+    normalize_eq(&announcement.signature, &legacy)
 }
 
 fn validate_announcement_semantics(
@@ -315,6 +346,9 @@ fn validate_announcement_semantics(
     }
     if agent_id.len() > MAX_AGENT_ID_LEN {
         return Err(format!("agent_id too long (>{})", MAX_AGENT_ID_LEN));
+    }
+    if let Some(agent_version) = &announcement.agent_version {
+        validate_text_field("agent_version", agent_version, MAX_VERSION_LEN)?;
     }
     if !is_hex64(&announcement.signature) {
         return Err("signature format invalid".to_string());
@@ -497,6 +531,54 @@ fn sanitize_fault_announcement(
 
 fn sign_payload(
     agent_id: &str,
+    agent_version: &str,
+    ts_ms: u64,
+    addr: Option<&str>,
+    capabilities: &Capabilities,
+    role: &CoordinatorRole,
+    status_addr: Option<&str>,
+    ban_advertisement: Option<&crate::tracey_ban::BanAdvertisement>,
+    fault_advertisement: Option<&crate::tracey_guard::FaultAdvertisement>,
+    key: &[u8; 32],
+) -> String {
+    let ban_digest = ban_advertisement
+        .and_then(|advertisement| serde_json::to_vec(advertisement).ok())
+        .map(|payload| blake3::hash(&payload).to_hex().to_string())
+        .unwrap_or_default();
+    let fault_digest = fault_advertisement
+        .and_then(|advertisement| serde_json::to_vec(advertisement).ok())
+        .map(|payload| blake3::hash(&payload).to_hex().to_string())
+        .unwrap_or_default();
+    let probe_digest = role
+        .prometheus_probe
+        .as_ref()
+        .and_then(|probe| serde_json::to_vec(probe).ok())
+        .map(|payload| blake3::hash(&payload).to_hex().to_string())
+        .unwrap_or_default();
+    let payload = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        agent_id,
+        agent_version,
+        ts_ms,
+        addr.unwrap_or(""),
+        status_addr.unwrap_or(""),
+        capabilities.os,
+        capabilities.arch,
+        capabilities.cpu_cores,
+        capabilities.tags.join(","),
+        role.is_coordinator,
+        role.epoch,
+        role.score,
+        ban_digest,
+        fault_digest,
+        probe_digest
+    );
+    let hash = blake3::keyed_hash(key, payload.as_bytes());
+    to_hex(hash.as_bytes())
+}
+
+fn sign_payload_legacy(
+    agent_id: &str,
     ts_ms: u64,
     addr: Option<&str>,
     capabilities: &Capabilities,
@@ -589,6 +671,7 @@ mod tests {
         let now = now_ms();
         let mut announcement = AgentAnnouncement {
             agent_id: "peer-1".to_string(),
+            agent_version: Some("1.2.3".to_string()),
             ts_ms: now,
             addr: Some("10.0.0.2:47990".to_string()),
             status_addr: Some("10.0.0.2:48000".to_string()),
@@ -673,6 +756,7 @@ mod tests {
         ) {
             let announcement = AgentAnnouncement {
                 agent_id,
+                agent_version: None,
                 ts_ms: ts,
                 addr,
                 status_addr,
@@ -694,5 +778,126 @@ mod tests {
 
             let _ = validate_announcement_semantics(&announcement, 20_000, now_ms());
         }
+    }
+
+    #[test]
+    fn discovery_signature_binds_agent_version() {
+        let key = derive_key("shared-key");
+        let role = CoordinatorRole {
+            agent_id: "peer-1".to_string(),
+            score: 7,
+            is_coordinator: true,
+            leader_rank: 0,
+            leader_count: 1,
+            epoch: 3,
+            last_update_ms: 1,
+            proxy_agent_id: None,
+            proxy_latency_ms: None,
+            proxy_addr: None,
+            is_prometheus_exporter: false,
+            prometheus_exporter_agent_id: None,
+            prometheus_exporter_addr: None,
+            prometheus_exporter_latency_ms: None,
+            prometheus_exporter_bandwidth_mbps: None,
+            prometheus_probe: None,
+        };
+        let capabilities = Capabilities {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_cores: 8,
+            tags: vec!["room:lab".to_string()],
+        };
+        let ts_ms = 42;
+        let signature = sign_payload(
+            "peer-1",
+            "1.2.3",
+            ts_ms,
+            Some("10.0.0.2:47990"),
+            &capabilities,
+            &role,
+            Some("https://10.0.0.2:48000/status"),
+            None,
+            None,
+            &key,
+        );
+
+        let mut announcement = AgentAnnouncement {
+            agent_id: "peer-1".to_string(),
+            agent_version: Some("1.2.3".to_string()),
+            ts_ms,
+            addr: Some("10.0.0.2:47990".to_string()),
+            status_addr: Some("https://10.0.0.2:48000/status".to_string()),
+            ban_advertisement: None,
+            fault_advertisement: None,
+            slurm: None,
+            capabilities,
+            signature,
+            is_coordinator: Some(true),
+            coordinator_epoch: Some(3),
+            score: Some(7),
+            prometheus_probe: None,
+        };
+        assert!(valid_signature(&announcement, &key));
+
+        announcement.agent_version = Some("9.9.9".to_string());
+        assert!(!valid_signature(&announcement, &key));
+    }
+
+    #[test]
+    fn discovery_signature_accepts_legacy_announcements_without_version() {
+        let key = derive_key("shared-key");
+        let role = CoordinatorRole {
+            agent_id: "peer-1".to_string(),
+            score: 7,
+            is_coordinator: false,
+            leader_rank: 0,
+            leader_count: 1,
+            epoch: 2,
+            last_update_ms: 1,
+            proxy_agent_id: None,
+            proxy_latency_ms: None,
+            proxy_addr: None,
+            is_prometheus_exporter: false,
+            prometheus_exporter_agent_id: None,
+            prometheus_exporter_addr: None,
+            prometheus_exporter_latency_ms: None,
+            prometheus_exporter_bandwidth_mbps: None,
+            prometheus_probe: None,
+        };
+        let capabilities = Capabilities {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_cores: 4,
+            tags: vec!["test".to_string()],
+        };
+        let ts_ms = 55;
+        let signature = sign_payload_legacy(
+            "peer-1",
+            ts_ms,
+            Some("10.0.0.2:47990"),
+            &capabilities,
+            &role,
+            Some("http://10.0.0.2:48000/status"),
+            None,
+            None,
+            &key,
+        );
+        let announcement = AgentAnnouncement {
+            agent_id: "peer-1".to_string(),
+            agent_version: None,
+            ts_ms,
+            addr: Some("10.0.0.2:47990".to_string()),
+            status_addr: Some("http://10.0.0.2:48000/status".to_string()),
+            ban_advertisement: None,
+            fault_advertisement: None,
+            slurm: None,
+            capabilities,
+            signature,
+            is_coordinator: Some(false),
+            coordinator_epoch: Some(2),
+            score: Some(7),
+            prometheus_probe: None,
+        };
+        assert!(valid_signature(&announcement, &key));
     }
 }

@@ -28,7 +28,7 @@ Options:
   --agent-id ID                Stable Tracey agent_id to write when creating config.
   --core-channel MODE          production or development. Auto-detected by default.
   --bootstrap-version VERSION  Optional fallback version for first loader bootstrap.
-  --skip-build                 Do not build release binaries when they are missing.
+  --skip-build                 Do not build release binaries when missing or older than source version.
   --skip-start                 Install/enable the service but do not start it.
   --no-supervisor              Deprecated; ignored because tracey-loader always supervises the core.
   --force-config               Overwrite an existing config file.
@@ -352,17 +352,189 @@ ensure_status_firewall_access() {
 
 build_release_binaries() {
   log "building release Tracey binaries"
+  RELEASE_BUILD_PLANNED=1
+  local build_cmd
+  printf -v build_cmd 'cd %q && cargo build --release --bin tracey --bin tracey-loader' "$REPO_ROOT"
   if ((DRY_RUN)); then
-    printf '+ (cd %q && cargo build --release --bin tracey --bin tracey-loader)\n' "$REPO_ROOT"
+    if [[ -n "$BUILD_AS_USER" ]]; then
+      printf '+ sudo -u %q -H bash -lc %q\n' "$BUILD_AS_USER" "$build_cmd"
+    else
+      printf '+ bash -lc %q\n' "$build_cmd"
+    fi
     return 0
   fi
-  (
-    cd "$REPO_ROOT"
-    cargo build --release --bin tracey --bin tracey-loader
-  )
+  if [[ -n "$BUILD_AS_USER" ]]; then
+    sudo -u "$BUILD_AS_USER" -H bash -lc "$build_cmd"
+  else
+    (
+      cd "$REPO_ROOT"
+      cargo build --release --bin tracey --bin tracey-loader
+    )
+  fi
+}
+
+resolve_build_user() {
+  if [[ $(id -u) -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    printf '%s\n' "$SUDO_USER"
+  fi
+}
+
+read_source_release_version() {
+  local cargo_toml="$REPO_ROOT/Cargo.toml"
+  [[ -r "$cargo_toml" ]] || return 1
+  sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$cargo_toml" \
+    | head -n 1
+}
+
+version_component_or_default() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+read_binary_version() {
+  local path="$1"
+  [[ -x "$path" ]] || return 1
+  local version
+  version=$("$path" --version 2>/dev/null) || return 1
+  version=${version%%$'\n'*}
+  version=${version//$'\r'/}
+  [[ -n "$version" ]] || return 1
+  printf '%s\n' "$version"
+}
+
+version_numbers() {
+  printf '%s\n' "$1" | tr -cs '0-9' ' '
+}
+
+env_first() {
+  local name value
+  for name in "$@"; do
+    value="${!name:-}"
+    value=${value//$'\r'/}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    if [[ -n "$value" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+read_source_build_version() {
+  local explicit_version release_version numbers
+  local major minor build_number
+  local -a parts=()
+
+  if explicit_version=$(env_first TRACEY_VERSION); then
+    if [[ "$explicit_version" =~ ^[0-9]+\.[0-9]+\.[0-9]{4,}$ ]]; then
+      printf '%s\n' "$explicit_version"
+      return 0
+    fi
+  fi
+
+  release_version=$(read_source_release_version || true)
+  read -r -a parts <<<"$(version_numbers "$release_version")"
+  major=$(version_component_or_default "${TRACEY_VERSION_MAJOR:-${parts[0]:-}}" 0)
+  minor=$(version_component_or_default "${TRACEY_VERSION_MINOR:-${parts[1]:-}}" 1)
+
+  if build_number=$(env_first TRACEY_BUILD_NUMBER BUILD_NUMBER); then
+    build_number=$(version_component_or_default "$build_number" 0)
+  elif build_number=$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null); then
+    build_number=$(version_component_or_default "$build_number" 0)
+  else
+    build_number=0
+  fi
+
+  printf '%s.%s.%04d\n' "$major" "$minor" "$((10#$build_number))"
+}
+
+compare_versions() {
+  local left="$1"
+  local right="$2"
+  local -a left_nums=()
+  local -a right_nums=()
+  local max_len=0
+  local idx left_part right_part
+
+  read -r -a left_nums <<<"$(version_numbers "$left")"
+  read -r -a right_nums <<<"$(version_numbers "$right")"
+
+  max_len=${#left_nums[@]}
+  if ((${#right_nums[@]} > max_len)); then
+    max_len=${#right_nums[@]}
+  fi
+
+  if ((max_len > 0)); then
+    for ((idx = 0; idx < max_len; idx++)); do
+      left_part=${left_nums[idx]:-0}
+      right_part=${right_nums[idx]:-0}
+      if ((10#$left_part > 10#$right_part)); then
+        printf '1\n'
+        return 0
+      fi
+      if ((10#$left_part < 10#$right_part)); then
+        printf '%s\n' '-1'
+        return 0
+      fi
+    done
+  fi
+
+  if [[ "$left" > "$right" ]]; then
+    printf '1\n'
+  elif [[ "$left" < "$right" ]]; then
+    printf '%s\n' '-1'
+  else
+    printf '0\n'
+  fi
+}
+
+release_rebuild_reason_for_source_version() {
+  local source_version="$1"
+  local release_core="$REPO_ROOT/target/release/tracey"
+  local release_loader="$REPO_ROOT/target/release/tracey-loader"
+  local core_version loader_version cmp
+  local -a reasons=()
+  local joined
+
+  [[ -n "$source_version" ]] || return 1
+  [[ -x "$release_core" && -x "$release_loader" ]] || return 1
+
+  if ! core_version=$(read_binary_version "$release_core"); then
+    reasons+=("could not read release core version from $release_core")
+  else
+    cmp=$(compare_versions "$source_version" "$core_version")
+    if ((cmp > 0)); then
+      reasons+=("source version $source_version is newer than release core $core_version")
+    fi
+  fi
+
+  if ! loader_version=$(read_binary_version "$release_loader"); then
+    reasons+=("could not read release loader version from $release_loader")
+  else
+    cmp=$(compare_versions "$source_version" "$loader_version")
+    if ((cmp > 0)); then
+      reasons+=("source version $source_version is newer than release loader $loader_version")
+    fi
+  fi
+
+  ((${#reasons[@]})) || return 1
+  joined=$(printf '%s; ' "${reasons[@]}")
+  joined=${joined%; }
+  printf '%s\n' "$joined"
 }
 
 ensure_binary_sources() {
+  local release_core="$REPO_ROOT/target/release/tracey"
+  local release_loader="$REPO_ROOT/target/release/tracey-loader"
+  local rebuild_reason=
+
   if [[ -n "$CORE_BINARY_SOURCE" ]]; then
     [[ -x "$CORE_BINARY_SOURCE" ]] || die "core binary is not executable: $CORE_BINARY_SOURCE"
   fi
@@ -371,17 +543,38 @@ ensure_binary_sources() {
   fi
 
   if { [[ -z "$CORE_BINARY_SOURCE" ]] || [[ -z "$LOADER_BINARY_SOURCE" ]]; } \
+    && [[ -f "$REPO_ROOT/Cargo.toml" ]]
+  then
+    SOURCE_VERSION=$(read_source_build_version || true)
+    rebuild_reason=$(release_rebuild_reason_for_source_version "$SOURCE_VERSION" || true)
+    if [[ -n "$rebuild_reason" ]]; then
+      if ((BUILD_IF_MISSING)); then
+        command -v cargo >/dev/null 2>&1 \
+          || die "$rebuild_reason but cargo is unavailable; install Cargo, pass explicit binaries, or use --skip-build to override"
+        RELEASE_BUILD_STATUS="rebuilding release binaries ($rebuild_reason)"
+        build_release_binaries
+      else
+        RELEASE_BUILD_STATUS="skipped release rebuild ($rebuild_reason)"
+        warn "$RELEASE_BUILD_STATUS"
+      fi
+    fi
+  fi
+
+  if { [[ -z "$CORE_BINARY_SOURCE" ]] || [[ -z "$LOADER_BINARY_SOURCE" ]]; } \
     && ((BUILD_IF_MISSING)) \
     && command -v cargo >/dev/null 2>&1 \
     && [[ -f "$REPO_ROOT/Cargo.toml" ]] \
-    && { [[ ! -x "$REPO_ROOT/target/release/tracey" ]] || [[ ! -x "$REPO_ROOT/target/release/tracey-loader" ]]; }
+    && { [[ ! -x "$release_core" ]] || [[ ! -x "$release_loader" ]]; }
   then
+    if [[ -z "$RELEASE_BUILD_STATUS" ]]; then
+      RELEASE_BUILD_STATUS="rebuilding release binaries (missing release artifacts)"
+    fi
     build_release_binaries
   fi
 
   if [[ -z "$CORE_BINARY_SOURCE" ]]; then
-    if [[ -x "$REPO_ROOT/target/release/tracey" ]]; then
-      CORE_BINARY_SOURCE="$REPO_ROOT/target/release/tracey"
+    if [[ -x "$release_core" || "$RELEASE_BUILD_PLANNED" -eq 1 ]]; then
+      CORE_BINARY_SOURCE="$release_core"
     elif [[ -x "$REPO_ROOT/target/debug/tracey" ]]; then
       CORE_BINARY_SOURCE="$REPO_ROOT/target/debug/tracey"
     elif command -v tracey >/dev/null 2>&1; then
@@ -392,8 +585,8 @@ ensure_binary_sources() {
   fi
 
   if [[ -z "$LOADER_BINARY_SOURCE" ]]; then
-    if [[ -x "$REPO_ROOT/target/release/tracey-loader" ]]; then
-      LOADER_BINARY_SOURCE="$REPO_ROOT/target/release/tracey-loader"
+    if [[ -x "$release_loader" || "$RELEASE_BUILD_PLANNED" -eq 1 ]]; then
+      LOADER_BINARY_SOURCE="$release_loader"
     elif [[ -x "$REPO_ROOT/target/debug/tracey-loader" ]]; then
       LOADER_BINARY_SOURCE="$REPO_ROOT/target/debug/tracey-loader"
     elif command -v tracey-loader >/dev/null 2>&1; then
@@ -817,6 +1010,15 @@ print_summary() {
   log "  service:        $UNIT_NAME"
   log "  loader source:  $LOADER_BINARY_SOURCE"
   log "  core source:    $CORE_BINARY_SOURCE"
+  if [[ -n "$BUILD_AS_USER" ]]; then
+    log "  build user:     $BUILD_AS_USER"
+  fi
+  if [[ -n "$SOURCE_VERSION" ]]; then
+    log "  source version: $SOURCE_VERSION"
+  fi
+  if [[ -n "$RELEASE_BUILD_STATUS" ]]; then
+    log "  build action:   $RELEASE_BUILD_STATUS"
+  fi
   log "  cli path:       $CLI_INSTALL_PATH"
   log "  loader path:    $LOADER_INSTALL_PATH"
   log "  core path:      $CORE_INSTALL_PATH"
@@ -870,6 +1072,10 @@ FORCE_CONFIG=0
 DRY_RUN=0
 WANTED_BY=
 SUPERVISOR_REQUESTED=1
+SOURCE_VERSION=
+RELEASE_BUILD_STATUS=
+RELEASE_BUILD_PLANNED=0
+BUILD_AS_USER=
 RUN_PREFIX=()
 
 while (($#)); do
@@ -986,6 +1192,8 @@ resolve_scope
 if [[ -z "$AGENT_ID" ]]; then
   AGENT_ID=$(default_agent_id)
 fi
+
+BUILD_AS_USER=$(resolve_build_user || true)
 
 ensure_binary_sources
 resolve_core_channel

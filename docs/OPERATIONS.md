@@ -23,6 +23,7 @@ Behaviour:
 - starts embedded collectors on supported systems
 - starts optional subsystems according to config
 - writes hand-off readiness when launched by supervisor or loader
+- `--version` reports the runtime build version as `major.minor.build`; local source builds derive `build` from the git commit count so it increments on each commit
 
 ### 2. Supervisor mode: `tracey --supervisor`
 
@@ -277,6 +278,7 @@ Bootstrap behaviour from the current code:
 - if the core binary exists and the metadata/signature files already exist, the loader verifies them and proceeds
 - if the core binary exists but metadata and signature are missing, the loader generates them locally using the configured artefact key
 - the version used for that generated metadata comes from `tracey-core --version` when possible, otherwise from `loader.bootstrap_version`, otherwise from the package version
+- in practice `tracey-core --version` is the preferred path and returns the git-aware runtime build version for source builds
 - if there is no core binary at all, the loader exits with an error
 
 ## Staged Update Workflow

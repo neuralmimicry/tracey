@@ -31,6 +31,8 @@ pub struct LocationGuess {
 #[serde(default)]
 pub struct AgentLocationSnapshot {
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_version: Option<String>,
     pub host: String,
     pub system: Option<String>,
     pub cpu: Option<String>,
@@ -76,6 +78,7 @@ struct LocalStaticFacts {
 #[derive(Clone, Debug, Default)]
 struct RawAgentContext {
     agent_id: String,
+    agent_version: Option<String>,
     host_label: String,
     system_label: Option<String>,
     cpu_label: Option<String>,
@@ -336,6 +339,7 @@ fn build_local_context(
 
     RawAgentContext {
         agent_id: local_agent_id.to_string(),
+        agent_version: local_presence.and_then(|record| record.agent_version.clone()),
         host_label,
         system_label,
         cpu_label,
@@ -384,6 +388,7 @@ fn build_peer_context(record: &PresenceRecord, role: &CoordinatorRole) -> RawAge
 
     RawAgentContext {
         agent_id: record.agent_id.clone(),
+        agent_version: record.agent_version.clone(),
         host_label,
         system_label: Some(format!("{}/{}", record.os, record.arch)),
         cpu_label: Some(format!("{} cores", record.cpu_cores.max(1))),
@@ -431,6 +436,7 @@ fn build_single_agent_context(
 
     RawAgentContext {
         agent_id: agent_id.to_string(),
+        agent_version: None,
         host_label,
         system_label: is_local_target
             .then(|| format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)),
@@ -541,6 +547,7 @@ fn finalize_snapshot(node: &RawAgentContext, inferred: DirectInference) -> Agent
     let evidence = build_evidence(node, &inferred);
     AgentLocationSnapshot {
         agent_id: node.agent_id.clone(),
+        agent_version: node.agent_version.clone(),
         host: node.host_label.clone(),
         system: node.system_label.clone(),
         cpu: node.cpu_label.clone(),
@@ -1418,6 +1425,7 @@ mod tests {
     ) -> PresenceRecord {
         PresenceRecord {
             agent_id: agent_id.to_string(),
+            agent_version: Some(crate::package_version().to_string()),
             score: 1,
             cpu_cores: 8,
             os: "linux".to_string(),
@@ -1493,6 +1501,10 @@ mod tests {
         );
         assert!(self_loc.secure_status);
         assert!(peers.is_empty());
+        assert_eq!(
+            self_loc.agent_version.as_deref(),
+            Some(crate::package_version())
+        );
     }
 
     #[test]
@@ -1522,6 +1534,10 @@ mod tests {
         assert_eq!(
             peers[0].site.as_ref().map(|guess| guess.label.as_str()),
             Some("lab")
+        );
+        assert_eq!(
+            peers[0].agent_version.as_deref(),
+            Some(crate::package_version())
         );
     }
 

@@ -29,6 +29,7 @@ enum ProxySnapshotParseError {
 #[derive(Clone)]
 pub struct StatusService {
     pub agent_id: String,
+    pub agent_version: String,
     pub coordination: Coordination,
     pub coordination_role: Arc<tokio::sync::RwLock<CoordinatorRole>>,
     pub governance_state: Arc<tokio::sync::RwLock<GovernanceState>>,
@@ -48,6 +49,8 @@ struct StatusSnapshot {
     #[serde(default)]
     status: Option<String>,
     agent_id: String,
+    #[serde(default)]
+    agent_version: Option<String>,
     #[serde(default)]
     status_addr: Option<String>,
     is_coordinator: bool,
@@ -306,17 +309,21 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         None
     };
     let local_probe = role.prometheus_probe.clone();
-    let (location, peer_locations) = crate::location::infer_cluster_locations(
+    let (mut location, peer_locations) = crate::location::infer_cluster_locations(
         &service.agent_id,
         role,
         service.status_addr.as_deref(),
         &presence,
     );
+    if location.agent_version.is_none() {
+        location.agent_version = Some(service.agent_version.clone());
+    }
 
     StatusSnapshot {
         ts_ms: now_ms(),
         status: Some(status_for_posture(state.posture)),
         agent_id: service.agent_id.clone(),
+        agent_version: Some(service.agent_version.clone()),
         status_addr: service.status_addr.clone(),
         is_coordinator: role.is_coordinator,
         leader_rank: role.leader_rank,

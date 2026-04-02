@@ -33,6 +33,7 @@ pub mod tracey_ban;
 pub mod tracey_guard;
 pub mod tuning;
 pub mod update;
+pub mod version;
 
 use crate::bus::EventBus;
 use crate::config::Config;
@@ -52,7 +53,11 @@ pub fn init_tracing() {
 }
 
 pub fn package_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    version::build_version()
+}
+
+pub fn release_version() -> &'static str {
+    version::release_version()
 }
 
 pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -158,6 +163,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         config.coordination.clone(),
         &config.discovery.shared_key,
         local_capabilities.clone(),
+        package_version().to_string(),
     );
     let coordination_role = coordination.role_handle();
     let coordination_for_election = coordination.clone();
@@ -244,6 +250,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     });
                 let service = status::StatusService {
                     agent_id: config.agent_id.clone(),
+                    agent_version: package_version().to_string(),
                     coordination: coordination.clone(),
                     coordination_role: coordination_role.clone(),
                     governance_state: governance_state.clone(),
@@ -362,6 +369,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         if let Err(err) = discovery::spawn_discovery(
             discovery_config,
             discovery_agent_id,
+            package_version().to_string(),
             discovery_inventory,
             discovery_shutdown,
             discovery_governance,
