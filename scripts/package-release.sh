@@ -60,16 +60,31 @@ binary_dir() {
   fi
 }
 
+resolve_build_user() {
+  if [[ $(id -u) -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    printf '%s\n' "$SUDO_USER"
+  fi
+}
+
 build_binaries() {
   local args
+  local cmd
   args=(cargo build --locked --release --bin tracey --bin tracey-loader)
   if [[ -n "$TARGET_TRIPLE" ]]; then
     args+=(--target "$TARGET_TRIPLE")
   fi
-  (
-    cd "$REPO_ROOT"
-    "${args[@]}"
-  )
+  printf -v cmd '%q ' "${args[@]}"
+  cmd=${cmd% }
+  if [[ -n "$BUILD_AS_USER" ]]; then
+    log "building release binaries as ${BUILD_AS_USER}"
+    sudo -u "$BUILD_AS_USER" -H bash -lc "cd $(printf '%q' "$REPO_ROOT") && ${cmd}"
+  else
+    log "building release binaries"
+    (
+      cd "$REPO_ROOT"
+      "${args[@]}"
+    )
+  fi
 }
 
 VERSION=
@@ -78,6 +93,7 @@ TARGET_TRIPLE=
 PLATFORM=
 SKIP_BUILD=0
 SIGN_UPDATE=0
+BUILD_AS_USER=
 
 while (($#)); do
   case "$1" in
@@ -124,13 +140,13 @@ done
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 PLATFORM="${PLATFORM:-$(default_platform)}"
+BUILD_AS_USER=$(resolve_build_user || true)
 
 BIN_DIR=$(binary_dir)
 TRACEY_BIN="$BIN_DIR/tracey"
 LOADER_BIN="$BIN_DIR/tracey-loader"
 
 if (( ! SKIP_BUILD )) || [[ ! -x "$TRACEY_BIN" || ! -x "$LOADER_BIN" ]]; then
-  log "building release binaries"
   build_binaries
 fi
 
