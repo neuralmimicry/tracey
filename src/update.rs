@@ -3,6 +3,7 @@
 //! Update bundles are verified with keyed BLAKE3 signatures before activation.
 
 use crate::event::now_ms;
+use crate::peer_compat::{self, SchemaField};
 use crate::shutdown::{Shutdown, ShutdownListener};
 use crate::storage::Storage;
 use crate::supervisor;
@@ -428,8 +429,25 @@ pub(crate) fn verify_signed_artifacts(
     signature: &str,
     shared_key: &str,
 ) -> Result<UpdateMetadata, UpdateError> {
-    let metadata: UpdateMetadata =
-        serde_json::from_slice(metadata_bytes).map_err(UpdateError::Serde)?;
+    let metadata = match serde_json::from_slice::<UpdateMetadata>(metadata_bytes) {
+        Ok(metadata) => metadata,
+        Err(err) => match parse_update_metadata_lossy(metadata_bytes) {
+            Ok((metadata, affinity)) => {
+                tracing::info!(affinity, version = %metadata.version, "update metadata recovered with fuzzy parser");
+                metadata
+            }
+            Err(reason) => {
+                return Err(if matches!(
+                    peer_compat::parse_bytes(metadata_bytes),
+                    Ok(serde_json::Value::Object(_))
+                ) {
+                    UpdateError::Metadata(reason)
+                } else {
+                    UpdateError::Serde(err)
+                });
+            }
+        },
+    };
     let computed_hash = blake3::hash(bundle_bytes);
     if metadata.blake3 != to_hex(computed_hash.as_bytes()) {
         return Err(UpdateError::Metadata("bundle hash mismatch".to_string()));
@@ -439,6 +457,70 @@ pub(crate) fn verify_signed_artifacts(
         return Err(UpdateError::Signature("invalid signature".to_string()));
     }
     Ok(metadata)
+}
+
+fn parse_update_metadata_lossy(metadata_bytes: &[u8]) -> Result<(UpdateMetadata, f64), String> {
+    let root = peer_compat::parse_bytes(metadata_bytes).map_err(|err| err.to_string())?;
+    let fields = [
+        SchemaField {
+            aliases: &["version", "agent_version", "build_version", "release_version"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["os", "platform", "target_os"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["arch", "architecture", "target_arch"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["blake3", "digest", "hash", "checksum"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["channel", "release_channel", "track"],
+            required: false,
+            weight: 0.8,
+        },
+    ];
+    let matched = peer_compat::best_object(&root, &fields, 3.0, 3)
+        .ok_or_else(|| "payload did not resemble update metadata".to_string())?;
+    let map = matched.map;
+    let version = peer_compat::value_for(
+        map,
+        &["version", "agent_version", "build_version", "release_version"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .ok_or_else(|| "missing version".to_string())?;
+    let os = peer_compat::value_for(map, &["os", "platform", "target_os"])
+        .and_then(peer_compat::coerce_string)
+        .ok_or_else(|| "missing os".to_string())?;
+    let arch = peer_compat::value_for(map, &["arch", "architecture", "target_arch"])
+        .and_then(peer_compat::coerce_string)
+        .ok_or_else(|| "missing arch".to_string())?;
+    let blake3 = peer_compat::value_for(map, &["blake3", "digest", "hash", "checksum"])
+        .and_then(peer_compat::coerce_string)
+        .ok_or_else(|| "missing blake3 digest".to_string())?;
+    let channel = peer_compat::value_for(map, &["channel", "release_channel", "track"])
+        .and_then(peer_compat::coerce_string)
+        .map(|value| UpdateChannel::from_str(&value).unwrap_or_default())
+        .unwrap_or_default();
+
+    Ok((
+        UpdateMetadata {
+            version,
+            os,
+            arch,
+            blake3,
+            channel,
+        },
+        matched.score,
+    ))
 }
 
 /// Writes readiness token for zero-downtime handoff when requested by parent.
@@ -765,5 +847,30 @@ mod tests {
         assert_eq!(meta.version, "1.2.3");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_signed_artifacts_accepts_fuzzy_metadata_schema() {
+        let bundle = b"tracey-bundle";
+        let digest = to_hex(blake3::hash(bundle).as_bytes());
+        let metadata_bytes = serde_json::json!({
+            "payload": {
+                "buildVersion": "2.4.6",
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "digest": digest,
+                "release_channel": "prod"
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let signature = sign_metadata_bytes(&metadata_bytes, bundle, "shared-key");
+
+        let metadata =
+            verify_signed_artifacts(&metadata_bytes, bundle, &signature, "shared-key").unwrap();
+
+        assert_eq!(metadata.version, "2.4.6");
+        assert_eq!(metadata.channel, UpdateChannel::Production);
+        assert_eq!(metadata.blake3, digest);
     }
 }

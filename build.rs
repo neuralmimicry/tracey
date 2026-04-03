@@ -17,7 +17,7 @@ fn main() {
         register_git_rerun_paths(&git_dir);
     }
 
-    let release_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+    let release_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.2.0".to_string());
     let (mut major, mut minor) = parse_major_minor(&release_version);
     if let Some(value) = env_int(&["TRACEY_VERSION_MAJOR"]) {
         major = value;

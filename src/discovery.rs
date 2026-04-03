@@ -9,8 +9,11 @@ use crate::coordination::{CoordinatorRole, PrometheusProbe};
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
 use crate::inventory::Inventory;
+use crate::peer_compat::{self, SchemaField};
 use crate::shutdown::ShutdownListener;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -165,14 +168,29 @@ pub async fn spawn_discovery(
                     let mut announcement = match serde_json::from_slice::<AgentAnnouncement>(&buf[..size]) {
                         Ok(announcement) => announcement,
                         Err(err) => {
-                            tracing::warn!(
-                                peer = %peer,
-                                size,
-                                error = %err,
-                                payload_preview = %payload_preview(&buf[..size], DISCOVERY_PREVIEW_BYTES),
-                                "invalid discovery announcement format"
-                            );
-                            continue;
+                            match parse_announcement_lossy(&buf[..size]) {
+                                Ok((announcement, affinity)) => {
+                                    tracing::info!(
+                                        peer = %peer,
+                                        size,
+                                        affinity,
+                                        payload_preview = %payload_preview(&buf[..size], DISCOVERY_PREVIEW_BYTES),
+                                        "discovery announcement recovered with fuzzy parser"
+                                    );
+                                    announcement
+                                }
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        peer = %peer,
+                                        size,
+                                        error = %err,
+                                        reason = %reason,
+                                        payload_preview = %payload_preview(&buf[..size], DISCOVERY_PREVIEW_BYTES),
+                                        "invalid discovery announcement format"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     };
                     if announcement.agent_id == agent_id {
@@ -403,6 +421,399 @@ fn validate_text_field(name: &str, value: &str, max_len: usize) -> Result<(), St
         return Err(format!("{} contains control characters", name));
     }
     Ok(())
+}
+
+fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), String> {
+    let root = peer_compat::parse_bytes(payload).map_err(|err| err.to_string())?;
+    let fields = [
+        SchemaField {
+            aliases: &["agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["ts_ms", "timestamp_ms", "timestamp", "ts", "seen_ms", "updated_ms"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["signature", "sig", "mac", "digest"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["capabilities", "capability", "traits", "os", "platform"],
+            required: true,
+            weight: 1.8,
+        },
+        SchemaField {
+            aliases: &["status_addr", "statusAddr", "status_url", "statusUrl", "api_addr"],
+            required: false,
+            weight: 0.8,
+        },
+    ];
+    let matched = peer_compat::best_object(&root, &fields, 2.4, 4)
+        .ok_or_else(|| "payload did not resemble a discovery announcement".to_string())?;
+    let map = matched.map;
+
+    let agent_id = peer_compat::value_for(
+        map,
+        &["agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .ok_or_else(|| "missing agent identifier".to_string())?;
+    let ts_ms = peer_compat::value_for(
+        map,
+        &["ts_ms", "timestamp_ms", "timestamp", "ts", "seen_ms", "updated_ms"],
+    )
+    .and_then(peer_compat::coerce_u64)
+    .ok_or_else(|| "missing timestamp".to_string())?;
+    let signature = peer_compat::value_for(map, &["signature", "sig", "mac", "digest"])
+        .and_then(peer_compat::coerce_string)
+        .ok_or_else(|| "missing signature".to_string())?;
+    let capabilities =
+        parse_capabilities_lossy(map).ok_or_else(|| "missing capability data".to_string())?;
+
+    let is_coordinator = peer_compat::value_for(
+        map,
+        &["is_coordinator", "isCoordinator", "leader", "coordinator"],
+    )
+    .and_then(parse_role_flag);
+
+    Ok((
+        AgentAnnouncement {
+            agent_id,
+            agent_version: peer_compat::value_for(
+                map,
+                &["agent_version", "agentVersion", "version", "build_version", "buildVersion"],
+            )
+            .and_then(peer_compat::coerce_string),
+            ts_ms,
+            addr: peer_compat::value_for(
+                map,
+                &[
+                    "addr",
+                    "advertise_addr",
+                    "advertiseAddr",
+                    "discovery_addr",
+                    "discoveryAddr",
+                    "peer_addr",
+                    "peerAddr",
+                ],
+            )
+            .and_then(peer_compat::coerce_string),
+            status_addr: peer_compat::value_for(
+                map,
+                &["status_addr", "statusAddr", "status_url", "statusUrl", "api_addr"],
+            )
+            .and_then(peer_compat::coerce_string),
+            ban_advertisement: peer_compat::value_for(
+                map,
+                &["ban_advertisement", "banAdvertisement", "ban_ad", "bans"],
+            )
+            .and_then(parse_ban_advertisement_lossy),
+            fault_advertisement: peer_compat::value_for(
+                map,
+                &["fault_advertisement", "faultAdvertisement", "fault_ad", "faults"],
+            )
+            .and_then(parse_fault_advertisement_lossy),
+            slurm: peer_compat::value_for(map, &["slurm", "slurm_status", "slurmSnapshot"])
+                .and_then(parse_slurm_snapshot_lossy),
+            capabilities,
+            signature,
+            is_coordinator,
+            coordinator_epoch: peer_compat::value_for(
+                map,
+                &["coordinator_epoch", "coordinatorEpoch", "epoch", "leader_epoch"],
+            )
+            .and_then(peer_compat::coerce_u64),
+            score: peer_compat::value_for(map, &["score", "rank_score", "weight"])
+                .and_then(peer_compat::coerce_u64),
+            prometheus_probe: peer_compat::value_for(
+                map,
+                &["prometheus_probe", "prometheusProbe", "probe", "metrics_probe"],
+            )
+            .and_then(parse_prometheus_probe_lossy),
+        },
+        matched.score,
+    ))
+}
+
+fn parse_capabilities_lossy(map: &Map<String, Value>) -> Option<Capabilities> {
+    let source = peer_compat::object_for(
+        map,
+        &["capabilities", "capability", "traits", "host", "system", "node"],
+    )
+    .unwrap_or_else(|| map.clone());
+
+    let os = peer_compat::value_for(&source, &["os", "platform", "operating_system"])
+        .and_then(peer_compat::coerce_string)?;
+    let arch = peer_compat::value_for(&source, &["arch", "architecture", "cpu_arch"])
+        .and_then(peer_compat::coerce_string)?;
+    let cpu_cores = peer_compat::value_for(
+        &source,
+        &["cpu_cores", "cpuCores", "cores", "cpu_count", "cpuCount", "cpus"],
+    )
+    .and_then(peer_compat::coerce_usize)
+    .unwrap_or(1);
+
+    let mut seen = HashSet::new();
+    let mut tags = Vec::new();
+    if let Some(value) = peer_compat::value_for(
+        &source,
+        &["tags", "labels", "roles", "capability_tags", "capabilityTags"],
+    ) {
+        for tag in peer_compat::coerce_string_vec(value) {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                tags.push(trimmed.to_string());
+            }
+        }
+    }
+
+    Some(Capabilities {
+        os,
+        arch,
+        cpu_cores,
+        tags,
+    })
+}
+
+fn parse_ban_advertisement_lossy(value: &Value) -> Option<crate::tracey_ban::BanAdvertisement> {
+    let object = peer_compat::value_as_object(value)?;
+    let ts_ms = peer_compat::value_for(&object, &["ts_ms", "timestamp_ms", "timestamp"])
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0);
+    let epoch = peer_compat::value_for(&object, &["epoch", "version", "generation"])
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0);
+    let entries = if let Some(items) = peer_compat::array_for(&object, &["entries", "bans", "items"])
+    {
+        items.into_iter()
+            .filter_map(|entry| parse_ban_entry_lossy(&entry, ts_ms))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(crate::tracey_ban::BanAdvertisement {
+        ts_ms,
+        epoch,
+        entries,
+    })
+}
+
+fn parse_ban_entry_lossy(
+    value: &Value,
+    advertisement_ts_ms: u64,
+) -> Option<crate::tracey_ban::BanAdvertisementEntry> {
+    let object = peer_compat::value_as_object(value)?;
+    let ip = peer_compat::value_for(&object, &["ip", "address", "addr", "host"])
+        .and_then(peer_compat::coerce_string)?;
+    let jail = peer_compat::value_for(&object, &["jail", "source", "rule", "name"])
+        .and_then(peer_compat::coerce_string)?;
+    Some(crate::tracey_ban::BanAdvertisementEntry {
+        ip,
+        jail,
+        expires_ms: peer_compat::value_for(&object, &["expires_ms", "expires", "until_ms"])
+            .and_then(peer_compat::coerce_u64),
+        ban_count: peer_compat::value_for(&object, &["ban_count", "count", "hits"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(1),
+        last_ban_ms: peer_compat::value_for(
+            &object,
+            &["last_ban_ms", "last_seen_ms", "ts_ms", "timestamp_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(advertisement_ts_ms),
+    })
+}
+
+fn parse_fault_advertisement_lossy(
+    value: &Value,
+) -> Option<crate::tracey_guard::FaultAdvertisement> {
+    let object = peer_compat::value_as_object(value)?;
+    let ts_ms = peer_compat::value_for(&object, &["ts_ms", "timestamp_ms", "timestamp"])
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0);
+    let epoch = peer_compat::value_for(&object, &["epoch", "version", "generation"])
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0);
+    let entries = if let Some(items) =
+        peer_compat::array_for(&object, &["entries", "faults", "items", "recent_faults"])
+    {
+        items.into_iter()
+            .filter_map(|entry| parse_fault_entry_lossy(&entry))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(crate::tracey_guard::FaultAdvertisement {
+        ts_ms,
+        epoch,
+        entries,
+    })
+}
+
+fn parse_fault_entry_lossy(value: &Value) -> Option<crate::tracey_guard::FaultAdvertisementEntry> {
+    let object = peer_compat::value_as_object(value)?;
+    let risk_value = peer_compat::value_for(&object, &["risk", "score", "mean_risk"])
+        .and_then(peer_compat::coerce_unit_interval)
+        .unwrap_or(0.0);
+    let confidence_value =
+        peer_compat::value_for(&object, &["confidence", "certainty", "mean_confidence"])
+            .and_then(peer_compat::coerce_unit_interval)
+            .unwrap_or(0.0);
+    Some(crate::tracey_guard::FaultAdvertisementEntry {
+        key: peer_compat::value_for(&object, &["key", "signature", "fault_key"])
+            .and_then(peer_compat::coerce_string)?,
+        gpu_id: peer_compat::value_for(&object, &["gpu_id", "gpuId", "device_id", "deviceId"])
+            .and_then(peer_compat::coerce_string)?,
+        probe_type: peer_compat::value_for(
+            &object,
+            &["probe_type", "probeType", "probe", "fault_type", "faultType"],
+        )
+        .and_then(peer_compat::coerce_string)?,
+        state: peer_compat::value_for(&object, &["state", "status"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        severity: peer_compat::value_for(&object, &["severity", "level"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| infer_severity_label(risk_value).to_string()),
+        risk: risk_value,
+        confidence: confidence_value,
+        count: peer_compat::value_for(&object, &["count", "hits", "samples"])
+            .and_then(peer_compat::coerce_u64)
+            .unwrap_or(1),
+        first_seen_ms: peer_compat::value_for(
+            &object,
+            &["first_seen_ms", "firstSeenMs", "started_ms", "ts_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0),
+        last_seen_ms: peer_compat::value_for(
+            &object,
+            &["last_seen_ms", "lastSeenMs", "updated_ms", "ts_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0),
+    })
+}
+
+fn parse_slurm_snapshot_lossy(value: &Value) -> Option<crate::slurm::SlurmSnapshot> {
+    let object = peer_compat::value_as_object(value)?;
+    let mut snapshot = crate::slurm::SlurmSnapshot {
+        updated_ms: peer_compat::value_for(
+            &object,
+            &["updated_ms", "timestamp_ms", "sampled_at_ms", "ts_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0),
+        mode: peer_compat::value_for(&object, &["mode", "deployment_mode", "slurm_mode"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_default(),
+        cluster_name: peer_compat::value_for(&object, &["cluster_name", "clusterName", "cluster"])
+            .and_then(peer_compat::coerce_string),
+        roles: peer_compat::value_for(&object, &["roles", "role", "labels"])
+            .map(peer_compat::coerce_string_vec)
+            .unwrap_or_default(),
+        controller_healthy: peer_compat::value_for(
+            &object,
+            &["controller_healthy", "controllerHealthy", "healthy", "ready"],
+        )
+        .and_then(peer_compat::coerce_bool)
+        .unwrap_or(false),
+        nodes_total: peer_compat::value_for(&object, &["nodes_total", "nodesTotal", "nodes"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        nodes_idle: peer_compat::value_for(&object, &["nodes_idle", "nodesIdle"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        nodes_allocated: peer_compat::value_for(
+            &object,
+            &["nodes_allocated", "nodesAllocated", "nodes_busy"],
+        )
+        .and_then(peer_compat::coerce_u32)
+        .unwrap_or(0),
+        nodes_down: peer_compat::value_for(&object, &["nodes_down", "nodesDown"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        nodes_other: peer_compat::value_for(&object, &["nodes_other", "nodesOther"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_total: peer_compat::value_for(&object, &["jobs_total", "jobsTotal", "jobs"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_pending: peer_compat::value_for(&object, &["jobs_pending", "jobsPending"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_running: peer_compat::value_for(&object, &["jobs_running", "jobsRunning"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_completing: peer_compat::value_for(&object, &["jobs_completing", "jobsCompleting"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_failed: peer_compat::value_for(&object, &["jobs_failed", "jobsFailed"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+        jobs_other: peer_compat::value_for(&object, &["jobs_other", "jobsOther"])
+            .and_then(peer_compat::coerce_u32)
+            .unwrap_or(0),
+    };
+    snapshot.sanitize();
+    Some(snapshot)
+}
+
+fn parse_prometheus_probe_lossy(value: &Value) -> Option<PrometheusProbe> {
+    let object = peer_compat::value_as_object(value)?;
+    Some(PrometheusProbe {
+        ready: peer_compat::value_for(&object, &["ready", "healthy", "up"])
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+        latency_ms: peer_compat::value_for(
+            &object,
+            &["latency_ms", "latencyMs", "latency", "duration_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0),
+        bandwidth_mbps: peer_compat::value_for(
+            &object,
+            &["bandwidth_mbps", "bandwidthMbps", "bandwidth", "throughput_mbps"],
+        )
+        .and_then(peer_compat::coerce_f64)
+        .unwrap_or(0.0),
+        sampled_at_ms: peer_compat::value_for(
+            &object,
+            &["sampled_at_ms", "sampledAtMs", "updated_ms", "ts_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(0),
+    })
+}
+
+fn parse_role_flag(value: &Value) -> Option<bool> {
+    peer_compat::coerce_bool(value).or_else(|| {
+        peer_compat::coerce_string(value).map(|text| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "coordinator" | "leader" | "primary"
+            )
+        })
+    })
+}
+
+fn infer_severity_label(risk: f64) -> &'static str {
+    if risk >= 0.95 {
+        "critical"
+    } else if risk >= 0.8 {
+        "high"
+    } else if risk >= 0.55 {
+        "medium"
+    } else {
+        "low"
+    }
 }
 
 fn sanitize_announcement(
@@ -898,6 +1309,94 @@ mod tests {
             score: Some(7),
             prometheus_probe: None,
         };
+        assert!(valid_signature(&announcement, &key));
+    }
+
+    #[test]
+    fn fuzzy_discovery_parser_recovers_wrapped_camel_case_payload() {
+        let key = derive_key("shared-key");
+        let role = CoordinatorRole {
+            agent_id: "peer-42".to_string(),
+            score: 9,
+            is_coordinator: true,
+            leader_rank: 0,
+            leader_count: 1,
+            epoch: 5,
+            last_update_ms: 1,
+            proxy_agent_id: None,
+            proxy_latency_ms: None,
+            proxy_addr: None,
+            is_prometheus_exporter: false,
+            prometheus_exporter_agent_id: None,
+            prometheus_exporter_addr: None,
+            prometheus_exporter_latency_ms: None,
+            prometheus_exporter_bandwidth_mbps: None,
+            prometheus_probe: Some(PrometheusProbe {
+                ready: true,
+                latency_ms: 12,
+                bandwidth_mbps: 37.5,
+                sampled_at_ms: 77,
+            }),
+        };
+        let capabilities = Capabilities {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_cores: 8,
+            tags: vec!["room:lab".to_string(), "jetson".to_string()],
+        };
+        let signature = sign_payload(
+            "peer-42",
+            "2.4.6",
+            77,
+            Some("10.0.0.42:47990"),
+            &capabilities,
+            &role,
+            Some("https://10.0.0.42:48000/status"),
+            None,
+            None,
+            &key,
+        );
+        let payload = serde_json::json!({
+            "wrapper": {
+                "announcement": {
+                    "agentId": "peer-42",
+                    "agentVersion": "2.4.6",
+                    "timestamp_ms": "77",
+                    "advertiseAddr": "10.0.0.42:47990",
+                    "statusUrl": "https://10.0.0.42:48000/status",
+                    "traits": {
+                        "platform": "linux",
+                        "architecture": "x86_64",
+                        "cores": "8",
+                        "labels": "room:lab, jetson"
+                    },
+                    "leader": "true",
+                    "epoch": "5",
+                    "weight": "9",
+                    "probe": {
+                        "healthy": "true",
+                        "latency": "12ms",
+                        "bandwidth": "37.5",
+                        "updated_ms": "77"
+                    },
+                    "sig": signature
+                }
+            }
+        })
+        .to_string();
+
+        let (announcement, affinity) =
+            parse_announcement_lossy(payload.as_bytes()).expect("payload should recover");
+
+        assert!(affinity >= 2.4);
+        assert_eq!(announcement.agent_id, "peer-42");
+        assert_eq!(announcement.agent_version.as_deref(), Some("2.4.6"));
+        assert_eq!(announcement.capabilities.cpu_cores, 8);
+        assert_eq!(
+            announcement.capabilities.tags,
+            vec!["room:lab".to_string(), "jetson".to_string()]
+        );
+        assert_eq!(announcement.score, Some(9));
         assert!(valid_signature(&announcement, &key));
     }
 }

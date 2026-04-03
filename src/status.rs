@@ -8,19 +8,23 @@ use crate::coordination::{Coordination, CoordinatorRole};
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
 use crate::location::AgentLocationSnapshot;
+use crate::peer_compat::{self, SchemaField};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 const STATUS_BODY_PREVIEW_BYTES: usize = 256;
 const STATUS_MAX_AGENT_ID_LEN: usize = 128;
 
+#[derive(Debug)]
 enum ProxySnapshotParseError {
     Syntax(serde_json::Error),
     Semantics(String),
@@ -41,6 +45,7 @@ pub struct StatusService {
     pub slurm: crate::slurm::SlurmRuntimeHandle,
     pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
     pub continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerHandle>,
+    pub loader_threats: Option<crate::loader_threat::LoaderThreatStatusHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,6 +98,8 @@ struct StatusSnapshot {
     slurm: Option<crate::slurm::SlurmSnapshot>,
     #[serde(default)]
     continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerSnapshot>,
+    #[serde(default)]
+    loader_threats: Option<crate::loader_threat::LoaderThreatSnapshot>,
     #[serde(default)]
     location: AgentLocationSnapshot,
     #[serde(default)]
@@ -308,6 +315,11 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let loader_threats = if let Some(loader_threats) = &service.loader_threats {
+        loader_threats.snapshot().await
+    } else {
+        None
+    };
     let local_probe = role.prometheus_probe.clone();
     let (mut location, peer_locations) = crate::location::infer_cluster_locations(
         &service.agent_id,
@@ -362,6 +374,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         tracey_guard,
         slurm,
         continuum_autoscaler,
+        loader_threats,
         location,
         peer_locations,
     }
@@ -407,10 +420,303 @@ fn validate_proxy_snapshot(snapshot: &StatusSnapshot) -> Result<(), String> {
 }
 
 fn parse_proxy_snapshot(body: &str) -> Result<StatusSnapshot, ProxySnapshotParseError> {
-    let snapshot =
-        serde_json::from_str::<StatusSnapshot>(body).map_err(ProxySnapshotParseError::Syntax)?;
+    let snapshot = match serde_json::from_str::<StatusSnapshot>(body) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let (snapshot, affinity) =
+                parse_proxy_snapshot_lossy(body).map_err(|_| ProxySnapshotParseError::Syntax(err))?;
+            tracing::info!(affinity, "proxy status payload recovered with fuzzy parser");
+            snapshot
+        }
+    };
     validate_proxy_snapshot(&snapshot).map_err(ProxySnapshotParseError::Semantics)?;
     Ok(snapshot)
+}
+
+fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), String> {
+    let root = peer_compat::parse_str(body).map_err(|err| err.to_string())?;
+    let fields = [
+        SchemaField {
+            aliases: &["agent_id", "agentId", "node_id", "nodeId", "id"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["posture", "status", "health"],
+            required: false,
+            weight: 1.0,
+        },
+        SchemaField {
+            aliases: &[
+                "decision_threshold",
+                "decisionThreshold",
+                "threshold",
+                "risk_threshold",
+            ],
+            required: false,
+            weight: 1.2,
+        },
+        SchemaField {
+            aliases: &["leader_count", "leaderCount", "leaders"],
+            required: false,
+            weight: 0.8,
+        },
+        SchemaField {
+            aliases: &["proxy_addr", "proxyAddr", "status_addr", "statusAddr"],
+            required: false,
+            weight: 0.8,
+        },
+    ];
+    let matched = peer_compat::best_object(&root, &fields, 1.6, 4)
+        .ok_or_else(|| "payload did not resemble a Tracey status snapshot".to_string())?;
+    let map = matched.map;
+
+    let agent_id = peer_compat::value_for(
+        map,
+        &["agent_id", "agentId", "node_id", "nodeId", "id"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .ok_or_else(|| "missing agent identifier".to_string())?;
+
+    let posture = peer_compat::value_for(map, &["posture", "mode"])
+        .and_then(peer_compat::coerce_string)
+        .unwrap_or_else(|| "Balanced".to_string());
+    let status = peer_compat::value_for(map, &["status", "health"])
+        .and_then(peer_compat::coerce_string);
+    let decision_threshold = peer_compat::value_for(
+        map,
+        &[
+            "decision_threshold",
+            "decisionThreshold",
+            "threshold",
+            "risk_threshold",
+        ],
+    )
+    .and_then(peer_compat::coerce_unit_interval)
+    .unwrap_or(0.75);
+    let leader_count = peer_compat::value_for(map, &["leader_count", "leaderCount", "leaders"])
+        .and_then(peer_compat::coerce_usize)
+        .unwrap_or(1)
+        .max(1);
+
+    Ok((
+        StatusSnapshot {
+            ts_ms: peer_compat::value_for(
+                map,
+                &["ts_ms", "timestamp_ms", "timestamp", "updated_ms"],
+            )
+            .and_then(peer_compat::coerce_u64)
+            .unwrap_or_else(now_ms),
+            status,
+            agent_id,
+            agent_version: peer_compat::value_for(
+                map,
+                &["agent_version", "agentVersion", "version", "build_version"],
+            )
+            .and_then(peer_compat::coerce_string),
+            status_addr: peer_compat::value_for(
+                map,
+                &["status_addr", "statusAddr", "status_url", "statusUrl"],
+            )
+            .and_then(peer_compat::coerce_string),
+            is_coordinator: peer_compat::value_for(
+                map,
+                &["is_coordinator", "isCoordinator", "leader", "coordinator"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            leader_rank: peer_compat::value_for(map, &["leader_rank", "leaderRank", "rank"])
+                .and_then(peer_compat::coerce_usize)
+                .unwrap_or(0),
+            leader_count,
+            proxy_agent_id: peer_compat::value_for(
+                map,
+                &["proxy_agent_id", "proxyAgentId", "proxy_id", "proxyId"],
+            )
+            .and_then(peer_compat::coerce_string),
+            proxy_addr: peer_compat::value_for(
+                map,
+                &["proxy_addr", "proxyAddr", "proxy_url", "proxyUrl"],
+            )
+            .and_then(peer_compat::coerce_string),
+            proxy_latency_ms: peer_compat::value_for(
+                map,
+                &["proxy_latency_ms", "proxyLatencyMs", "proxy_latency"],
+            )
+            .and_then(peer_compat::coerce_u64),
+            is_prometheus_exporter: peer_compat::value_for(
+                map,
+                &["is_prometheus_exporter", "isPrometheusExporter", "prometheus_exporter"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            prometheus_exporter_agent_id: peer_compat::value_for(
+                map,
+                &[
+                    "prometheus_exporter_agent_id",
+                    "prometheusExporterAgentId",
+                    "exporter_agent_id",
+                ],
+            )
+            .and_then(peer_compat::coerce_string),
+            prometheus_exporter_addr: peer_compat::value_for(
+                map,
+                &[
+                    "prometheus_exporter_addr",
+                    "prometheusExporterAddr",
+                    "exporter_addr",
+                ],
+            )
+            .and_then(peer_compat::coerce_string),
+            prometheus_exporter_latency_ms: peer_compat::value_for(
+                map,
+                &[
+                    "prometheus_exporter_latency_ms",
+                    "prometheusExporterLatencyMs",
+                    "exporter_latency_ms",
+                ],
+            )
+            .and_then(peer_compat::coerce_u64),
+            prometheus_exporter_bandwidth_mbps: peer_compat::value_for(
+                map,
+                &[
+                    "prometheus_exporter_bandwidth_mbps",
+                    "prometheusExporterBandwidthMbps",
+                    "exporter_bandwidth_mbps",
+                ],
+            )
+            .and_then(peer_compat::coerce_f64),
+            local_prometheus_probe_ready: peer_compat::value_for(
+                map,
+                &[
+                    "local_prometheus_probe_ready",
+                    "localPrometheusProbeReady",
+                    "probe_ready",
+                ],
+            )
+            .and_then(peer_compat::coerce_bool),
+            local_prometheus_latency_ms: peer_compat::value_for(
+                map,
+                &[
+                    "local_prometheus_latency_ms",
+                    "localPrometheusLatencyMs",
+                    "probe_latency_ms",
+                ],
+            )
+            .and_then(peer_compat::coerce_u64),
+            local_prometheus_bandwidth_mbps: peer_compat::value_for(
+                map,
+                &[
+                    "local_prometheus_bandwidth_mbps",
+                    "localPrometheusBandwidthMbps",
+                    "probe_bandwidth_mbps",
+                ],
+            )
+            .and_then(peer_compat::coerce_f64),
+            posture,
+            decision_threshold,
+            active_response: peer_compat::value_for(
+                map,
+                &["active_response", "activeResponse", "response_enabled"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            shutdown_enabled: peer_compat::value_for(
+                map,
+                &["shutdown_enabled", "shutdownEnabled"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            update_enabled: peer_compat::value_for(map, &["update_enabled", "updateEnabled"])
+                .and_then(peer_compat::coerce_bool)
+                .unwrap_or(false),
+            telemetry_enabled: peer_compat::value_for(
+                map,
+                &["telemetry_enabled", "telemetryEnabled"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            discovery_enabled: peer_compat::value_for(
+                map,
+                &["discovery_enabled", "discoveryEnabled"],
+            )
+            .and_then(peer_compat::coerce_bool)
+            .unwrap_or(false),
+            tracey_ban_local_bans: peer_compat::value_for(
+                map,
+                &["tracey_ban_local_bans", "traceyBanLocalBans", "local_bans"],
+            )
+            .and_then(peer_compat::coerce_usize)
+            .unwrap_or(0),
+            tracey_ban_remote_bans: peer_compat::value_for(
+                map,
+                &["tracey_ban_remote_bans", "traceyBanRemoteBans", "remote_bans"],
+            )
+            .and_then(peer_compat::coerce_usize)
+            .unwrap_or(0),
+            tracey_ban_remote_agents: peer_compat::value_for(
+                map,
+                &[
+                    "tracey_ban_remote_agents",
+                    "traceyBanRemoteAgents",
+                    "remote_agents",
+                ],
+            )
+            .and_then(peer_compat::coerce_usize)
+            .unwrap_or(0),
+            tracey_ban_local_entries: peer_compat::value_for(
+                map,
+                &["tracey_ban_local_entries", "traceyBanLocalEntries", "local_entries"],
+            )
+            .map(peer_compat::coerce_string_vec)
+            .unwrap_or_default(),
+            tracey_ban_remote_entries: peer_compat::value_for(
+                map,
+                &["tracey_ban_remote_entries", "traceyBanRemoteEntries", "remote_entries"],
+            )
+            .map(peer_compat::coerce_string_vec)
+            .unwrap_or_default(),
+            tracey_guard: parse_object_field(map, &["tracey_guard", "traceyGuard"]),
+            slurm: parse_object_field(map, &["slurm", "slurm_status", "slurmSnapshot"]),
+            continuum_autoscaler: parse_object_field(
+                map,
+                &["continuum_autoscaler", "continuumAutoscaler", "autoscaler"],
+            ),
+            loader_threats: parse_object_field(
+                map,
+                &[
+                    "loader_threats",
+                    "loaderThreats",
+                    "loader_security",
+                    "loaderSecurity",
+                ],
+            ),
+            location: parse_object_field(map, &["location", "agent_location"]).unwrap_or_default(),
+            peer_locations: parse_array_field(map, &["peer_locations", "peerLocations", "peers"]),
+        },
+        matched.score,
+    ))
+}
+
+fn parse_object_field<T>(map: &Map<String, Value>, aliases: &[&str]) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    peer_compat::value_for(map, aliases)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn parse_array_field<T>(map: &Map<String, Value>, aliases: &[&str]) -> Vec<T>
+where
+    T: DeserializeOwned,
+{
+    peer_compat::value_for(map, aliases)
+        .and_then(peer_compat::value_as_array)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect()
 }
 
 fn body_preview(body: &str, max: usize) -> String {
@@ -459,6 +765,54 @@ mod tests {
             }
             _ => panic!("expected semantic error for invalid leader_count"),
         }
+    }
+
+    #[test]
+    fn parse_proxy_snapshot_recovers_wrapped_camel_case_payload() {
+        let payload = serde_json::json!({
+            "response": {
+                "statusSnapshot": {
+                    "timestamp_ms": "99",
+                    "agentId": "peer-a",
+                    "agentVersion": "2.3.4",
+                    "statusUrl": "https://peer-a.example/status",
+                    "leaderCount": "2",
+                    "leaderRank": "1",
+                    "proxyAddr": "https://leader.example/status",
+                    "proxyLatencyMs": "18",
+                    "decisionThreshold": "62%",
+                    "posture": "Strict",
+                    "activeResponse": "yes",
+                    "shutdownEnabled": "false",
+                    "updateEnabled": "true",
+                    "telemetryEnabled": "true",
+                    "discoveryEnabled": "true",
+                    "traceyBanLocalBans": "1",
+                    "traceyBanRemoteBans": "2",
+                    "traceyBanRemoteAgents": "1",
+                    "traceyBanLocalEntries": ["ssh:192.0.2.10 (2)"],
+                    "traceyBanRemoteEntries": ["api:192.0.2.11 (1)"],
+                    "peerLocations": [
+                        {
+                            "agent_id": "peer-b",
+                            "host": "peer-b",
+                            "relation": "peer"
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string();
+
+        let snapshot = parse_proxy_snapshot(&payload).expect("payload should recover");
+
+        assert_eq!(snapshot.agent_id, "peer-a");
+        assert_eq!(snapshot.agent_version.as_deref(), Some("2.3.4"));
+        assert_eq!(snapshot.decision_threshold, 0.62);
+        assert!(snapshot.active_response);
+        assert_eq!(snapshot.leader_count, 2);
+        assert_eq!(snapshot.peer_locations.len(), 1);
+        assert_eq!(snapshot.proxy_latency_ms, Some(18));
     }
 
     proptest! {

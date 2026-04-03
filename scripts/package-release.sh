@@ -17,8 +17,8 @@ Options:
   -h, --help                  Show this help text.
 
 Examples:
-  ./scripts/package-release.sh --version 0.1.0 --output-dir ./dist
-  TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.1.0 --output-dir ./dist --sign-update
+  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist
+  TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --sign-update
 USAGE
 }
 

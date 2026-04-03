@@ -3,12 +3,14 @@
 use crate::config::PrometheusLogExportConfig;
 use crate::coordination::{Coordination, CoordinatorRole, PrometheusProbe};
 use crate::event::{Event, EventKind, Severity, now_ms};
+use crate::peer_compat::{self, SchemaField};
 use crate::security::Action;
 use crate::shutdown::ShutdownListener;
 use crate::swarm::Decision;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -503,8 +505,16 @@ impl PrometheusExportHandle {
         if body.len() > MAX_REMOTE_BATCH_BYTES {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        let batch =
-            serde_json::from_slice::<ForwardBatch>(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let batch = match serde_json::from_slice::<ForwardBatch>(body) {
+            Ok(batch) => batch,
+            Err(_) => match parse_forward_batch_lossy(body) {
+                Ok((batch, affinity)) => {
+                    tracing::info!(agent_id = %self.agent_id, affinity, "prometheus forward batch recovered with fuzzy parser");
+                    batch
+                }
+                Err(_) => return Err(StatusCode::BAD_REQUEST),
+            },
+        };
         if batch.agent_id.trim().is_empty() {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -663,6 +673,165 @@ fn normalize_remote_record(agent_id: &str, mut record: PertinentLogRecord) -> Pe
     record.risk = record.risk.clamp(0.0, 1.0);
     record.confidence = record.confidence.clamp(0.0, 1.0);
     record
+}
+
+fn parse_forward_batch_lossy(payload: &[u8]) -> Result<(ForwardBatch, f64), String> {
+    let root = peer_compat::parse_bytes(payload).map_err(|err| err.to_string())?;
+    let fields = [
+        SchemaField {
+            aliases: &["agent_id", "agentId", "source_agent", "sourceAgent", "node_id"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["ts_ms", "timestamp_ms", "timestamp", "batch_ts_ms"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["records", "entries", "items", "events", "batch"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["batch_id", "batchId", "id"],
+            required: false,
+            weight: 0.8,
+        },
+    ];
+    let matched = peer_compat::best_object(&root, &fields, 2.2, 4)
+        .ok_or_else(|| "payload did not resemble a Prometheus forward batch".to_string())?;
+    let map = matched.map;
+    let agent_id = peer_compat::value_for(
+        map,
+        &["agent_id", "agentId", "source_agent", "sourceAgent", "node_id"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .ok_or_else(|| "missing agent identifier".to_string())?;
+    let ts_ms = peer_compat::value_for(map, &["ts_ms", "timestamp_ms", "timestamp", "batch_ts_ms"])
+        .and_then(peer_compat::coerce_u64)
+        .ok_or_else(|| "missing batch timestamp".to_string())?;
+    let records = peer_compat::value_for(map, &["records", "entries", "items", "events", "batch"])
+        .and_then(peer_compat::value_as_array)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| parse_pertinent_record_lossy(&value, &agent_id, ts_ms))
+        .collect::<Vec<_>>();
+    let batch_id = peer_compat::value_for(map, &["batch_id", "batchId", "id"])
+        .and_then(peer_compat::coerce_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| derive_batch_id(&agent_id, &records));
+
+    Ok((
+        ForwardBatch {
+            agent_id,
+            batch_id,
+            ts_ms,
+            records,
+        },
+        matched.score,
+    ))
+}
+
+fn parse_pertinent_record_lossy(
+    value: &Value,
+    agent_id: &str,
+    batch_ts_ms: u64,
+) -> Option<PertinentLogRecord> {
+    let object = peer_compat::value_as_object(value)?;
+    let source = peer_compat::object_for(&object, &["record", "event", "decision", "payload"])
+        .unwrap_or_else(|| object.clone());
+
+    let risk = peer_compat::value_for(&source, &["risk", "mean_risk", "score"])
+        .and_then(peer_compat::coerce_unit_interval)
+        .or_else(|| {
+            peer_compat::value_for(&source, &["signal", "value", "normalized_signal"])
+                .and_then(peer_compat::coerce_unit_interval)
+        })
+        .unwrap_or(0.0);
+    let signal = peer_compat::value_for(&source, &["signal", "value", "normalized_signal"])
+        .and_then(peer_compat::coerce_unit_interval)
+        .unwrap_or(risk);
+    let confidence =
+        peer_compat::value_for(&source, &["confidence", "mean_confidence", "certainty"])
+            .and_then(peer_compat::coerce_unit_interval)
+            .unwrap_or(0.5);
+
+    let source_name = peer_compat::value_for(
+        &source,
+        &["source", "origin", "producer", "component"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .unwrap_or_else(|| "remote".to_string());
+    let category = peer_compat::value_for(&source, &["category", "record_type", "recordType"])
+        .and_then(peer_compat::coerce_string)
+        .unwrap_or_else(|| infer_record_category(&source_name, risk).to_string());
+    let detail = peer_compat::value_for(
+        &source,
+        &["detail", "message", "metric", "name", "reason", "probe_type"],
+    )
+    .and_then(peer_compat::coerce_string)
+    .unwrap_or_else(|| category.clone());
+
+    Some(PertinentLogRecord {
+        ts_ms: peer_compat::value_for(
+            &source,
+            &["ts_ms", "timestamp_ms", "timestamp", "event_ts_ms", "sampled_at_ms"],
+        )
+        .and_then(peer_compat::coerce_u64)
+        .unwrap_or(batch_ts_ms),
+        source_agent: peer_compat::value_for(
+            &source,
+            &["source_agent", "sourceAgent", "agent_id", "agentId"],
+        )
+        .and_then(peer_compat::coerce_string)
+        .unwrap_or_else(|| agent_id.to_string()),
+        category,
+        source: source_name.clone(),
+        kind: peer_compat::value_for(&source, &["kind", "event_kind", "eventKind", "type"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| "observability".to_string()),
+        severity: peer_compat::value_for(&source, &["severity", "level", "risk_bucket"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| infer_severity(risk).to_string()),
+        action: peer_compat::value_for(&source, &["action", "decision", "response"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| infer_action(risk).to_string()),
+        detail,
+        signal,
+        risk,
+        confidence,
+    })
+}
+
+fn infer_record_category(source: &str, risk: f64) -> &'static str {
+    match source {
+        "tracey_guard" => "fault",
+        "tracey_ban" => "ban",
+        "refiner" => "security",
+        "swarm" if risk >= 0.55 => "decision",
+        _ => "anomaly",
+    }
+}
+
+fn infer_action(risk: f64) -> &'static str {
+    if risk >= 0.8 {
+        "alert"
+    } else {
+        "monitor"
+    }
+}
+
+fn infer_severity(risk: f64) -> &'static str {
+    if risk >= 0.95 {
+        "critical"
+    } else if risk >= 0.8 {
+        "high"
+    } else if risk >= 0.55 {
+        "medium"
+    } else {
+        "low"
+    }
 }
 
 fn derive_key(shared: &str) -> [u8; 32] {
@@ -871,6 +1040,59 @@ mod tests {
         };
         let rendered = handle.render_metrics().await;
         assert!(!rendered.contains("tracey_pertinent_logs_total{"));
+    }
+
+    #[tokio::test]
+    async fn ingest_http_accepts_fuzzy_forward_batch() {
+        let ts_ms = now_ms();
+        let handle = PrometheusExportHandle {
+            agent_id: "agent-a".to_string(),
+            config: cfg(),
+            role: Arc::new(RwLock::new(role(true))),
+            state: Arc::new(RwLock::new(ExporterState::default())),
+            client: reqwest::Client::new(),
+            signing_key: derive_key("shared"),
+        };
+        let body = serde_json::json!({
+            "wrapper": {
+                "agentId": "agent-b",
+                "timestamp_ms": ts_ms.to_string(),
+                "items": [
+                    {
+                        "decision": {
+                            "source": "swarm",
+                            "mean_risk": "84%",
+                            "mean_confidence": "91%",
+                            "action": "alert",
+                            "reason": "thermal anomaly"
+                        }
+                    },
+                    {
+                        "event": {
+                            "source": "tracey_guard",
+                            "probeType": "memory",
+                            "score": "0.97",
+                            "certainty": "88%",
+                            "level": "critical",
+                            "timestamp_ms": (ts_ms + 1).to_string()
+                        }
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let signature = sign_batch("agent-b", ts_ms, body.as_bytes(), &derive_key("shared"));
+        let mut headers = HeaderMap::new();
+        headers.insert(BATCH_SIG_HEADER, signature.parse().unwrap());
+
+        handle
+            .ingest_http(&headers, &Bytes::from(body))
+            .await
+            .expect("fuzzy batch should be accepted");
+
+        let rendered = handle.render_metrics().await;
+        assert!(rendered.contains("source_agent=\"agent-b\",category=\"decision\""));
+        assert!(rendered.contains("source_agent=\"agent-b\",category=\"fault\""));
     }
 
     #[test]

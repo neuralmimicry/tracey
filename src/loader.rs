@@ -1,5 +1,7 @@
 use crate::config::{Config, LoaderConfig};
 use crate::event::now_ms;
+use crate::loader_threat::{self, LocalThreatIncident};
+use crate::peer_compat::{self, SchemaField};
 use crate::shutdown::{Shutdown, ShutdownListener};
 use crate::supervisor::{self, ManagedChild, SupervisorRequest};
 use crate::update::{self, UpdateChannel, UpdateMetadata};
@@ -8,6 +10,7 @@ use axum::http::{StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
@@ -80,6 +83,12 @@ struct RollbackMarker {
     failed_blake3: String,
     previous_version: String,
     previous_blake3: String,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    source_peer_agent_id: Option<String>,
+    #[serde(default)]
+    source_peer_addr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +104,7 @@ struct LoaderSharedState {
     transfer_advertise_addr: String,
     current: Arc<RwLock<Option<ActiveCore>>>,
     rollback: Arc<RwLock<Option<PendingRollback>>>,
+    threats: loader_threat::LoaderThreatHub,
 }
 
 impl LoaderSharedState {
@@ -128,6 +138,8 @@ struct LoaderStatusSnapshot {
     transfer_addr: Option<String>,
     pending_rollback: bool,
     rollback_previous_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loader_threats: Option<loader_threat::LoaderThreatSnapshot>,
 }
 
 #[derive(Debug)]
@@ -136,6 +148,36 @@ struct FetchedCore {
     metadata: UpdateMetadata,
     metadata_bytes: Vec<u8>,
     signature: String,
+}
+
+#[derive(Debug)]
+enum PeerFetchError {
+    Transport(String),
+    Verification(String),
+}
+
+impl std::fmt::Display for PeerFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(detail) => write!(f, "{detail}"),
+            Self::Verification(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for PeerFetchError {}
+
+impl PeerFetchError {
+    fn suspicious(&self) -> bool {
+        matches!(self, Self::Verification(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateProvenance {
+    source_kind: String,
+    peer_agent_id: Option<String>,
+    peer_addr: Option<String>,
 }
 
 pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -192,6 +234,7 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         config.loader.rollback_window_ms,
     )
     .await?;
+    let threat_hub = loader_threat::LoaderThreatHub::from_config(&config.loader).await?;
 
     let shared_state = LoaderSharedState {
         agent_id: config.agent_id.clone(),
@@ -199,6 +242,7 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         transfer_advertise_addr,
         current: Arc::new(RwLock::new(Some(initial_core.clone()))),
         rollback: Arc::new(RwLock::new(pending_rollback.clone())),
+        threats: threat_hub.clone(),
     };
     let shared_state = Arc::new(shared_state);
 
@@ -324,15 +368,108 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                         tracing::warn!(error = %err, "loader announcement serialization failed");
                     }
                 }
+                if let Some(threat_announcement) = threat_hub
+                    .build_announcement(&config.agent_id, &keys.gossip_key, 8)
+                    .await
+                {
+                    match serde_json::to_vec(&threat_announcement) {
+                        Ok(payload) => {
+                            if let Err(err) = gossip_socket
+                                .send_to(&payload, &config.loader.discovery_broadcast_addr)
+                                .await
+                            {
+                                tracing::warn!(
+                                    target = %config.loader.discovery_broadcast_addr,
+                                    error = %err,
+                                    "loader threat announcement broadcast failed"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "loader threat announcement serialization failed"
+                            );
+                        }
+                    }
+                }
             }
             recv = gossip_socket.recv_from(&mut buf) => {
                 match recv {
                     Ok((size, peer_addr)) => {
-                        if let Ok(announcement) = serde_json::from_slice::<LoaderAnnouncement>(&buf[..size]) {
-                            if announcement.agent_id != config.agent_id {
-                                if validate_loader_announcement(&announcement, &keys.gossip_key, config.loader.ttl_ms).is_ok() {
-                                    peers.insert(announcement.agent_id.clone(), PeerPresence { announcement, source_addr: peer_addr });
+                        let loader_announcement =
+                            match serde_json::from_slice::<LoaderAnnouncement>(&buf[..size]) {
+                                Ok(announcement) => Some(announcement),
+                                Err(_) => match parse_loader_announcement_lossy(&buf[..size]) {
+                                    Ok((announcement, affinity)) => {
+                                        tracing::info!(
+                                            peer = %peer_addr,
+                                            affinity,
+                                            "loader announcement recovered with fuzzy parser"
+                                        );
+                                        Some(announcement)
+                                    }
+                                    Err(_) => None,
+                                },
+                            };
+                        if let Some(announcement) = loader_announcement {
+                            if announcement.agent_id != config.agent_id
+                                && validate_loader_announcement(
+                                    &announcement,
+                                    &keys.gossip_key,
+                                    config.loader.ttl_ms,
+                                )
+                                .is_ok()
+                            {
+                                peers.insert(
+                                    announcement.agent_id.clone(),
+                                    PeerPresence {
+                                        announcement,
+                                        source_addr: peer_addr,
+                                    },
+                                );
+                            }
+                            continue;
+                        }
+
+                        let threat_announcement = match serde_json::from_slice::<
+                            loader_threat::LoaderThreatAnnouncement,
+                        >(&buf[..size]) {
+                            Ok(announcement) => Some(announcement),
+                            Err(_) => {
+                                match loader_threat::parse_loader_threat_announcement_lossy(
+                                    &buf[..size],
+                                ) {
+                                    Ok((announcement, affinity)) => {
+                                        tracing::info!(
+                                            peer = %peer_addr,
+                                            affinity,
+                                            "loader threat announcement recovered with fuzzy parser"
+                                        );
+                                        Some(announcement)
+                                    }
+                                    Err(reason) => {
+                                        tracing::warn!(
+                                            peer = %peer_addr,
+                                            reason = %reason,
+                                            "invalid loader gossip payload"
+                                        );
+                                        None
+                                    }
                                 }
+                            }
+                        };
+                        if let Some(announcement) = threat_announcement
+                            && announcement.agent_id != config.agent_id
+                        {
+                            if loader_threat::validate_loader_threat_announcement(
+                                &announcement,
+                                &keys.gossip_key,
+                                config.loader.ttl_ms,
+                            )
+                            .is_ok()
+                            {
+                                threat_hub.ingest_remote(announcement).await;
                             }
                         }
                     }
@@ -372,7 +509,13 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 )
                 .await;
                 if should_attempt_peer_sync(&config, shared_state.clone(), &last_sync_attempt).await {
-                    if let Some(candidate) = choose_best_peer(&peers, shared_state.clone(), config.loader.ttl_ms).await {
+                    if let Some(candidate) = choose_best_peer(
+                        &peers,
+                        shared_state.clone(),
+                        threat_hub.clone(),
+                        config.loader.ttl_ms,
+                    )
+                    .await {
                         last_sync_attempt = Some((candidate.announcement.version.clone(), now_ms()));
                         match sync_from_peer(
                             &config,
@@ -380,6 +523,7 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                             &loader_root,
                             &update_dir,
                             shared_state.clone(),
+                            threat_hub.clone(),
                             &mut child,
                             &candidate,
                         ).await {
@@ -719,6 +863,30 @@ async fn rollback_after_crash(
             "failed to archive crashing core before rollback"
         );
     }
+    shared
+        .threats
+        .record_incident(LocalThreatIncident {
+            provider_agent_id: pending.marker.source_peer_agent_id.clone(),
+            source_addr: pending.marker.source_peer_addr.clone(),
+            artifact_version: Some(current.metadata.version.clone()),
+            artifact_blake3: Some(current.metadata.blake3.clone()),
+            classification: "crashing_update".to_string(),
+            reason: format!(
+                "activated core crashed during rollback probation window via {}",
+                pending
+                    .marker
+                    .source_kind
+                    .clone()
+                    .unwrap_or_else(|| "unknown source".to_string())
+            ),
+            provider_risk: if pending.marker.source_peer_agent_id.is_some() {
+                1.0
+            } else {
+                0.0
+            },
+            artifact_risk: 1.0,
+        })
+        .await;
     let restored = restore_previous_core(loader_root, artifact_key, &pending.previous).await?;
     *shared.current.write().await = Some(restored.clone());
     clear_pending_rollback(loader_root, shared).await?;
@@ -951,6 +1119,7 @@ async fn loader_status_handler(
     let current = shared.current.read().await.clone();
     let pending = shared.rollback.read().await.clone();
     let distributable = shared.distributable_core().await.is_some();
+    let loader_threats = Some(shared.threats.snapshot(8).await);
     Json(LoaderStatusSnapshot {
         ts_ms: now_ms(),
         agent_id: shared.agent_id.clone(),
@@ -968,6 +1137,7 @@ async fn loader_status_handler(
         },
         pending_rollback: pending.is_some(),
         rollback_previous_version: pending.map(|state| state.marker.previous_version),
+        loader_threats,
     })
 }
 
@@ -1078,6 +1248,89 @@ fn validate_loader_announcement(
     Ok(())
 }
 
+fn parse_loader_announcement_lossy(payload: &[u8]) -> Result<(LoaderAnnouncement, f64), String> {
+    let root = peer_compat::parse_bytes(payload).map_err(|err| err.to_string())?;
+    let fields = [
+        SchemaField {
+            aliases: &["agent_id", "agentId", "node_id", "nodeId", "id"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["ts_ms", "timestamp_ms", "timestamp", "updated_ms"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["version", "agent_version", "build_version"],
+            required: true,
+            weight: 1.5,
+        },
+        SchemaField {
+            aliases: &["blake3", "digest", "hash", "checksum"],
+            required: true,
+            weight: 2.0,
+        },
+        SchemaField {
+            aliases: &["signature", "sig", "mac"],
+            required: true,
+            weight: 2.0,
+        },
+    ];
+    let matched = peer_compat::best_object(&root, &fields, 3.0, 4)
+        .ok_or_else(|| "payload did not resemble a loader announcement".to_string())?;
+    let map = matched.map;
+    let channel = peer_compat::value_for(map, &["channel", "release_channel", "track"])
+        .and_then(parse_update_channel_lossy)
+        .unwrap_or(UpdateChannel::Production);
+    let distributable = peer_compat::value_for(
+        map,
+        &["distributable", "can_distribute", "shareable", "production_ready"],
+    )
+    .and_then(peer_compat::coerce_bool)
+    .unwrap_or_else(|| channel.distributable());
+
+    Ok((
+        LoaderAnnouncement {
+            agent_id: peer_compat::value_for(
+                map,
+                &["agent_id", "agentId", "node_id", "nodeId", "id"],
+            )
+            .and_then(peer_compat::coerce_string)
+            .ok_or_else(|| "missing agent identifier".to_string())?,
+            ts_ms: peer_compat::value_for(
+                map,
+                &["ts_ms", "timestamp_ms", "timestamp", "updated_ms"],
+            )
+            .and_then(peer_compat::coerce_u64)
+            .ok_or_else(|| "missing timestamp".to_string())?,
+            os: peer_compat::value_for(map, &["os", "platform", "target_os"])
+                .and_then(peer_compat::coerce_string)
+                .ok_or_else(|| "missing os".to_string())?,
+            arch: peer_compat::value_for(map, &["arch", "architecture", "target_arch"])
+                .and_then(peer_compat::coerce_string)
+                .ok_or_else(|| "missing arch".to_string())?,
+            version: peer_compat::value_for(map, &["version", "agent_version", "build_version"])
+                .and_then(peer_compat::coerce_string)
+                .ok_or_else(|| "missing version".to_string())?,
+            blake3: peer_compat::value_for(map, &["blake3", "digest", "hash", "checksum"])
+                .and_then(peer_compat::coerce_string)
+                .ok_or_else(|| "missing digest".to_string())?,
+            channel,
+            distributable,
+            transfer_addr: peer_compat::value_for(
+                map,
+                &["transfer_addr", "transferAddr", "addr", "url", "bundle_url"],
+            )
+            .and_then(peer_compat::coerce_string),
+            signature: peer_compat::value_for(map, &["signature", "sig", "mac"])
+                .and_then(peer_compat::coerce_string)
+                .ok_or_else(|| "missing signature".to_string())?,
+        },
+        matched.score,
+    ))
+}
+
 fn sign_loader_announcement(announcement: &LoaderAnnouncement, gossip_key: &str) -> String {
     let key = update::derive_key(gossip_key);
     let payload = serde_json::to_vec(&(
@@ -1102,7 +1355,65 @@ fn verify_loader_announcement_signature(
     gossip_key: &str,
 ) -> bool {
     let expected = sign_loader_announcement(announcement, gossip_key);
-    update::constant_time_eq(&announcement.signature, &expected)
+    if update::constant_time_eq(&announcement.signature, &expected) {
+        return true;
+    }
+    let legacy_without_transfer = sign_loader_announcement_legacy(announcement, gossip_key, true);
+    if update::constant_time_eq(&announcement.signature, &legacy_without_transfer) {
+        return true;
+    }
+    let legacy_without_distributable =
+        sign_loader_announcement_legacy(announcement, gossip_key, false);
+    update::constant_time_eq(&announcement.signature, &legacy_without_distributable)
+}
+
+fn sign_loader_announcement_legacy(
+    announcement: &LoaderAnnouncement,
+    gossip_key: &str,
+    include_distributable: bool,
+) -> String {
+    let key = update::derive_key(gossip_key);
+    let payload = if include_distributable {
+        serde_json::to_vec(&(
+            &announcement.agent_id,
+            announcement.ts_ms,
+            &announcement.os,
+            &announcement.arch,
+            &announcement.version,
+            &announcement.blake3,
+            announcement.channel.as_str(),
+            announcement.distributable,
+        ))
+        .unwrap_or_default()
+    } else {
+        serde_json::to_vec(&(
+            &announcement.agent_id,
+            announcement.ts_ms,
+            &announcement.os,
+            &announcement.arch,
+            &announcement.version,
+            &announcement.blake3,
+            announcement.channel.as_str(),
+        ))
+        .unwrap_or_default()
+    };
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    hasher.update(&payload);
+    update::to_hex(hasher.finalize().as_bytes())
+}
+
+fn parse_update_channel_lossy(value: &Value) -> Option<UpdateChannel> {
+    peer_compat::coerce_string(value)
+        .and_then(|value| value.parse::<UpdateChannel>().ok())
+        .or_else(|| {
+            peer_compat::coerce_u64(value).map(|value| {
+                if value == 0 {
+                    UpdateChannel::Production
+                } else {
+                    UpdateChannel::Development
+                }
+            })
+        })
 }
 
 async fn should_attempt_peer_sync(
@@ -1133,25 +1444,65 @@ async fn should_attempt_peer_sync(
 async fn choose_best_peer(
     peers: &HashMap<String, PeerPresence>,
     shared: Arc<LoaderSharedState>,
+    threats: loader_threat::LoaderThreatHub,
     ttl_ms: u64,
 ) -> Option<PeerPresence> {
     let local = shared.current.read().await.clone()?;
     let now = now_ms();
-    peers
-        .values()
-        .filter(|peer| now.saturating_sub(peer.announcement.ts_ms) <= ttl_ms)
-        .filter(|peer| peer.announcement.distributable)
-        .filter(|peer| peer.announcement.channel.distributable())
-        .filter(|peer| !peer.announcement.version.trim().is_empty())
-        .filter(|peer| {
-            compare_versions(&peer.announcement.version, &local.metadata.version)
+    let mut best: Option<PeerPresence> = None;
+
+    for peer in peers.values() {
+        if now.saturating_sub(peer.announcement.ts_ms) > ttl_ms
+            || !peer.announcement.distributable
+            || !peer.announcement.channel.distributable()
+            || peer.announcement.version.trim().is_empty()
+            || compare_versions(&peer.announcement.version, &local.metadata.version)
+                != Ordering::Greater
+        {
+            continue;
+        }
+
+        let provider_assessment = threats
+            .provider_assessment(&peer.announcement.agent_id)
+            .await;
+        if provider_assessment.recommended_block {
+            tracing::debug!(
+                peer = %peer.announcement.agent_id,
+                local_risk = provider_assessment.local_risk,
+                remote_risk = provider_assessment.remote_risk,
+                remote_reporters = provider_assessment.remote_reporters,
+                "skipping loader peer because provider is blocklisted"
+            );
+            continue;
+        }
+
+        let artifact_assessment = threats
+            .artifact_assessment(&peer.announcement.version, &peer.announcement.blake3)
+            .await;
+        if artifact_assessment.recommended_block {
+            tracing::debug!(
+                peer = %peer.announcement.agent_id,
+                version = %peer.announcement.version,
+                blake3 = %peer.announcement.blake3,
+                local_risk = artifact_assessment.local_risk,
+                remote_risk = artifact_assessment.remote_risk,
+                remote_reporters = artifact_assessment.remote_reporters,
+                "skipping loader peer because artifact is blocklisted"
+            );
+            continue;
+        }
+
+        let replace = best.as_ref().is_none_or(|current| {
+            compare_versions(&peer.announcement.version, &current.announcement.version)
+                .then_with(|| peer.announcement.ts_ms.cmp(&current.announcement.ts_ms))
                 == Ordering::Greater
-        })
-        .cloned()
-        .max_by(|left, right| {
-            compare_versions(&left.announcement.version, &right.announcement.version)
-                .then_with(|| left.announcement.ts_ms.cmp(&right.announcement.ts_ms))
-        })
+        });
+        if replace {
+            best = Some(peer.clone());
+        }
+    }
+
+    best
 }
 
 async fn sync_from_peer(
@@ -1160,6 +1511,7 @@ async fn sync_from_peer(
     loader_root: &Path,
     update_dir: &Path,
     shared: Arc<LoaderSharedState>,
+    threats: loader_threat::LoaderThreatHub,
     child: &mut ManagedChild,
     peer: &PeerPresence,
 ) -> Result<bool, Box<dyn Error>> {
@@ -1170,15 +1522,51 @@ async fn sync_from_peer(
         return Ok(false);
     };
 
-    let fetched = fetch_peer_core(
+    let fetched = match fetch_peer_core(
         &base_addr,
         artifact_key,
         config.loader.request_timeout_ms,
         &staging_dir_path(loader_root),
     )
-    .await?;
+    .await
+    {
+        Ok(fetched) => fetched,
+        Err(err) => {
+            if err.suspicious() {
+                threats
+                    .record_incident(LocalThreatIncident {
+                        provider_agent_id: Some(peer.announcement.agent_id.clone()),
+                        source_addr: Some(peer.source_addr.to_string()),
+                        artifact_version: Some(peer.announcement.version.clone()),
+                        artifact_blake3: Some(peer.announcement.blake3.clone()),
+                        classification: "malformed_update".to_string(),
+                        reason: format!("peer served malformed or unverifiable artifact: {err}"),
+                        provider_risk: 0.60,
+                        artifact_risk: 0.60,
+                    })
+                    .await;
+            }
+            return Err(std::io::Error::other(err.to_string()).into());
+        }
+    };
 
     if fetched.metadata.channel != UpdateChannel::Production {
+        let _ = fs::remove_file(&fetched.staged_path).await;
+        threats
+            .record_incident(LocalThreatIncident {
+                provider_agent_id: Some(peer.announcement.agent_id.clone()),
+                source_addr: Some(peer.source_addr.to_string()),
+                artifact_version: Some(fetched.metadata.version.clone()),
+                artifact_blake3: Some(fetched.metadata.blake3.clone()),
+                classification: "announcement_mismatch".to_string(),
+                reason: format!(
+                    "peer announced distributable production artifact but served {:?} channel",
+                    fetched.metadata.channel
+                ),
+                provider_risk: 0.60,
+                artifact_risk: 0.60,
+            })
+            .await;
         return Ok(false);
     }
     if compare_versions(
@@ -1199,6 +1587,24 @@ async fn sync_from_peer(
         || fetched.metadata.blake3 != peer.announcement.blake3
     {
         let _ = fs::remove_file(&fetched.staged_path).await;
+        threats
+            .record_incident(LocalThreatIncident {
+                provider_agent_id: Some(peer.announcement.agent_id.clone()),
+                source_addr: Some(peer.source_addr.to_string()),
+                artifact_version: Some(fetched.metadata.version.clone()),
+                artifact_blake3: Some(fetched.metadata.blake3.clone()),
+                classification: "announcement_mismatch".to_string(),
+                reason: format!(
+                    "peer announcement {} / {} did not match fetched artifact {} / {}",
+                    peer.announcement.version,
+                    peer.announcement.blake3,
+                    fetched.metadata.version,
+                    fetched.metadata.blake3
+                ),
+                provider_risk: 0.75,
+                artifact_risk: 0.75,
+            })
+            .await;
         return Err(
             std::io::Error::other("peer announcement did not match fetched core metadata").into(),
         );
@@ -1209,9 +1615,14 @@ async fn sync_from_peer(
         loader_root,
         update_dir,
         shared,
+        threats,
         child,
         fetched,
-        "loader-peer",
+        UpdateProvenance {
+            source_kind: "loader-peer".to_string(),
+            peer_agent_id: Some(peer.announcement.agent_id.clone()),
+            peer_addr: Some(peer.source_addr.to_string()),
+        },
         config.loader.handoff_timeout_ms,
     )
     .await?;
@@ -1242,51 +1653,73 @@ async fn fetch_peer_core(
     artifact_key: &str,
     timeout_ms: u64,
     staging_dir: &Path,
-) -> Result<FetchedCore, Box<dyn Error>> {
-    fs::create_dir_all(staging_dir).await?;
+) -> Result<FetchedCore, PeerFetchError> {
+    fs::create_dir_all(staging_dir)
+        .await
+        .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
-        .build()?;
+        .build()
+        .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
 
     let metadata_url = join_loader_url(base_addr, LOADER_METADATA_ROUTE);
     let signature_url = join_loader_url(base_addr, LOADER_SIGNATURE_ROUTE);
     let bundle_url = join_loader_url(base_addr, LOADER_BUNDLE_ROUTE);
 
     let metadata_request = async {
-        let response = client.get(&metadata_url).send().await?;
+        let response = client
+            .get(&metadata_url)
+            .send()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
         if !response.status().is_success() {
-            return Err(std::io::Error::other(format!(
+            return Err(PeerFetchError::Transport(format!(
                 "metadata fetch failed with {}",
                 response.status()
-            ))
-            .into());
+            )));
         }
-        let bytes = response.bytes().await?;
-        Ok::<Vec<u8>, Box<dyn Error>>(bytes.to_vec())
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
+        Ok::<Vec<u8>, PeerFetchError>(bytes.to_vec())
     };
     let signature_request = async {
-        let response = client.get(&signature_url).send().await?;
+        let response = client
+            .get(&signature_url)
+            .send()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
         if !response.status().is_success() {
-            return Err(std::io::Error::other(format!(
+            return Err(PeerFetchError::Transport(format!(
                 "signature fetch failed with {}",
                 response.status()
-            ))
-            .into());
+            )));
         }
-        let bytes = response.bytes().await?;
-        Ok::<String, Box<dyn Error>>(String::from_utf8(bytes.to_vec())?)
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|err| PeerFetchError::Verification(format!("signature body was not utf-8: {err}")))
     };
     let bundle_request = async {
-        let response = client.get(&bundle_url).send().await?;
+        let response = client
+            .get(&bundle_url)
+            .send()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
         if !response.status().is_success() {
-            return Err(std::io::Error::other(format!(
+            return Err(PeerFetchError::Transport(format!(
                 "bundle fetch failed with {}",
                 response.status()
-            ))
-            .into());
+            )));
         }
-        let bytes = response.bytes().await?;
-        Ok::<Vec<u8>, Box<dyn Error>>(bytes.to_vec())
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
+        Ok::<Vec<u8>, PeerFetchError>(bytes.to_vec())
     };
 
     let (metadata_bytes, signature, bundle_bytes) =
@@ -1296,16 +1729,22 @@ async fn fetch_peer_core(
         &bundle_bytes,
         signature.trim(),
         artifact_key,
-    )?;
-    validate_local_metadata(&metadata)?;
+    )
+    .map_err(|err| PeerFetchError::Verification(err.to_string()))?;
+    validate_local_metadata(&metadata)
+        .map_err(|err| PeerFetchError::Verification(err.to_string()))?;
 
     let staged_path = staging_dir.join(format!(
         "tracey-core-{}-{}",
         metadata.version.replace('/', "_"),
         metadata.blake3,
     ));
-    update::write_atomic(&staged_path, &bundle_bytes).await?;
-    ensure_executable(&staged_path).await?;
+    update::write_atomic(&staged_path, &bundle_bytes)
+        .await
+        .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
+    ensure_executable(&staged_path)
+        .await
+        .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
 
     Ok(FetchedCore {
         staged_path,
@@ -1353,15 +1792,21 @@ async fn apply_supervisor_request(
         metadata_bytes,
         signature,
     };
+    let threats = shared.threats.clone();
 
     apply_fetched_core(
         artifact_key,
         loader_root,
         update_dir,
         shared,
+        threats,
         child,
         fetched,
-        "loader-handoff",
+        UpdateProvenance {
+            source_kind: "loader-handoff".to_string(),
+            peer_agent_id: None,
+            peer_addr: None,
+        },
         config.loader.handoff_timeout_ms,
     )
     .await
@@ -1372,9 +1817,10 @@ async fn apply_fetched_core(
     loader_root: &Path,
     update_dir: &Path,
     shared: Arc<LoaderSharedState>,
+    threats: loader_threat::LoaderThreatHub,
     child: &mut ManagedChild,
     fetched: FetchedCore,
-    updated_from: &str,
+    provenance: UpdateProvenance,
     handoff_timeout_ms: u64,
 ) -> Result<(), Box<dyn Error>> {
     if shared.rollback_pending().await {
@@ -1392,6 +1838,7 @@ async fn apply_fetched_core(
     let staged_path = fetched.staged_path.clone();
     let staged_cleanup_path = staged_path.clone();
     let staged_version = fetched.metadata.version.clone();
+    let staged_blake3 = fetched.metadata.blake3.clone();
     let staged_channel = fetched.metadata.channel.clone();
     let extra_env = vec![
         (
@@ -1403,7 +1850,7 @@ async fn apply_fetched_core(
             fetched.metadata.channel.to_string(),
         ),
     ];
-    let mut new_child = supervisor::perform_handoff_with_env(
+    let mut new_child = match supervisor::perform_handoff_with_env(
         child,
         &fetched.staged_path,
         &[],
@@ -1411,13 +1858,28 @@ async fn apply_fetched_core(
         Duration::from_millis(handoff_timeout_ms),
         &extra_env,
         None,
-        updated_from,
+        &provenance.source_kind,
     )
     .await
-    .map_err(|err| {
-        tokio::spawn(cleanup_staged_core(staged_cleanup_path.clone()));
-        err
-    })?;
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tokio::spawn(cleanup_staged_core(staged_cleanup_path.clone()));
+            threats
+                .record_incident(LocalThreatIncident {
+                    provider_agent_id: provenance.peer_agent_id.clone(),
+                    source_addr: provenance.peer_addr.clone(),
+                    artifact_version: Some(staged_version.clone()),
+                    artifact_blake3: Some(staged_blake3.clone()),
+                    classification: "handoff_failure".to_string(),
+                    reason: format!("activated core never became ready: {err}"),
+                    provider_risk: if provenance.peer_agent_id.is_some() { 0.75 } else { 0.0 },
+                    artifact_risk: 0.75,
+                })
+                .await;
+            return Err(err.into());
+        }
+    };
 
     let promoted = match promote_fetched_core(loader_root, fetched).await {
         Ok(promoted) => promoted,
@@ -1453,6 +1915,9 @@ async fn apply_fetched_core(
             failed_blake3: promoted.metadata.blake3.clone(),
             previous_version: current_active.metadata.version.clone(),
             previous_blake3: current_active.metadata.blake3.clone(),
+            source_kind: Some(provenance.source_kind),
+            source_peer_agent_id: provenance.peer_agent_id,
+            source_peer_addr: provenance.peer_addr,
         },
     };
     if let Err(err) = write_rollback_marker(loader_root, &pending.marker).await {
@@ -1590,6 +2055,9 @@ mod tests {
             failed_blake3: "deadbeef".to_string(),
             previous_version: "1.9.0".to_string(),
             previous_blake3: "feedface".to_string(),
+            source_kind: None,
+            source_peer_agent_id: None,
+            source_peer_addr: None,
         };
 
         assert!(!rollback_marker_expired(&marker, 5_000, 6_000));
@@ -1630,6 +2098,9 @@ mod tests {
             failed_blake3: current.metadata.blake3.clone(),
             previous_version: previous.metadata.version.clone(),
             previous_blake3: previous.metadata.blake3.clone(),
+            source_kind: None,
+            source_peer_agent_id: None,
+            source_peer_addr: None,
         };
         write_rollback_marker(&loader_root, &marker)
             .await
@@ -1683,6 +2154,9 @@ mod tests {
             failed_blake3: current.metadata.blake3.clone(),
             previous_version: previous.metadata.version.clone(),
             previous_blake3: previous.metadata.blake3.clone(),
+            source_kind: None,
+            source_peer_agent_id: None,
+            source_peer_addr: None,
         };
         write_rollback_marker(&loader_root, &marker)
             .await
@@ -1697,6 +2171,12 @@ mod tests {
                 previous: previous.clone(),
                 marker: marker.clone(),
             }))),
+            threats: loader_threat::LoaderThreatHub::from_config(&LoaderConfig {
+                state_dir: loader_root.clone(),
+                ..LoaderConfig::default()
+            })
+            .await
+            .expect("loader threat hub should initialize"),
         });
 
         let restored = rollback_after_crash(&loader_root, key, shared.clone(), 60_000)
@@ -1737,6 +2217,249 @@ mod tests {
         assert_eq!(archived, failed_bytes);
 
         let _ = fs::remove_dir_all(&loader_root).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_after_crash_marks_peer_source_as_blocked() {
+        let loader_root = unique_test_dir("crash-rollback-threats");
+        let _ = fs::remove_dir_all(&loader_root).await;
+        fs::create_dir_all(current_binary_path(&loader_root).parent().unwrap())
+            .await
+            .expect("current dir should exist");
+        fs::create_dir_all(rollback_binary_path(&loader_root).parent().unwrap())
+            .await
+            .expect("rollback dir should exist");
+
+        let key = "loader-test-key";
+        let current = write_signed_core(
+            &current_binary_path(&loader_root),
+            &current_metadata_path(&loader_root),
+            &current_signature_path(&loader_root),
+            "4.0.0",
+            key,
+        )
+        .await;
+        let previous = write_signed_core(
+            &rollback_binary_path(&loader_root),
+            &rollback_metadata_path(&loader_root),
+            &rollback_signature_path(&loader_root),
+            "3.9.0",
+            key,
+        )
+        .await;
+        let marker = RollbackMarker {
+            activated_ms: now_ms(),
+            failed_version: current.metadata.version.clone(),
+            failed_blake3: current.metadata.blake3.clone(),
+            previous_version: previous.metadata.version.clone(),
+            previous_blake3: previous.metadata.blake3.clone(),
+            source_kind: Some("loader-peer".to_string()),
+            source_peer_agent_id: Some("peer-malicious".to_string()),
+            source_peer_addr: Some("10.0.0.7:47988".to_string()),
+        };
+        write_rollback_marker(&loader_root, &marker)
+            .await
+            .expect("rollback marker should persist");
+
+        let threats = loader_threat::LoaderThreatHub::from_config(&LoaderConfig {
+            state_dir: loader_root.clone(),
+            ..LoaderConfig::default()
+        })
+        .await
+        .expect("loader threat hub should initialize");
+        let shared = Arc::new(LoaderSharedState {
+            agent_id: "agent-a".to_string(),
+            policy_channel: update::UpdateChannel::Production,
+            transfer_advertise_addr: "http://127.0.0.1:47988".to_string(),
+            current: Arc::new(RwLock::new(Some(current.clone()))),
+            rollback: Arc::new(RwLock::new(Some(PendingRollback {
+                previous: previous.clone(),
+                marker: marker.clone(),
+            }))),
+            threats: threats.clone(),
+        });
+
+        let restored = rollback_after_crash(&loader_root, key, shared.clone(), 60_000)
+            .await
+            .expect("rollback should succeed")
+            .expect("rollback should restore previous core");
+
+        assert_eq!(restored.metadata.version, "3.9.0");
+        let provider = threats.provider_assessment("peer-malicious").await;
+        let artifact = threats
+            .artifact_assessment(&current.metadata.version, &current.metadata.blake3)
+            .await;
+        assert!(provider.recommended_block);
+        assert!(artifact.recommended_block);
+
+        let _ = fs::remove_dir_all(&loader_root).await;
+    }
+
+    #[tokio::test]
+    async fn choose_best_peer_skips_blocklisted_provider() {
+        let loader_root = unique_test_dir("choose-peer-threats");
+        let _ = fs::remove_dir_all(&loader_root).await;
+        fs::create_dir_all(current_binary_path(&loader_root).parent().unwrap())
+            .await
+            .expect("current dir should exist");
+
+        let key = "loader-test-key";
+        let current = write_signed_core(
+            &current_binary_path(&loader_root),
+            &current_metadata_path(&loader_root),
+            &current_signature_path(&loader_root),
+            "1.0.0",
+            key,
+        )
+        .await;
+        let threats = loader_threat::LoaderThreatHub::from_config(&LoaderConfig {
+            state_dir: loader_root.clone(),
+            ..LoaderConfig::default()
+        })
+        .await
+        .expect("loader threat hub should initialize");
+        threats
+            .record_incident(LocalThreatIncident {
+                provider_agent_id: Some("peer-bad".to_string()),
+                source_addr: Some("10.0.0.9:47988".to_string()),
+                artifact_version: Some("3.0.0".to_string()),
+                artifact_blake3: Some("bb".repeat(32)),
+                classification: "malformed_update".to_string(),
+                reason: "served malformed artifact".to_string(),
+                provider_risk: 1.0,
+                artifact_risk: 1.0,
+            })
+            .await;
+
+        let shared = Arc::new(LoaderSharedState {
+            agent_id: "agent-a".to_string(),
+            policy_channel: update::UpdateChannel::Production,
+            transfer_advertise_addr: "http://127.0.0.1:47988".to_string(),
+            current: Arc::new(RwLock::new(Some(current.clone()))),
+            rollback: Arc::new(RwLock::new(None)),
+            threats: threats.clone(),
+        });
+
+        let mut peers = HashMap::new();
+        peers.insert(
+            "peer-bad".to_string(),
+            PeerPresence {
+                announcement: LoaderAnnouncement {
+                    agent_id: "peer-bad".to_string(),
+                    ts_ms: now_ms(),
+                    os: std::env::consts::OS.to_string(),
+                    arch: std::env::consts::ARCH.to_string(),
+                    version: "3.0.0".to_string(),
+                    blake3: "bb".repeat(32),
+                    channel: UpdateChannel::Production,
+                    distributable: true,
+                    transfer_addr: Some("http://10.0.0.9:47988".to_string()),
+                    signature: String::new(),
+                },
+                source_addr: "10.0.0.9:47989".parse().expect("source addr should parse"),
+            },
+        );
+        peers.insert(
+            "peer-good".to_string(),
+            PeerPresence {
+                announcement: LoaderAnnouncement {
+                    agent_id: "peer-good".to_string(),
+                    ts_ms: now_ms(),
+                    os: std::env::consts::OS.to_string(),
+                    arch: std::env::consts::ARCH.to_string(),
+                    version: "2.0.0".to_string(),
+                    blake3: "cc".repeat(32),
+                    channel: UpdateChannel::Production,
+                    distributable: true,
+                    transfer_addr: Some("http://10.0.0.10:47988".to_string()),
+                    signature: String::new(),
+                },
+                source_addr: "10.0.0.10:47989".parse().expect("source addr should parse"),
+            },
+        );
+
+        let selected = choose_best_peer(&peers, shared, threats, 60_000)
+            .await
+            .expect("a safe peer should be selected");
+        assert_eq!(selected.announcement.agent_id, "peer-good");
+
+        let _ = fs::remove_dir_all(&loader_root).await;
+    }
+
+    #[test]
+    fn fuzzy_loader_parser_recovers_wrapped_payload() {
+        let announcement = LoaderAnnouncement {
+            agent_id: "peer-loader".to_string(),
+            ts_ms: 77,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            version: "2.4.6".to_string(),
+            blake3: "ab".repeat(32),
+            channel: UpdateChannel::Production,
+            distributable: true,
+            transfer_addr: Some("http://10.0.0.42:47988".to_string()),
+            signature: String::new(),
+        };
+        let signature = sign_loader_announcement(&announcement, "shared-key");
+        let payload = serde_json::json!({
+            "wrapper": {
+                "announcement": {
+                    "agentId": "peer-loader",
+                    "timestamp_ms": "77",
+                    "platform": std::env::consts::OS,
+                    "architecture": std::env::consts::ARCH,
+                    "buildVersion": "2.4.6",
+                    "digest": "ab".repeat(32),
+                    "release_channel": "prod",
+                    "production_ready": "true",
+                    "transferAddr": "http://10.0.0.42:47988",
+                    "sig": signature
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, affinity) =
+            parse_loader_announcement_lossy(payload.as_bytes()).expect("payload should recover");
+
+        assert!(affinity >= 3.0);
+        assert_eq!(parsed.agent_id, "peer-loader");
+        assert_eq!(parsed.version, "2.4.6");
+        assert!(parsed.distributable);
+        assert_eq!(
+            parsed.transfer_addr.as_deref(),
+            Some("http://10.0.0.42:47988")
+        );
+        assert!(verify_loader_announcement_signature(&parsed, "shared-key"));
+    }
+
+    #[test]
+    fn loader_signature_accepts_legacy_formats() {
+        let mut announcement = LoaderAnnouncement {
+            agent_id: "peer-loader".to_string(),
+            ts_ms: 77,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            version: "2.4.6".to_string(),
+            blake3: "ab".repeat(32),
+            channel: UpdateChannel::Production,
+            distributable: true,
+            transfer_addr: Some("http://10.0.0.42:47988".to_string()),
+            signature: String::new(),
+        };
+        announcement.signature =
+            sign_loader_announcement_legacy(&announcement, "shared-key", true);
+        assert!(verify_loader_announcement_signature(
+            &announcement,
+            "shared-key"
+        ));
+
+        announcement.signature =
+            sign_loader_announcement_legacy(&announcement, "shared-key", false);
+        assert!(verify_loader_announcement_signature(
+            &announcement,
+            "shared-key"
+        ));
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

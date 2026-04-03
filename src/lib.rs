@@ -16,7 +16,9 @@ pub mod governance;
 pub mod gpu;
 pub mod inventory;
 pub mod loader;
+pub mod loader_threat;
 pub mod location;
+mod peer_compat;
 pub mod prometheus_export;
 pub mod refiner_tracking;
 pub mod security;
@@ -266,6 +268,18 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     slurm: slurm_runtime.clone(),
                     prometheus_export: prometheus_export_handle.clone(),
                     continuum_autoscaler: Some(continuum_autoscaler.clone()),
+                    loader_threats: match loader_threat::LoaderThreatStatusHandle::from_config(
+                        &config.loader,
+                    ) {
+                        Ok(handle) => Some(handle),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "loader threat snapshot handle unavailable; status will omit loader threat intel"
+                            );
+                            None
+                        }
+                    },
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));
