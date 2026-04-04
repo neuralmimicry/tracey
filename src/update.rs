@@ -437,14 +437,16 @@ pub(crate) fn verify_signed_artifacts(
                 metadata
             }
             Err(reason) => {
-                return Err(if matches!(
-                    peer_compat::parse_bytes(metadata_bytes),
-                    Ok(serde_json::Value::Object(_))
-                ) {
-                    UpdateError::Metadata(reason)
-                } else {
-                    UpdateError::Serde(err)
-                });
+                return Err(
+                    if matches!(
+                        peer_compat::parse_bytes(metadata_bytes),
+                        Ok(serde_json::Value::Object(_))
+                    ) {
+                        UpdateError::Metadata(reason)
+                    } else {
+                        UpdateError::Serde(err)
+                    },
+                );
             }
         },
     };
@@ -463,7 +465,12 @@ fn parse_update_metadata_lossy(metadata_bytes: &[u8]) -> Result<(UpdateMetadata,
     let root = peer_compat::parse_bytes(metadata_bytes).map_err(|err| err.to_string())?;
     let fields = [
         SchemaField {
-            aliases: &["version", "agent_version", "build_version", "release_version"],
+            aliases: &[
+                "version",
+                "agent_version",
+                "build_version",
+                "release_version",
+            ],
             required: true,
             weight: 2.0,
         },
@@ -493,7 +500,12 @@ fn parse_update_metadata_lossy(metadata_bytes: &[u8]) -> Result<(UpdateMetadata,
     let map = matched.map;
     let version = peer_compat::value_for(
         map,
-        &["version", "agent_version", "build_version", "release_version"],
+        &[
+            "version",
+            "agent_version",
+            "build_version",
+            "release_version",
+        ],
     )
     .and_then(peer_compat::coerce_string)
     .ok_or_else(|| "missing version".to_string())?;

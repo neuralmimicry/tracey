@@ -205,12 +205,20 @@ impl LoaderThreatHub {
         };
 
         if let Some(persisted) = persisted {
-            for entry in persisted.providers.into_iter().filter_map(sanitize_provider_entry) {
+            for entry in persisted
+                .providers
+                .into_iter()
+                .filter_map(sanitize_provider_entry)
+            {
                 state
                     .local_providers
                     .insert(entry.provider_agent_id.clone(), entry);
             }
-            for entry in persisted.artifacts.into_iter().filter_map(sanitize_artifact_entry) {
+            for entry in persisted
+                .artifacts
+                .into_iter()
+                .filter_map(sanitize_artifact_entry)
+            {
                 state
                     .local_artifacts
                     .insert(make_artifact_key(&entry.version, &entry.blake3), entry);
@@ -249,7 +257,9 @@ impl LoaderThreatHub {
             let source_addr = sanitize_text_option(incident.source_addr, MAX_ADDR_LEN);
             let event_ms = now_ms();
 
-            if let Some(provider_agent_id) = provider_agent_id.clone() && provider_risk > 0.0 {
+            if let Some(provider_agent_id) = provider_agent_id.clone()
+                && provider_risk > 0.0
+            {
                 state.epoch = state.epoch.saturating_add(1);
                 let entry = state
                     .local_providers
@@ -271,20 +281,22 @@ impl LoaderThreatHub {
                 entry.recommended_block = entry.risk >= PROVIDER_BLOCK_THRESHOLD;
             }
 
-            if let (Some(version), Some(blake3)) = (artifact_version.clone(), artifact_blake3.clone())
+            if let (Some(version), Some(blake3)) =
+                (artifact_version.clone(), artifact_blake3.clone())
                 && artifact_risk > 0.0
             {
                 let key = make_artifact_key(&version, &blake3);
                 state.epoch = state.epoch.saturating_add(1);
-                let entry = state
-                    .local_artifacts
-                    .entry(key)
-                    .or_insert_with(|| LoaderThreatArtifactEntry {
-                        version,
-                        blake3,
-                        reporter_count: 1,
-                        ..LoaderThreatArtifactEntry::default()
-                    });
+                let entry =
+                    state
+                        .local_artifacts
+                        .entry(key)
+                        .or_insert_with(|| LoaderThreatArtifactEntry {
+                            version,
+                            blake3,
+                            reporter_count: 1,
+                            ..LoaderThreatArtifactEntry::default()
+                        });
                 entry.risk = (entry.risk + artifact_risk).clamp(0.0, 1.0);
                 entry.evidence_count = entry.evidence_count.saturating_add(1);
                 entry.last_event_ms = event_ms;
@@ -308,11 +320,7 @@ impl LoaderThreatHub {
         provider_assessment_locked(&state, provider_agent_id)
     }
 
-    pub async fn artifact_assessment(
-        &self,
-        version: &str,
-        blake3: &str,
-    ) -> LoaderThreatAssessment {
+    pub async fn artifact_assessment(&self, version: &str, blake3: &str) -> LoaderThreatAssessment {
         let mut state = self.state.write().await;
         cleanup_state(&mut state, now_ms());
         artifact_assessment_locked(&state, version, blake3)
@@ -327,7 +335,9 @@ impl LoaderThreatHub {
         let max_entries = max_entries.max(1);
         let mut state = self.state.write().await;
         cleanup_state(&mut state, now_ms());
-        if state.epoch == 0 || (state.local_providers.is_empty() && state.local_artifacts.is_empty()) {
+        if state.epoch == 0
+            || (state.local_providers.is_empty() && state.local_artifacts.is_empty())
+        {
             return None;
         }
 
@@ -423,15 +433,14 @@ pub fn validate_loader_threat_announcement(
         return Err(std::io::Error::other("loader threat announcement missing agent_id").into());
     }
     if !verify_loader_threat_announcement_signature(announcement, gossip_key) {
-        return Err(
-            std::io::Error::other("loader threat announcement signature mismatch").into(),
-        );
+        return Err(std::io::Error::other("loader threat announcement signature mismatch").into());
     }
     let now = now_ms();
     if announcement.ts_ms > now.saturating_add(MAX_FUTURE_SKEW_MS) {
-        return Err(
-            std::io::Error::other("loader threat announcement timestamp too far in future").into(),
-        );
+        return Err(std::io::Error::other(
+            "loader threat announcement timestamp too far in future",
+        )
+        .into());
     }
     if now.saturating_sub(announcement.ts_ms) > ttl_ms {
         return Err(std::io::Error::other("loader threat announcement expired").into());
@@ -473,20 +482,24 @@ pub fn parse_loader_threat_announcement_lossy(
     let matched = peer_compat::best_object(&root, &fields, 3.0, 3)
         .ok_or_else(|| "payload did not resemble a loader threat announcement".to_string())?;
     let map = matched.map;
-    let providers = peer_compat::array_for(map, &["providers", "provider_reports", "provider_intel"])
-        .map(|items| {
-            items.into_iter()
-                .filter_map(|item| parse_provider_entry_lossy(&item))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let artifacts = peer_compat::array_for(map, &["artifacts", "artifact_reports", "artifact_intel"])
-        .map(|items| {
-            items.into_iter()
-                .filter_map(|item| parse_artifact_entry_lossy(&item))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let providers =
+        peer_compat::array_for(map, &["providers", "provider_reports", "provider_intel"])
+            .map(|items| {
+                items
+                    .into_iter()
+                    .filter_map(|item| parse_provider_entry_lossy(&item))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    let artifacts =
+        peer_compat::array_for(map, &["artifacts", "artifact_reports", "artifact_intel"])
+            .map(|items| {
+                items
+                    .into_iter()
+                    .filter_map(|item| parse_artifact_entry_lossy(&item))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
     if providers.is_empty() && artifacts.is_empty() {
         return Err("loader threat announcement did not contain threat entries".to_string());
     }
@@ -712,7 +725,9 @@ fn snapshot_from_state(
     let blocked_provider_count = state
         .local_providers
         .keys()
-        .filter(|provider_agent_id| provider_assessment_locked(state, provider_agent_id).recommended_block)
+        .filter(|provider_agent_id| {
+            provider_assessment_locked(state, provider_agent_id).recommended_block
+        })
         .count()
         + remote_providers
             .iter()
@@ -724,7 +739,9 @@ fn snapshot_from_state(
     let blocked_artifact_count = state
         .local_artifacts
         .values()
-        .filter(|entry| artifact_assessment_locked(state, &entry.version, &entry.blake3).recommended_block)
+        .filter(|entry| {
+            artifact_assessment_locked(state, &entry.version, &entry.blake3).recommended_block
+        })
         .count()
         + remote_artifacts
             .iter()
@@ -861,7 +878,9 @@ fn artifact_assessment_locked(
     }
 }
 
-fn aggregate_remote_providers(state: &LoaderThreatState) -> HashMap<String, LoaderThreatProviderEntry> {
+fn aggregate_remote_providers(
+    state: &LoaderThreatState,
+) -> HashMap<String, LoaderThreatProviderEntry> {
     let mut aggregated = HashMap::new();
     for record in state.remote.values() {
         for entry in &record.providers {
@@ -888,7 +907,9 @@ fn aggregate_remote_providers(state: &LoaderThreatState) -> HashMap<String, Load
     aggregated
 }
 
-fn aggregate_remote_artifacts(state: &LoaderThreatState) -> HashMap<String, LoaderThreatArtifactEntry> {
+fn aggregate_remote_artifacts(
+    state: &LoaderThreatState,
+) -> HashMap<String, LoaderThreatArtifactEntry> {
     let mut aggregated = HashMap::new();
     for record in state.remote.values() {
         for entry in &record.artifacts {
@@ -915,7 +936,9 @@ fn aggregate_remote_artifacts(state: &LoaderThreatState) -> HashMap<String, Load
     aggregated
 }
 
-fn sanitize_provider_entry(mut entry: LoaderThreatProviderEntry) -> Option<LoaderThreatProviderEntry> {
+fn sanitize_provider_entry(
+    mut entry: LoaderThreatProviderEntry,
+) -> Option<LoaderThreatProviderEntry> {
     entry.provider_agent_id = sanitize_text(entry.provider_agent_id, MAX_ID_LEN)?;
     entry.last_source_addr = sanitize_text_option(entry.last_source_addr, MAX_ADDR_LEN);
     entry.last_reason = sanitize_text(entry.last_reason, MAX_REASON_LEN)
@@ -930,14 +953,17 @@ fn sanitize_provider_entry(mut entry: LoaderThreatProviderEntry) -> Option<Loade
     Some(entry)
 }
 
-fn sanitize_artifact_entry(mut entry: LoaderThreatArtifactEntry) -> Option<LoaderThreatArtifactEntry> {
+fn sanitize_artifact_entry(
+    mut entry: LoaderThreatArtifactEntry,
+) -> Option<LoaderThreatArtifactEntry> {
     entry.version = sanitize_text(entry.version, MAX_VERSION_LEN)?;
     entry.blake3 = sanitize_text(entry.blake3, MAX_DIGEST_LEN)?;
     entry.last_reason = sanitize_text(entry.last_reason, MAX_REASON_LEN)
         .unwrap_or_else(|| "suspicious loader update detected".to_string());
     entry.last_classification = sanitize_text(entry.last_classification, MAX_CLASSIFICATION_LEN)
         .unwrap_or_else(|| "malformed_update".to_string());
-    entry.source_provider_agent_id = sanitize_text_option(entry.source_provider_agent_id, MAX_ID_LEN);
+    entry.source_provider_agent_id =
+        sanitize_text_option(entry.source_provider_agent_id, MAX_ID_LEN);
     entry.risk = entry.risk.clamp(0.0, 1.0);
     entry.reporter_count = entry.reporter_count.max(1);
     entry.recommended_block = entry.recommended_block || entry.risk >= ARTIFACT_BLOCK_THRESHOLD;
@@ -974,7 +1000,13 @@ fn parse_provider_entry_lossy(value: &Value) -> Option<LoaderThreatProviderEntry
     sanitize_provider_entry(LoaderThreatProviderEntry {
         provider_agent_id: peer_compat::value_for(
             &object,
-            &["provider_agent_id", "provider", "peer_agent_id", "peerId", "agent_id"],
+            &[
+                "provider_agent_id",
+                "provider",
+                "peer_agent_id",
+                "peerId",
+                "agent_id",
+            ],
         )
         .and_then(peer_compat::coerce_string)?,
         last_source_addr: peer_compat::value_for(
@@ -1053,7 +1085,12 @@ fn parse_artifact_entry_lossy(value: &Value) -> Option<LoaderThreatArtifactEntry
         .unwrap_or_else(|| "malformed_update".to_string()),
         source_provider_agent_id: peer_compat::value_for(
             &object,
-            &["source_provider_agent_id", "provider_agent_id", "provider", "peer_agent_id"],
+            &[
+                "source_provider_agent_id",
+                "provider_agent_id",
+                "provider",
+                "peer_agent_id",
+            ],
         )
         .and_then(peer_compat::coerce_string),
         reporter_count: 1,
@@ -1161,7 +1198,11 @@ mod tests {
         announcement.signature = sign_loader_threat_announcement(&announcement, "shared-key");
         hub.ingest_remote(announcement).await;
         assert!(!hub.provider_assessment("peer-bad").await.recommended_block);
-        assert!(!hub.artifact_assessment("9.9.9", &"cd".repeat(32)).await.recommended_block);
+        assert!(
+            !hub.artifact_assessment("9.9.9", &"cd".repeat(32))
+                .await
+                .recommended_block
+        );
 
         let mut announcement = LoaderThreatAnnouncement {
             agent_id: "observer-2".to_string(),
@@ -1174,7 +1215,11 @@ mod tests {
         announcement.signature = sign_loader_threat_announcement(&announcement, "shared-key");
         hub.ingest_remote(announcement).await;
         assert!(hub.provider_assessment("peer-bad").await.recommended_block);
-        assert!(hub.artifact_assessment("9.9.9", &"cd".repeat(32)).await.recommended_block);
+        assert!(
+            hub.artifact_assessment("9.9.9", &"cd".repeat(32))
+                .await
+                .recommended_block
+        );
 
         let _ = fs::remove_dir_all(&loader_root).await;
     }
@@ -1258,7 +1303,10 @@ mod tests {
         assert_eq!(parsed.artifacts.len(), 1);
         assert_eq!(parsed.providers, announcement.providers);
         assert_eq!(parsed.artifacts, announcement.artifacts);
-        assert!(verify_loader_threat_announcement_signature(&parsed, "shared-key"));
+        assert!(verify_loader_threat_announcement_signature(
+            &parsed,
+            "shared-key"
+        ));
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
@@ -1266,9 +1314,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "tracey-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("tracey-{label}-{}-{nonce}", std::process::id()))
     }
 }

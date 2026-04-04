@@ -427,12 +427,21 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
     let root = peer_compat::parse_bytes(payload).map_err(|err| err.to_string())?;
     let fields = [
         SchemaField {
-            aliases: &["agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id"],
+            aliases: &[
+                "agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id",
+            ],
             required: true,
             weight: 2.0,
         },
         SchemaField {
-            aliases: &["ts_ms", "timestamp_ms", "timestamp", "ts", "seen_ms", "updated_ms"],
+            aliases: &[
+                "ts_ms",
+                "timestamp_ms",
+                "timestamp",
+                "ts",
+                "seen_ms",
+                "updated_ms",
+            ],
             required: true,
             weight: 1.5,
         },
@@ -447,7 +456,13 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
             weight: 1.8,
         },
         SchemaField {
-            aliases: &["status_addr", "statusAddr", "status_url", "statusUrl", "api_addr"],
+            aliases: &[
+                "status_addr",
+                "statusAddr",
+                "status_url",
+                "statusUrl",
+                "api_addr",
+            ],
             required: false,
             weight: 0.8,
         },
@@ -458,13 +473,22 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
 
     let agent_id = peer_compat::value_for(
         map,
-        &["agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id"],
+        &[
+            "agent_id", "agentId", "peer_id", "peerId", "node_id", "nodeId", "id",
+        ],
     )
     .and_then(peer_compat::coerce_string)
     .ok_or_else(|| "missing agent identifier".to_string())?;
     let ts_ms = peer_compat::value_for(
         map,
-        &["ts_ms", "timestamp_ms", "timestamp", "ts", "seen_ms", "updated_ms"],
+        &[
+            "ts_ms",
+            "timestamp_ms",
+            "timestamp",
+            "ts",
+            "seen_ms",
+            "updated_ms",
+        ],
     )
     .and_then(peer_compat::coerce_u64)
     .ok_or_else(|| "missing timestamp".to_string())?;
@@ -485,7 +509,13 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
             agent_id,
             agent_version: peer_compat::value_for(
                 map,
-                &["agent_version", "agentVersion", "version", "build_version", "buildVersion"],
+                &[
+                    "agent_version",
+                    "agentVersion",
+                    "version",
+                    "build_version",
+                    "buildVersion",
+                ],
             )
             .and_then(peer_compat::coerce_string),
             ts_ms,
@@ -504,7 +534,13 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
             .and_then(peer_compat::coerce_string),
             status_addr: peer_compat::value_for(
                 map,
-                &["status_addr", "statusAddr", "status_url", "statusUrl", "api_addr"],
+                &[
+                    "status_addr",
+                    "statusAddr",
+                    "status_url",
+                    "statusUrl",
+                    "api_addr",
+                ],
             )
             .and_then(peer_compat::coerce_string),
             ban_advertisement: peer_compat::value_for(
@@ -514,7 +550,12 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
             .and_then(parse_ban_advertisement_lossy),
             fault_advertisement: peer_compat::value_for(
                 map,
-                &["fault_advertisement", "faultAdvertisement", "fault_ad", "faults"],
+                &[
+                    "fault_advertisement",
+                    "faultAdvertisement",
+                    "fault_ad",
+                    "faults",
+                ],
             )
             .and_then(parse_fault_advertisement_lossy),
             slurm: peer_compat::value_for(map, &["slurm", "slurm_status", "slurmSnapshot"])
@@ -524,14 +565,24 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
             is_coordinator,
             coordinator_epoch: peer_compat::value_for(
                 map,
-                &["coordinator_epoch", "coordinatorEpoch", "epoch", "leader_epoch"],
+                &[
+                    "coordinator_epoch",
+                    "coordinatorEpoch",
+                    "epoch",
+                    "leader_epoch",
+                ],
             )
             .and_then(peer_compat::coerce_u64),
             score: peer_compat::value_for(map, &["score", "rank_score", "weight"])
                 .and_then(peer_compat::coerce_u64),
             prometheus_probe: peer_compat::value_for(
                 map,
-                &["prometheus_probe", "prometheusProbe", "probe", "metrics_probe"],
+                &[
+                    "prometheus_probe",
+                    "prometheusProbe",
+                    "probe",
+                    "metrics_probe",
+                ],
             )
             .and_then(parse_prometheus_probe_lossy),
         },
@@ -542,7 +593,14 @@ fn parse_announcement_lossy(payload: &[u8]) -> Result<(AgentAnnouncement, f64), 
 fn parse_capabilities_lossy(map: &Map<String, Value>) -> Option<Capabilities> {
     let source = peer_compat::object_for(
         map,
-        &["capabilities", "capability", "traits", "host", "system", "node"],
+        &[
+            "capabilities",
+            "capability",
+            "traits",
+            "host",
+            "system",
+            "node",
+        ],
     )
     .unwrap_or_else(|| map.clone());
 
@@ -552,7 +610,14 @@ fn parse_capabilities_lossy(map: &Map<String, Value>) -> Option<Capabilities> {
         .and_then(peer_compat::coerce_string)?;
     let cpu_cores = peer_compat::value_for(
         &source,
-        &["cpu_cores", "cpuCores", "cores", "cpu_count", "cpuCount", "cpus"],
+        &[
+            "cpu_cores",
+            "cpuCores",
+            "cores",
+            "cpu_count",
+            "cpuCount",
+            "cpus",
+        ],
     )
     .and_then(peer_compat::coerce_usize)
     .unwrap_or(1);
@@ -561,7 +626,13 @@ fn parse_capabilities_lossy(map: &Map<String, Value>) -> Option<Capabilities> {
     let mut tags = Vec::new();
     if let Some(value) = peer_compat::value_for(
         &source,
-        &["tags", "labels", "roles", "capability_tags", "capabilityTags"],
+        &[
+            "tags",
+            "labels",
+            "roles",
+            "capability_tags",
+            "capabilityTags",
+        ],
     ) {
         for tag in peer_compat::coerce_string_vec(value) {
             let trimmed = tag.trim();
@@ -590,14 +661,15 @@ fn parse_ban_advertisement_lossy(value: &Value) -> Option<crate::tracey_ban::Ban
     let epoch = peer_compat::value_for(&object, &["epoch", "version", "generation"])
         .and_then(peer_compat::coerce_u64)
         .unwrap_or(0);
-    let entries = if let Some(items) = peer_compat::array_for(&object, &["entries", "bans", "items"])
-    {
-        items.into_iter()
-            .filter_map(|entry| parse_ban_entry_lossy(&entry, ts_ms))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let entries =
+        if let Some(items) = peer_compat::array_for(&object, &["entries", "bans", "items"]) {
+            items
+                .into_iter()
+                .filter_map(|entry| parse_ban_entry_lossy(&entry, ts_ms))
+                .collect()
+        } else {
+            Vec::new()
+        };
     Some(crate::tracey_ban::BanAdvertisement {
         ts_ms,
         epoch,
@@ -644,7 +716,8 @@ fn parse_fault_advertisement_lossy(
     let entries = if let Some(items) =
         peer_compat::array_for(&object, &["entries", "faults", "items", "recent_faults"])
     {
-        items.into_iter()
+        items
+            .into_iter()
             .filter_map(|entry| parse_fault_entry_lossy(&entry))
             .collect()
     } else {
@@ -673,7 +746,13 @@ fn parse_fault_entry_lossy(value: &Value) -> Option<crate::tracey_guard::FaultAd
             .and_then(peer_compat::coerce_string)?,
         probe_type: peer_compat::value_for(
             &object,
-            &["probe_type", "probeType", "probe", "fault_type", "faultType"],
+            &[
+                "probe_type",
+                "probeType",
+                "probe",
+                "fault_type",
+                "faultType",
+            ],
         )
         .and_then(peer_compat::coerce_string)?,
         state: peer_compat::value_for(&object, &["state", "status"])
@@ -721,7 +800,12 @@ fn parse_slurm_snapshot_lossy(value: &Value) -> Option<crate::slurm::SlurmSnapsh
             .unwrap_or_default(),
         controller_healthy: peer_compat::value_for(
             &object,
-            &["controller_healthy", "controllerHealthy", "healthy", "ready"],
+            &[
+                "controller_healthy",
+                "controllerHealthy",
+                "healthy",
+                "ready",
+            ],
         )
         .and_then(peer_compat::coerce_bool)
         .unwrap_or(false),
@@ -780,7 +864,12 @@ fn parse_prometheus_probe_lossy(value: &Value) -> Option<PrometheusProbe> {
         .unwrap_or(0),
         bandwidth_mbps: peer_compat::value_for(
             &object,
-            &["bandwidth_mbps", "bandwidthMbps", "bandwidth", "throughput_mbps"],
+            &[
+                "bandwidth_mbps",
+                "bandwidthMbps",
+                "bandwidth",
+                "throughput_mbps",
+            ],
         )
         .and_then(peer_compat::coerce_f64)
         .unwrap_or(0.0),

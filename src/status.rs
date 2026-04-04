@@ -423,8 +423,8 @@ fn parse_proxy_snapshot(body: &str) -> Result<StatusSnapshot, ProxySnapshotParse
     let snapshot = match serde_json::from_str::<StatusSnapshot>(body) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            let (snapshot, affinity) =
-                parse_proxy_snapshot_lossy(body).map_err(|_| ProxySnapshotParseError::Syntax(err))?;
+            let (snapshot, affinity) = parse_proxy_snapshot_lossy(body)
+                .map_err(|_| ProxySnapshotParseError::Syntax(err))?;
             tracing::info!(affinity, "proxy status payload recovered with fuzzy parser");
             snapshot
         }
@@ -471,18 +471,15 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
         .ok_or_else(|| "payload did not resemble a Tracey status snapshot".to_string())?;
     let map = matched.map;
 
-    let agent_id = peer_compat::value_for(
-        map,
-        &["agent_id", "agentId", "node_id", "nodeId", "id"],
-    )
-    .and_then(peer_compat::coerce_string)
-    .ok_or_else(|| "missing agent identifier".to_string())?;
+    let agent_id = peer_compat::value_for(map, &["agent_id", "agentId", "node_id", "nodeId", "id"])
+        .and_then(peer_compat::coerce_string)
+        .ok_or_else(|| "missing agent identifier".to_string())?;
 
     let posture = peer_compat::value_for(map, &["posture", "mode"])
         .and_then(peer_compat::coerce_string)
         .unwrap_or_else(|| "Balanced".to_string());
-    let status = peer_compat::value_for(map, &["status", "health"])
-        .and_then(peer_compat::coerce_string);
+    let status =
+        peer_compat::value_for(map, &["status", "health"]).and_then(peer_compat::coerce_string);
     let decision_threshold = peer_compat::value_for(
         map,
         &[
@@ -546,7 +543,11 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             .and_then(peer_compat::coerce_u64),
             is_prometheus_exporter: peer_compat::value_for(
                 map,
-                &["is_prometheus_exporter", "isPrometheusExporter", "prometheus_exporter"],
+                &[
+                    "is_prometheus_exporter",
+                    "isPrometheusExporter",
+                    "prometheus_exporter",
+                ],
             )
             .and_then(peer_compat::coerce_bool)
             .unwrap_or(false),
@@ -621,12 +622,9 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             )
             .and_then(peer_compat::coerce_bool)
             .unwrap_or(false),
-            shutdown_enabled: peer_compat::value_for(
-                map,
-                &["shutdown_enabled", "shutdownEnabled"],
-            )
-            .and_then(peer_compat::coerce_bool)
-            .unwrap_or(false),
+            shutdown_enabled: peer_compat::value_for(map, &["shutdown_enabled", "shutdownEnabled"])
+                .and_then(peer_compat::coerce_bool)
+                .unwrap_or(false),
             update_enabled: peer_compat::value_for(map, &["update_enabled", "updateEnabled"])
                 .and_then(peer_compat::coerce_bool)
                 .unwrap_or(false),
@@ -650,7 +648,11 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             .unwrap_or(0),
             tracey_ban_remote_bans: peer_compat::value_for(
                 map,
-                &["tracey_ban_remote_bans", "traceyBanRemoteBans", "remote_bans"],
+                &[
+                    "tracey_ban_remote_bans",
+                    "traceyBanRemoteBans",
+                    "remote_bans",
+                ],
             )
             .and_then(peer_compat::coerce_usize)
             .unwrap_or(0),
@@ -666,13 +668,21 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             .unwrap_or(0),
             tracey_ban_local_entries: peer_compat::value_for(
                 map,
-                &["tracey_ban_local_entries", "traceyBanLocalEntries", "local_entries"],
+                &[
+                    "tracey_ban_local_entries",
+                    "traceyBanLocalEntries",
+                    "local_entries",
+                ],
             )
             .map(peer_compat::coerce_string_vec)
             .unwrap_or_default(),
             tracey_ban_remote_entries: peer_compat::value_for(
                 map,
-                &["tracey_ban_remote_entries", "traceyBanRemoteEntries", "remote_entries"],
+                &[
+                    "tracey_ban_remote_entries",
+                    "traceyBanRemoteEntries",
+                    "remote_entries",
+                ],
             )
             .map(peer_compat::coerce_string_vec)
             .unwrap_or_default(),

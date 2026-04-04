@@ -64,9 +64,7 @@ pub(crate) fn value_for<'a>(map: &'a Map<String, Value>, aliases: &[&str]) -> Op
             .iter()
             .map(|alias| key_similarity(key, alias))
             .fold(0.0, f64::max);
-        if score >= FIELD_MATCH_THRESHOLD
-            && best.is_none_or(|(_, best_score)| score > best_score)
-        {
+        if score >= FIELD_MATCH_THRESHOLD && best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((value, score));
         }
     }
@@ -152,7 +150,12 @@ pub(crate) fn coerce_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
             .as_u64()
-            .or_else(|| number.as_i64().filter(|value| *value >= 0).map(|value| value as u64))
+            .or_else(|| {
+                number
+                    .as_i64()
+                    .filter(|value| *value >= 0)
+                    .map(|value| value as u64)
+            })
             .or_else(|| {
                 number
                     .as_f64()
@@ -161,10 +164,12 @@ pub(crate) fn coerce_u64(value: &Value) -> Option<u64> {
             }),
         Value::String(text) => {
             let trimmed = text.trim().trim_end_matches("ms");
-            trimmed
-                .parse::<u64>()
-                .ok()
-                .or_else(|| trimmed.parse::<f64>().ok().map(|value| value.round() as u64))
+            trimmed.parse::<u64>().ok().or_else(|| {
+                trimmed
+                    .parse::<f64>()
+                    .ok()
+                    .map(|value| value.round() as u64)
+            })
         }
         Value::Bool(value) => Some(u64::from(*value)),
         _ => None,
@@ -187,7 +192,11 @@ pub(crate) fn coerce_f64(value: &Value) -> Option<f64> {
         Value::String(text) => {
             let trimmed = text.trim();
             if let Some(percent) = trimmed.strip_suffix('%') {
-                percent.trim().parse::<f64>().ok().map(|value| value / 100.0)
+                percent
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|value| value / 100.0)
             } else {
                 trimmed.parse::<f64>().ok()
             }

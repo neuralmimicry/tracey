@@ -679,7 +679,13 @@ fn parse_forward_batch_lossy(payload: &[u8]) -> Result<(ForwardBatch, f64), Stri
     let root = peer_compat::parse_bytes(payload).map_err(|err| err.to_string())?;
     let fields = [
         SchemaField {
-            aliases: &["agent_id", "agentId", "source_agent", "sourceAgent", "node_id"],
+            aliases: &[
+                "agent_id",
+                "agentId",
+                "source_agent",
+                "sourceAgent",
+                "node_id",
+            ],
             required: true,
             weight: 2.0,
         },
@@ -704,7 +710,13 @@ fn parse_forward_batch_lossy(payload: &[u8]) -> Result<(ForwardBatch, f64), Stri
     let map = matched.map;
     let agent_id = peer_compat::value_for(
         map,
-        &["agent_id", "agentId", "source_agent", "sourceAgent", "node_id"],
+        &[
+            "agent_id",
+            "agentId",
+            "source_agent",
+            "sourceAgent",
+            "node_id",
+        ],
     )
     .and_then(peer_compat::coerce_string)
     .ok_or_else(|| "missing agent identifier".to_string())?;
@@ -757,18 +769,23 @@ fn parse_pertinent_record_lossy(
             .and_then(peer_compat::coerce_unit_interval)
             .unwrap_or(0.5);
 
-    let source_name = peer_compat::value_for(
-        &source,
-        &["source", "origin", "producer", "component"],
-    )
-    .and_then(peer_compat::coerce_string)
-    .unwrap_or_else(|| "remote".to_string());
+    let source_name =
+        peer_compat::value_for(&source, &["source", "origin", "producer", "component"])
+            .and_then(peer_compat::coerce_string)
+            .unwrap_or_else(|| "remote".to_string());
     let category = peer_compat::value_for(&source, &["category", "record_type", "recordType"])
         .and_then(peer_compat::coerce_string)
         .unwrap_or_else(|| infer_record_category(&source_name, risk).to_string());
     let detail = peer_compat::value_for(
         &source,
-        &["detail", "message", "metric", "name", "reason", "probe_type"],
+        &[
+            "detail",
+            "message",
+            "metric",
+            "name",
+            "reason",
+            "probe_type",
+        ],
     )
     .and_then(peer_compat::coerce_string)
     .unwrap_or_else(|| category.clone());
@@ -776,7 +793,13 @@ fn parse_pertinent_record_lossy(
     Some(PertinentLogRecord {
         ts_ms: peer_compat::value_for(
             &source,
-            &["ts_ms", "timestamp_ms", "timestamp", "event_ts_ms", "sampled_at_ms"],
+            &[
+                "ts_ms",
+                "timestamp_ms",
+                "timestamp",
+                "event_ts_ms",
+                "sampled_at_ms",
+            ],
         )
         .and_then(peer_compat::coerce_u64)
         .unwrap_or(batch_ts_ms),
@@ -815,11 +838,7 @@ fn infer_record_category(source: &str, risk: f64) -> &'static str {
 }
 
 fn infer_action(risk: f64) -> &'static str {
-    if risk >= 0.8 {
-        "alert"
-    } else {
-        "monitor"
-    }
+    if risk >= 0.8 { "alert" } else { "monitor" }
 }
 
 fn infer_severity(risk: f64) -> &'static str {

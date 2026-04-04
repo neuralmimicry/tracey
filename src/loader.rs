@@ -1285,7 +1285,12 @@ fn parse_loader_announcement_lossy(payload: &[u8]) -> Result<(LoaderAnnouncement
         .unwrap_or(UpdateChannel::Production);
     let distributable = peer_compat::value_for(
         map,
-        &["distributable", "can_distribute", "shareable", "production_ready"],
+        &[
+            "distributable",
+            "can_distribute",
+            "shareable",
+            "production_ready",
+        ],
     )
     .and_then(peer_compat::coerce_bool)
     .unwrap_or_else(|| channel.distributable());
@@ -1700,8 +1705,9 @@ async fn fetch_peer_core(
             .bytes()
             .await
             .map_err(|err| PeerFetchError::Transport(err.to_string()))?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|err| PeerFetchError::Verification(format!("signature body was not utf-8: {err}")))
+        String::from_utf8(bytes.to_vec()).map_err(|err| {
+            PeerFetchError::Verification(format!("signature body was not utf-8: {err}"))
+        })
     };
     let bundle_request = async {
         let response = client
@@ -1873,7 +1879,11 @@ async fn apply_fetched_core(
                     artifact_blake3: Some(staged_blake3.clone()),
                     classification: "handoff_failure".to_string(),
                     reason: format!("activated core never became ready: {err}"),
-                    provider_risk: if provenance.peer_agent_id.is_some() { 0.75 } else { 0.0 },
+                    provider_risk: if provenance.peer_agent_id.is_some() {
+                        0.75
+                    } else {
+                        0.0
+                    },
                     artifact_risk: 0.75,
                 })
                 .await;
@@ -2447,8 +2457,7 @@ mod tests {
             transfer_addr: Some("http://10.0.0.42:47988".to_string()),
             signature: String::new(),
         };
-        announcement.signature =
-            sign_loader_announcement_legacy(&announcement, "shared-key", true);
+        announcement.signature = sign_loader_announcement_legacy(&announcement, "shared-key", true);
         assert!(verify_loader_announcement_signature(
             &announcement,
             "shared-key"
