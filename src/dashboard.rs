@@ -1,5 +1,6 @@
 use crate::autoscaler::ContinuumAutoscalerSnapshot;
 use crate::config::{Config, StatusConfig, StorageConfig};
+use crate::continuum_telemetry::ContinuumTelemetrySnapshot;
 use crate::event::{Event, EventKind, Severity, now_ms};
 use crate::governance::GovernanceUpdate;
 use crate::location::{AgentLocationSnapshot, infer_single_agent_location};
@@ -40,6 +41,10 @@ const MAX_GPU_ROWS: usize = 4;
 const MAX_DISK_ROWS: usize = 3;
 const MAX_BAN_LINES: usize = 6;
 const MAX_CLUSTER_PRESSURE: usize = 3;
+const MAX_TELEMETRY_GPU_ROWS: usize = 6;
+const MAX_TELEMETRY_ACTION_ROWS: usize = 8;
+const MAX_TELEMETRY_EXECUTION_ROWS: usize = 8;
+const MAX_TELEMETRY_SENSOR_ROWS: usize = 4;
 const MIN_TUI_WIDTH: u16 = 120;
 const MIN_TUI_HEIGHT: u16 = 33;
 
@@ -83,6 +88,7 @@ fn run_dashboard(args: Vec<String>, invocation: &str) -> Result<(), Box<dyn Erro
                     KeyCode::BackTab | KeyCode::Left => app.previous_page(),
                     KeyCode::Char('1') => app.set_page(DashboardPage::Overview),
                     KeyCode::Char('2') => app.set_page(DashboardPage::Locations),
+                    KeyCode::Char('3') => app.set_page(DashboardPage::Telemetry),
                     _ => {}
                 }
             }
@@ -442,7 +448,7 @@ fn file_name_of(value: &str) -> String {
 
 fn print_help(config: &Config, invocation: &str) {
     println!(
-        "{invocation}\n\nUsage:\n  {invocation} [--status <url>] [--bearer <token>] [--log-path <path> | --no-log]\n             [--refresh-ms <ms>] [--tail-bytes <bytes>]\n\nDefaults:\n  status url : {}\n  log path   : {}\n  refresh    : {}ms\n  tail bytes : {}\n\nNotes:\n  auto attach: prefers a reachable local tracey agent when --status is omitted\n  transport  : loopback targets default to http, other no-scheme targets default to https\n  header     : shows the active status transport as 🔒 https or 🔓 http\n  location   : page 2 renders the inferred cluster map and location evidence\n  minimum tty: {}x{}\n\nKeys:\n  q, Esc     quit\n  r          refresh immediately\n  Tab, ←/→   switch page\n  1 / 2      jump to overview or locations\n",
+        "{invocation}\n\nUsage:\n  {invocation} [--status <url>] [--bearer <token>] [--log-path <path> | --no-log]\n             [--refresh-ms <ms>] [--tail-bytes <bytes>]\n\nDefaults:\n  status url : {}\n  log path   : {}\n  refresh    : {}ms\n  tail bytes : {}\n\nNotes:\n  auto attach: prefers a reachable local tracey agent when --status is omitted\n  transport  : loopback targets default to http, other no-scheme targets default to https\n  header     : shows the active status transport as 🔒 https or 🔓 http\n  location   : page 2 renders the inferred cluster map and location evidence\n  telemetry  : page 3 renders Continuum host, gpu, action, and probe telemetry\n  minimum tty: {}x{}\n\nKeys:\n  q, Esc     quit\n  r          refresh immediately\n  Tab, ←/→   switch page\n  1 / 2 / 3  jump to overview, locations, or telemetry\n",
         default_status_url(config),
         config.storage.log_path.display(),
         DEFAULT_REFRESH_MS,
@@ -581,13 +587,15 @@ struct TraceyTopApp {
 enum DashboardPage {
     Overview,
     Locations,
+    Telemetry,
 }
 
 impl DashboardPage {
     fn next(self) -> Self {
         match self {
             Self::Overview => Self::Locations,
-            Self::Locations => Self::Overview,
+            Self::Locations => Self::Telemetry,
+            Self::Telemetry => Self::Overview,
         }
     }
 
@@ -599,13 +607,15 @@ impl DashboardPage {
         match self {
             Self::Overview => "overview",
             Self::Locations => "locations",
+            Self::Telemetry => "telemetry",
         }
     }
 
     fn shortcut(self) -> &'static str {
         match self {
-            Self::Overview => "1/2",
-            Self::Locations => "2/2",
+            Self::Overview => "1/3",
+            Self::Locations => "2/3",
+            Self::Telemetry => "3/3",
         }
     }
 }
@@ -731,6 +741,8 @@ struct StatusSnapshot {
     #[serde(default)]
     continuum_autoscaler: Option<ContinuumAutoscalerSnapshot>,
     #[serde(default)]
+    continuum_telemetry: Option<ContinuumTelemetrySnapshot>,
+    #[serde(default)]
     location: AgentLocationSnapshot,
     #[serde(default)]
     peer_locations: Vec<AgentLocationSnapshot>,
@@ -802,7 +814,7 @@ struct ActivityRow {
     tone: Tone,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Tone {
     Good,
     Warn,
@@ -1390,6 +1402,7 @@ fn draw_ui(frame: &mut Frame, app: &TraceyTopApp) {
     match app.page {
         DashboardPage::Overview => render_overview_page(frame, area, app, theme),
         DashboardPage::Locations => render_locations_page(frame, area, app, theme),
+        DashboardPage::Telemetry => render_telemetry_page(frame, area, app, theme),
     }
 }
 
@@ -1465,6 +1478,825 @@ fn render_locations_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
     render_location_summary_panel(frame, summary[1], app, theme);
     render_location_map_panel(frame, outer[3], app, theme);
     render_footer(frame, outer[4], app, theme);
+}
+
+fn render_telemetry_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Min(9),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_header(frame, outer[0], app, theme);
+
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(29),
+            Constraint::Percentage(33),
+            Constraint::Percentage(38),
+        ])
+        .split(outer[1]);
+    render_telemetry_identity_panel(frame, top[0], app, theme);
+    render_telemetry_server_panel(frame, top[1], app, theme);
+    render_telemetry_guard_detail_panel(frame, top[2], app, theme);
+
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(28),
+            Constraint::Percentage(38),
+        ])
+        .split(outer[2]);
+    render_telemetry_sensor_panel(frame, middle[0], app, theme);
+    render_telemetry_storage_panel(frame, middle[1], app, theme);
+    render_telemetry_gpu_panel(frame, middle[2], app, theme);
+
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(outer[3]);
+    render_telemetry_actions_panel(frame, bottom[0], app, theme);
+    render_telemetry_execution_panel(frame, bottom[1], app, theme);
+
+    render_footer(frame, outer[4], app, theme);
+}
+
+fn render_telemetry_identity_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let block = panel_block(" continuum identity ", theme);
+    let Some(status) = &app.status else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "waiting for status snapshot")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+    let Some(telemetry) = status.continuum_telemetry.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "continuum telemetry unavailable")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let identity = &telemetry.identity;
+    let mut lines = Vec::new();
+    lines.push(kv_line(
+        theme,
+        "host",
+        if identity.host.trim().is_empty() {
+            status.agent_id.as_str()
+        } else {
+            identity.host.as_str()
+        },
+        Some(Tone::Info),
+    ));
+    lines.push(kv_line(
+        theme,
+        "agent",
+        &status.agent_id,
+        Some(Tone::Neutral),
+    ));
+    if let Some(zone) = identity.zone.as_deref() {
+        lines.push(kv_line(theme, "zone", zone, Some(Tone::Neutral)));
+    }
+    if let Some(rack) = identity.rack.as_deref() {
+        lines.push(kv_line(theme, "rack", rack, Some(Tone::Neutral)));
+    }
+    if let Some(row) = identity.row.as_deref() {
+        lines.push(kv_line(theme, "row", row, Some(Tone::Neutral)));
+    }
+    if let Some(site) = identity.site.as_deref() {
+        lines.push(kv_line(theme, "site", site, Some(Tone::Neutral)));
+    }
+    if let Some(building) = identity.building.as_deref() {
+        lines.push(kv_line(theme, "building", building, Some(Tone::Neutral)));
+    }
+    if let Some(room) = identity.room.as_deref() {
+        lines.push(kv_line(theme, "room", room, Some(Tone::Neutral)));
+    }
+    if let Some(network) = identity.network.as_deref() {
+        lines.push(kv_line(theme, "network", network, Some(Tone::Neutral)));
+    }
+    lines.push(kv_line(
+        theme,
+        "telemetry",
+        &human_age_ms(now_ms().saturating_sub(telemetry.ts_ms)),
+        Some(if now_ms().saturating_sub(telemetry.ts_ms) <= 5_000 {
+            Tone::Good
+        } else {
+            Tone::Warn
+        }),
+    ));
+    lines.push(kv_line(
+        theme,
+        "estate",
+        &format!(
+            "{} gpus / {} actions",
+            telemetry.gpus.len(),
+            telemetry.recent_actions.len()
+        ),
+        Some(Tone::Info),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_telemetry_server_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let block = panel_block(" server summary ", theme);
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "continuum telemetry unavailable")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let server = &telemetry.server;
+    let cpu_tone = tone_for_pct(server.cpu_usage_pct.unwrap_or_default());
+    let mem_tone = tone_for_pct(server.mem_used_pct.unwrap_or_default());
+    let temp_tone = tone_for_temp(server.gpu_temperature_max_c.unwrap_or_default());
+    let ecc_tone = if server.ecc.uncorrected_total > 0 {
+        Tone::Warn
+    } else {
+        Tone::Good
+    };
+    let autonomy_tone = tone_for_ratio(server.autonomy_risk.unwrap_or_default());
+
+    let lines = vec![
+        kv_line(
+            theme,
+            "cpu / mem",
+            &format!(
+                "{} / {}",
+                format_opt_pct(server.cpu_usage_pct),
+                format_opt_pct(server.mem_used_pct)
+            ),
+            Some(if cpu_tone == Tone::Warn || mem_tone == Tone::Warn {
+                Tone::Warn
+            } else {
+                Tone::Info
+            }),
+        ),
+        kv_line(
+            theme,
+            "app / swap",
+            &format!(
+                "{} / {}",
+                format_opt_pct(server.mem_app_used_pct),
+                format_opt_pct(server.swap_used_pct)
+            ),
+            Some(tone_for_pct(server.swap_used_pct.unwrap_or_default())),
+        ),
+        kv_line(
+            theme,
+            "network",
+            &format!(
+                "rx {} tx {}",
+                format_opt_bps(server.net_rx_bps),
+                format_opt_bps(server.net_tx_bps)
+            ),
+            Some(Tone::Neutral),
+        ),
+        kv_line(
+            theme,
+            "gpu estate",
+            &format!(
+                "util {} temp {} power {}",
+                format_opt_pct(server.gpu_utilization_avg_pct),
+                format_opt_temp(server.gpu_temperature_max_c),
+                format_opt_power(server.gpu_power_total_w)
+            ),
+            Some(temp_tone),
+        ),
+        kv_line(
+            theme,
+            "alerts",
+            &format!(
+                "thermal={} fan={} actions={}",
+                server.thermal_alerts, server.fan_alerts, server.recent_action_count
+            ),
+            Some(if server.thermal_alerts > 0 || server.fan_alerts > 0 {
+                Tone::Warn
+            } else {
+                Tone::Good
+            }),
+        ),
+        kv_line(
+            theme,
+            "ecc",
+            &format!(
+                "corr={} uncorr={}",
+                server.ecc.corrected_total, server.ecc.uncorrected_total
+            ),
+            Some(ecc_tone),
+        ),
+        kv_line(
+            theme,
+            "autonomy",
+            &format!(
+                "risk {} {}",
+                format_opt_ratio_pct(server.autonomy_risk),
+                server.autonomy_action.as_deref().unwrap_or("idle")
+            ),
+            Some(autonomy_tone),
+        ),
+        kv_line(
+            theme,
+            "sensors",
+            &format!(
+                "{} thermal / {} fan / {} power",
+                telemetry.server.thermal_sensors.len(),
+                telemetry.server.fan_sensors.len(),
+                telemetry.server.power_sensors.len()
+            ),
+            Some(Tone::Neutral),
+        ),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_telemetry_guard_detail_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let block = panel_block(" guard detail ", theme);
+    let Some(status) = &app.status else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "waiting for status snapshot")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+    let Some(guard) = status.tracey_guard.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "tracey guard snapshot unavailable")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = Vec::new();
+    lines.push(kv_line(
+        theme,
+        "mode",
+        &format!(
+            "{} deep={} tmr={} budget={:.1}%",
+            bool_word(guard.summary.enabled),
+            bool_word(guard.summary.deep_dive),
+            bool_word(guard.control.tmr_enabled),
+            guard.summary.overhead_budget_pct
+        ),
+        Some(if guard.summary.enabled {
+            Tone::Good
+        } else {
+            Tone::Warn
+        }),
+    ));
+    lines.push(kv_line(
+        theme,
+        "scheduler",
+        &format!(
+            "{}ms / {}ms sig {:.2}",
+            guard.summary.scheduler_poll_ms,
+            guard.summary.scheduler_target_poll_ms,
+            guard.summary.scheduler_signal
+        ),
+        Some(Tone::Info),
+    ));
+    lines.push(kv_line(
+        theme,
+        "devices",
+        &format!(
+            "{} total {} healthy {} suspect {} quarantine",
+            guard.summary.total_devices,
+            guard.summary.healthy_devices,
+            guard.summary.suspect_devices,
+            guard.summary.quarantined_devices
+        ),
+        Some(if guard.summary.quarantined_devices > 0 {
+            Tone::Warn
+        } else {
+            Tone::Good
+        }),
+    ));
+    lines.push(kv_line(
+        theme,
+        "runtime",
+        &format!(
+            "exec={} fail={} err={} timeout={}",
+            guard.summary.total_executions,
+            guard.summary.total_failures,
+            guard.summary.total_errors,
+            guard.summary.total_timeouts
+        ),
+        Some(if guard.summary.total_failures > 0
+            || guard.summary.total_errors > 0
+            || guard.summary.total_timeouts > 0
+        {
+            Tone::Warn
+        } else {
+            Tone::Good
+        }),
+    ));
+    lines.push(kv_line(
+        theme,
+        "fault intel",
+        &format!(
+            "local={} remote={} support={}",
+            guard.recent_faults.len(),
+            guard.remote_faults.len(),
+            guard.summary.remote_fault_support
+        ),
+        Some(if !guard.recent_faults.is_empty() || !guard.remote_faults.is_empty() {
+            Tone::Warn
+        } else {
+            Tone::Good
+        }),
+    ));
+
+    if let Some((name, counters)) = guard
+        .summary
+        .probes
+        .iter()
+        .max_by(|left, right| {
+            left.1
+                .fail
+                .cmp(&right.1.fail)
+                .then_with(|| left.1.executions.cmp(&right.1.executions))
+        })
+    {
+        lines.push(kv_line(
+            theme,
+            "hot probe",
+            &format!(
+                "{} pass={} fail={} risk={:.2}",
+                truncate(name, 10),
+                counters.pass,
+                counters.fail,
+                counters.last_risk
+            ),
+            Some(if counters.fail > 0 { Tone::Warn } else { Tone::Good }),
+        ));
+    }
+
+    if let Some(gpu) = highest_risk_guard_gpu(guard) {
+        lines.push(kv_line(
+            theme,
+            "hot gpu",
+            &format!(
+                "{} {:?} risk={:.2} conf={:.2}",
+                truncate(&gpu.gpu_id, 10),
+                gpu.state,
+                gpu.last_risk,
+                gpu.last_confidence
+            ),
+            Some(tone_for_guard_state(&format!("{:?}", gpu.state))),
+        ));
+        lines.push(kv_line(
+            theme,
+            "reason",
+            &format!(
+                "sm={} probe={} {}",
+                gpu.sm_count,
+                human_age_ms(now_ms().saturating_sub(gpu.last_probe_ms)),
+                truncate(&gpu.last_reason, 24)
+            ),
+            Some(Tone::Neutral),
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_telemetry_sensor_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let block = panel_block(" thermal / fan / power ", theme);
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "continuum telemetry unavailable")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let rows_per_section = (MAX_TELEMETRY_SENSOR_ROWS / 2).max(1);
+    let mut lines = Vec::new();
+    lines.push(section_line(theme, "thermals"));
+    if telemetry.server.thermal_sensors.is_empty() {
+        lines.push(kv_line(theme, "temp", "none reported", Some(Tone::Neutral)));
+    } else {
+        for sensor in telemetry.server.thermal_sensors.iter().take(rows_per_section) {
+            lines.push(kv_line(
+                theme,
+                &truncate(sensor.label.as_str(), 11),
+                &format!("{} {}", format_temp(sensor.temp_c), sensor.severity),
+                Some(tone_for_guard_state(&sensor.severity)),
+            ));
+        }
+    }
+
+    lines.push(section_line(theme, "fans"));
+    if telemetry.server.fan_sensors.is_empty() {
+        lines.push(kv_line(theme, "fan", "none reported", Some(Tone::Neutral)));
+    } else {
+        for sensor in telemetry.server.fan_sensors.iter().take(rows_per_section) {
+            let rpm = sensor
+                .rpm
+                .map(|value| format!("{value}rpm"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let pwm = sensor
+                .pwm_percent
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "n/a".to_string());
+            lines.push(kv_line(
+                theme,
+                &truncate(sensor.label.as_str(), 11),
+                &format!("{rpm} pwm {pwm}"),
+                Some(tone_for_guard_state(&sensor.severity)),
+            ));
+        }
+    }
+
+    lines.push(section_line(theme, "power"));
+    if telemetry.server.power_sensors.is_empty() {
+        lines.push(kv_line(theme, "power", "none reported", Some(Tone::Neutral)));
+    } else {
+        for sensor in telemetry.server.power_sensors.iter().take(rows_per_section) {
+            lines.push(kv_line(
+                theme,
+                &truncate(sensor.label.as_str(), 11),
+                &format!("{} {}", format_power(sensor.power_w), sensor.severity),
+                Some(tone_for_guard_state(&sensor.severity)),
+            ));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_telemetry_storage_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let block = panel_block(" storage / process ", theme);
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new(vec![error_line(theme, "continuum telemetry unavailable")])
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = Vec::new();
+    lines.push(section_line(theme, "disks"));
+    if telemetry.server.disks.is_empty() {
+        lines.push(kv_line(theme, "disk", "none reported", Some(Tone::Neutral)));
+    } else {
+        for disk in telemetry.server.disks.iter().take(2) {
+            lines.push(kv_line(
+                theme,
+                &truncate(&disk.mount, 11),
+                &format!(
+                    "{} / {} {}",
+                    disk.used_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    disk.total_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    disk.used_ratio
+                        .map(|value| format!("{:.0}%", value * 100.0))
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+                Some(if disk.used_ratio.unwrap_or_default() >= 0.85 {
+                    Tone::Warn
+                } else {
+                    Tone::Neutral
+                }),
+            ));
+        }
+    }
+
+    lines.push(section_line(theme, "procs"));
+    if telemetry.server.processes.is_empty() {
+        lines.push(kv_line(theme, "proc", "none reported", Some(Tone::Neutral)));
+    } else {
+        for process in telemetry.server.processes.iter().take(2) {
+            lines.push(kv_line(
+                theme,
+                &truncate(&process.name, 11),
+                &format!(
+                    "cpu {} mem {}",
+                    process
+                        .cpu_pct
+                        .map(|value| format!("{value:.0}%"))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    process
+                        .mem_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+                Some(tone_for_pct(process.cpu_pct.unwrap_or_default())),
+            ));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_telemetry_gpu_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let block = panel_block(" gpu estate ", theme);
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new("continuum telemetry unavailable")
+                .block(block)
+                .style(Style::default().fg(theme.bad)),
+            area,
+        );
+        return;
+    };
+    if telemetry.gpus.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no gpu telemetry reported")
+                .block(block)
+                .style(Style::default().fg(theme.muted)),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(vec!["gpu", "state", "util", "temp", "mem", "risk"]).style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = telemetry.gpus.iter().take(MAX_TELEMETRY_GPU_ROWS).map(|gpu| {
+        let state = gpu
+            .guard_state
+            .as_deref()
+            .unwrap_or_else(|| gpu.source.as_deref().unwrap_or("ok"));
+        Row::new(vec![
+            Cell::from(truncate(&gpu.gpu_id, 10)),
+            Cell::from(truncate(state, 10)),
+            Cell::from(format_opt_pct(gpu.util_pct)),
+            Cell::from(format_opt_temp(gpu.temp_c)),
+            Cell::from(format!(
+                "{} / {}",
+                gpu.mem_used_bytes
+                    .map(|value| format_bytes(value as f64))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                gpu.mem_total_bytes
+                    .map(|value| format_bytes(value as f64))
+                    .unwrap_or_else(|| "n/a".to_string())
+            )),
+            Cell::from(format!(
+                "{} / {}",
+                format_opt_ratio_pct(gpu.last_guard_risk),
+                format_opt_ratio_pct(gpu.last_guard_confidence)
+            )),
+        ])
+        .style(Style::default().fg(tone_color(tone_for_guard_state(state), theme)))
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(17),
+            Constraint::Min(9),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn render_telemetry_actions_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let block = panel_block(" recent actions ", theme);
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new("continuum telemetry unavailable")
+                .block(block)
+                .style(Style::default().fg(theme.bad)),
+            area,
+        );
+        return;
+    };
+    if telemetry.recent_actions.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no autonomous or hardware actions recorded")
+                .block(block)
+                .style(Style::default().fg(theme.muted)),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(vec!["age", "action", "gpu", "detail"]).style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = telemetry
+        .recent_actions
+        .iter()
+        .take(MAX_TELEMETRY_ACTION_ROWS)
+        .map(|action| {
+            Row::new(vec![
+                Cell::from(human_age_ms(now_ms().saturating_sub(action.ts_ms))),
+                Cell::from(truncate(
+                    &format!("{} {}", action.category, action.action),
+                    18,
+                )),
+                Cell::from(truncate(
+                    action.gpu_id.as_deref().unwrap_or("-"),
+                    8,
+                )),
+                Cell::from(truncate(&action.detail, 44)),
+            ])
+            .style(Style::default().fg(tone_color(
+                tone_from_text(action.tone.as_str()),
+                theme,
+            )))
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(7),
+            Constraint::Length(18),
+            Constraint::Length(8),
+            Constraint::Min(12),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn render_telemetry_execution_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TraceyTopApp,
+    theme: Theme,
+) {
+    let block = panel_block(" probe executions ", theme);
+    let Some(guard) = guard_snapshot(app) else {
+        frame.render_widget(
+            Paragraph::new("tracey guard snapshot unavailable")
+                .block(block)
+                .style(Style::default().fg(theme.bad)),
+            area,
+        );
+        return;
+    };
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(4)])
+        .split(inner);
+
+    let summary = vec![
+        Line::from(vec![
+            Span::styled("faults ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!(
+                    "local={} remote={} support={}",
+                    guard.recent_faults.len(),
+                    guard.remote_faults.len(),
+                    guard.summary.remote_fault_support
+                ),
+                Style::default().fg(if !guard.recent_faults.is_empty() {
+                    theme.warn
+                } else {
+                    theme.text
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("recent ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!(
+                    "exec={} timeline={} tmr={}",
+                    guard.recent_executions.len(),
+                    guard.timeline.len(),
+                    bool_word(guard.control.tmr_enabled)
+                ),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(summary), rows[0]);
+
+    if guard.recent_executions.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no recent probe executions").style(Style::default().fg(theme.muted)),
+            rows[1],
+        );
+        return;
+    }
+
+    let header = Row::new(vec!["age", "gpu/sm", "probe", "state", "risk", "context"]).style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table_rows = guard
+        .recent_executions
+        .iter()
+        .take(MAX_TELEMETRY_EXECUTION_ROWS)
+        .map(|execution| {
+            let probe_state = format!("{:?}", execution.probe_state).to_ascii_lowercase();
+            Row::new(vec![
+                Cell::from(human_age_ms(now_ms().saturating_sub(execution.ts_ms))),
+                Cell::from(format!(
+                    "{}:{}",
+                    truncate(&execution.gpu_id, 8),
+                    execution.sm_id
+                )),
+                Cell::from(truncate(execution.probe_type.as_str(), 10)),
+                Cell::from(truncate(&probe_state, 8)),
+                Cell::from(format!(
+                    "{} / {}",
+                    format_ratio_pct(execution.risk),
+                    format_ratio_pct(execution.confidence)
+                )),
+                Cell::from(truncate(&execution_context_summary(execution), 30)),
+            ])
+            .style(Style::default().fg(tone_color(
+                tone_from_text(&probe_state),
+                theme,
+            )))
+        });
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(7),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Min(12),
+        ],
+    )
+    .header(header)
+    .column_spacing(1);
+    frame.render_widget(table, rows[1]);
 }
 
 fn effective_self_location(app: &TraceyTopApp) -> Option<AgentLocationSnapshot> {
@@ -1579,6 +2411,14 @@ fn build_header_lines<'a>(app: &'a TraceyTopApp, theme: Theme) -> Vec<Line<'a>> 
         .as_deref()
         .unwrap_or("configured target");
     let transport = StatusTransport::from_url(&app.options.status_url);
+    let topology = status
+        .and_then(|value| value.continuum_telemetry.as_ref())
+        .map(|telemetry| {
+            let zone = telemetry.identity.zone.as_deref().unwrap_or("zone?");
+            let rack = telemetry.identity.rack.as_deref().unwrap_or("rack?");
+            format!("{zone}/{rack}")
+        })
+        .unwrap_or_else(|| "zone?/rack?".to_string());
 
     vec![
         Line::from(vec![
@@ -1606,6 +2446,9 @@ fn build_header_lines<'a>(app: &'a TraceyTopApp, theme: Theme) -> Vec<Line<'a>> 
             Span::raw("  "),
             Span::styled("role ", Style::default().fg(theme.muted)),
             Span::styled(role, Style::default().fg(theme.text)),
+            Span::raw("  "),
+            Span::styled("topology ", Style::default().fg(theme.muted)),
+            Span::styled(truncate(&topology, 16), Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             Span::styled("page ", Style::default().fg(theme.muted)),
@@ -2298,7 +3141,28 @@ fn render_workload_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if !app.log_view.process_rows.is_empty() {
+    let mut process_rows = process_rows_from_telemetry(app);
+    if process_rows.is_empty() {
+        process_rows = app.log_view.process_rows.clone();
+    }
+    process_rows.sort_by(compare_process_rows);
+    process_rows.truncate(MAX_PROCESS_ROWS);
+
+    let mut gpu_rows = gpu_rows_from_telemetry(app);
+    if gpu_rows.is_empty() {
+        gpu_rows = app.log_view.gpu_rows.clone();
+    }
+    gpu_rows.sort_by(compare_gpu_rows);
+    gpu_rows.truncate(MAX_GPU_ROWS);
+
+    let mut disk_rows = disk_rows_from_telemetry(app);
+    if disk_rows.is_empty() {
+        disk_rows = app.log_view.disk_rows.clone();
+    }
+    disk_rows.sort_by(compare_disk_rows);
+    disk_rows.truncate(MAX_DISK_ROWS);
+
+    if !process_rows.is_empty() {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(5), Constraint::Length(2)])
@@ -2308,7 +3172,7 @@ fn render_workload_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         );
-        let rows = app.log_view.process_rows.iter().map(|row| {
+        let rows = process_rows.iter().map(|row| {
             Row::new(vec![
                 Cell::from(row.pid.to_string()),
                 Cell::from(truncate(&row.name, 14)),
@@ -2352,7 +3216,7 @@ fn render_workload_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
     }
 
     let mut lines = Vec::new();
-    for gpu in &app.log_view.gpu_rows {
+    for gpu in &gpu_rows {
         lines.push(kv_line(
             theme,
             &truncate(&gpu.id, 10),
@@ -2372,7 +3236,7 @@ fn render_workload_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
             Some(Tone::Info),
         ));
     }
-    for disk in &app.log_view.disk_rows {
+    for disk in &disk_rows {
         lines.push(kv_line(
             theme,
             &truncate(&disk.mount, 10),
@@ -2410,8 +3274,20 @@ fn render_workload_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
 }
 
 fn workload_summary(app: &TraceyTopApp) -> String {
+    let mut gpu_rows = gpu_rows_from_telemetry(app);
+    if gpu_rows.is_empty() {
+        gpu_rows = app.log_view.gpu_rows.clone();
+    }
+    gpu_rows.sort_by(compare_gpu_rows);
+
+    let mut disk_rows = disk_rows_from_telemetry(app);
+    if disk_rows.is_empty() {
+        disk_rows = app.log_view.disk_rows.clone();
+    }
+    disk_rows.sort_by(compare_disk_rows);
+
     let mut summary = Vec::new();
-    if let Some(gpu) = app.log_view.gpu_rows.first() {
+    if let Some(gpu) = gpu_rows.first() {
         summary.push(format!(
             "gpu {} util {} temp {}",
             gpu.id,
@@ -2423,7 +3299,7 @@ fn workload_summary(app: &TraceyTopApp) -> String {
                 .unwrap_or_else(|| "n/a".to_string())
         ));
     }
-    if let Some(disk) = app.log_view.disk_rows.first() {
+    if let Some(disk) = disk_rows.first() {
         summary.push(format!(
             "disk {} {}",
             disk.mount,
@@ -2832,6 +3708,232 @@ fn same_location_guess(
     )
 }
 
+fn telemetry_snapshot(app: &TraceyTopApp) -> Option<&ContinuumTelemetrySnapshot> {
+    app.status
+        .as_ref()
+        .and_then(|status| status.continuum_telemetry.as_ref())
+}
+
+fn guard_snapshot(app: &TraceyTopApp) -> Option<&TraceyGuardStatusSnapshot> {
+    app.status
+        .as_ref()
+        .and_then(|status| status.tracey_guard.as_ref())
+}
+
+fn highest_risk_guard_gpu(
+    guard: &TraceyGuardStatusSnapshot,
+) -> Option<&crate::tracey_guard::GpuHealthView> {
+    guard.gpu_health.iter().max_by(|left, right| {
+        let left_score = left.last_risk + (left.consecutive_failures as f64 * 0.05);
+        let right_score = right.last_risk + (right.consecutive_failures as f64 * 0.05);
+        left_score
+            .partial_cmp(&right_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.last_probe_ms.cmp(&right.last_probe_ms))
+    })
+}
+
+fn tone_from_text(value: &str) -> Tone {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "good" | "healthy" | "pass" | "ok" | "nominal" | "on" => Tone::Good,
+        "warn" | "warning" | "suspect" | "degraded" | "timeout" | "deep_test"
+        | "deep-test" => Tone::Warn,
+        "bad" | "error" | "fail" | "failed" | "critical" | "high" | "quarantined"
+        | "condemned" | "shutdown" | "isolate" | "offline" => Tone::Bad,
+        "info" | "medium" | "observability" | "operator" | "automation" | "system"
+        | "network" => Tone::Info,
+        _ => Tone::Neutral,
+    }
+}
+
+fn tone_for_guard_state(value: &str) -> Tone {
+    tone_from_text(value)
+}
+
+fn tone_for_pct(value: f64) -> Tone {
+    if value >= 90.0 {
+        Tone::Bad
+    } else if value >= 75.0 {
+        Tone::Warn
+    } else if value > 0.0 {
+        Tone::Info
+    } else {
+        Tone::Neutral
+    }
+}
+
+fn tone_for_temp(value: f64) -> Tone {
+    if value >= 88.0 {
+        Tone::Bad
+    } else if value >= 78.0 {
+        Tone::Warn
+    } else if value > 0.0 {
+        Tone::Info
+    } else {
+        Tone::Neutral
+    }
+}
+
+fn tone_for_ratio(value: f64) -> Tone {
+    if value >= 0.80 {
+        Tone::Bad
+    } else if value >= 0.50 {
+        Tone::Warn
+    } else if value > 0.0 {
+        Tone::Info
+    } else {
+        Tone::Neutral
+    }
+}
+
+fn section_line(theme: Theme, title: &str) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        format!("> {title}"),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )])
+}
+
+fn format_pct(value: f64) -> String {
+    format!("{value:.0}%")
+}
+
+fn format_ratio_pct(value: f64) -> String {
+    format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0)
+}
+
+fn format_temp(value: f64) -> String {
+    format!("{value:.0}C")
+}
+
+fn format_power(value: f64) -> String {
+    format!("{value:.0}W")
+}
+
+fn format_opt_pct(value: Option<f64>) -> String {
+    value
+        .map(format_pct)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_ratio_pct(value: Option<f64>) -> String {
+    value
+        .map(format_ratio_pct)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_temp(value: Option<f64>) -> String {
+    value
+        .map(format_temp)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_power(value: Option<f64>) -> String {
+    value
+        .map(format_power)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_bps(value: Option<f64>) -> String {
+    value
+        .map(format_bps)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn execution_context_summary(execution: &crate::tracey_guard::ProbeExecution) -> String {
+    let context = &execution.context;
+    let mut parts = Vec::new();
+    for key in [
+        "mem_used_ratio",
+        "ecc_error_count",
+        "deep_dive",
+        "remote_support",
+    ] {
+        if let Some(value) = context.get(key) {
+            let label = match key {
+                "mem_used_ratio" => format!(
+                    "mem {}",
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .map(format_ratio_pct)
+                        .unwrap_or_else(|| value.clone())
+                ),
+                "ecc_error_count" => format!("ecc {value}"),
+                "deep_dive" => format!("deep {value}"),
+                "remote_support" => format!("remote {value}"),
+                _ => format!("{key}={value}"),
+            };
+            parts.push(label);
+        }
+    }
+    if parts.is_empty() {
+        parts.push(format!(
+            "{}ns mismatch={}",
+            execution.execution_time_ns, execution.mismatch_count
+        ));
+    }
+    parts.join(" ")
+}
+
+fn process_rows_from_telemetry(app: &TraceyTopApp) -> Vec<ProcessRow> {
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        return Vec::new();
+    };
+    telemetry
+        .server
+        .processes
+        .iter()
+        .map(|process| ProcessRow {
+            pid: process.pid,
+            name: process.name.clone(),
+            cpu_pct: process.cpu_pct,
+            mem_bytes: process.mem_bytes,
+            io_bps: process.io_bps,
+        })
+        .collect()
+}
+
+fn gpu_rows_from_telemetry(app: &TraceyTopApp) -> Vec<GpuRow> {
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        return Vec::new();
+    };
+    telemetry
+        .gpus
+        .iter()
+        .map(|gpu| GpuRow {
+            id: gpu.gpu_id.clone(),
+            name: gpu.name.clone().unwrap_or_else(|| "gpu".to_string()),
+            source: gpu
+                .guard_state
+                .clone()
+                .or_else(|| gpu.source.clone())
+                .unwrap_or_else(|| "embedded".to_string()),
+            util_pct: gpu.util_pct,
+            temp_c: gpu.temp_c,
+            power_w: gpu.power_w,
+        })
+        .collect()
+}
+
+fn disk_rows_from_telemetry(app: &TraceyTopApp) -> Vec<DiskRow> {
+    let Some(telemetry) = telemetry_snapshot(app) else {
+        return Vec::new();
+    };
+    telemetry
+        .server
+        .disks
+        .iter()
+        .map(|disk| DiskRow {
+            mount: disk.mount.clone(),
+            used_ratio: disk.used_ratio,
+            used_bytes: disk.used_bytes,
+            total_bytes: disk.total_bytes,
+        })
+        .collect()
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
     let mut parts = Vec::new();
     parts.push(Span::styled("q/Esc", Style::default().fg(theme.accent)));
@@ -3025,6 +4127,7 @@ mod tests {
             tracey_guard: None,
             slurm: None,
             continuum_autoscaler: None,
+            continuum_telemetry: None,
             location: AgentLocationSnapshot::default(),
             peer_locations: Vec::new(),
         }

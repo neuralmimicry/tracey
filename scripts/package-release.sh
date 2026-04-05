@@ -12,12 +12,15 @@ Options:
   --output-dir DIR            Directory to receive the packaged artifacts.
   --target-triple TRIPLE      Optional cargo target triple.
   --platform NAME             Platform suffix in output names. Default: derived from host.
+  --archive-format FORMAT     Archive format: tar.gz or zip.
+  --binary-suffix SUFFIX      Binary suffix in packaged filenames (for example .exe).
   --skip-build                Reuse existing release binaries instead of building them.
   --sign-update               Generate tracey.update(.meta.json/.sig) with TRACEY_UPDATE_KEY.
   -h, --help                  Show this help text.
 
 Examples:
   ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist
+  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --platform windows-x86_64 --archive-format zip --binary-suffix .exe
   TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --sign-update
 USAGE
 }
@@ -35,11 +38,29 @@ default_platform() {
   local os arch
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
+  case "$os" in
+    darwin) os="macos" ;;
+    mingw*|msys*|cygwin*) os="windows" ;;
+  esac
   case "$arch" in
     amd64) arch="x86_64" ;;
     arm64) arch="aarch64" ;;
   esac
   printf '%s-%s\n' "$os" "$arch"
+}
+
+default_archive_format() {
+  case "$PLATFORM" in
+    windows*) printf 'zip\n' ;;
+    *) printf 'tar.gz\n' ;;
+  esac
+}
+
+default_binary_suffix() {
+  case "$PLATFORM" in
+    windows*) printf '.exe\n' ;;
+    *) printf '\n' ;;
+  esac
 }
 
 sha256_tool() {
@@ -87,10 +108,68 @@ build_binaries() {
   fi
 }
 
+archive_extension() {
+  case "$ARCHIVE_FORMAT" in
+    tar.gz|zip)
+      printf '%s\n' "$ARCHIVE_FORMAT"
+      ;;
+    *)
+      die "unsupported archive format: $ARCHIVE_FORMAT"
+      ;;
+  esac
+}
+
+create_zip_archive() {
+  if command -v zip >/dev/null 2>&1; then
+    (
+      cd "$STAGE_ROOT"
+      zip -q -r "$ARCHIVE_PATH" "$ARCHIVE_BASENAME"
+    )
+    return
+  fi
+
+  if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    local archive_win payload_win ps_cmd
+    archive_win=$(cygpath -w "$ARCHIVE_PATH")
+    payload_win=$(cygpath -w "$PAYLOAD_DIR")
+    printf -v ps_cmd \
+      'Compress-Archive -LiteralPath "%s" -DestinationPath "%s" -Force' \
+      "$payload_win" \
+      "$archive_win"
+    powershell.exe -NoLogo -NoProfile -Command "$ps_cmd" >/dev/null
+    return
+  fi
+
+  die "zip archive creation requires 'zip' or powershell.exe with cygpath"
+}
+
+create_archive() {
+  case "$ARCHIVE_FORMAT" in
+    tar.gz)
+      tar -C "$STAGE_ROOT" -czf "$ARCHIVE_PATH" "$ARCHIVE_BASENAME"
+      ;;
+    zip)
+      create_zip_archive
+      ;;
+    *)
+      die "unsupported archive format: $ARCHIVE_FORMAT"
+      ;;
+  esac
+}
+
+should_include_install_service() {
+  case "$PLATFORM" in
+    linux*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 VERSION=
 OUTPUT_DIR=
 TARGET_TRIPLE=
 PLATFORM=
+ARCHIVE_FORMAT=
+BINARY_SUFFIX=
 SKIP_BUILD=0
 SIGN_UPDATE=0
 BUILD_AS_USER=
@@ -117,6 +196,16 @@ while (($#)); do
       (($#)) || die "--platform requires a value"
       PLATFORM="$1"
       ;;
+    --archive-format)
+      shift
+      (($#)) || die "--archive-format requires a value"
+      ARCHIVE_FORMAT="$1"
+      ;;
+    --binary-suffix)
+      shift
+      (($#)) || die "--binary-suffix requires a value"
+      BINARY_SUFFIX="$1"
+      ;;
     --skip-build)
       SKIP_BUILD=1
       ;;
@@ -140,11 +229,15 @@ done
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 PLATFORM="${PLATFORM:-$(default_platform)}"
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-$(default_archive_format)}"
+BINARY_SUFFIX="${BINARY_SUFFIX:-$(default_binary_suffix)}"
 BUILD_AS_USER=$(resolve_build_user || true)
 
 BIN_DIR=$(binary_dir)
-TRACEY_BIN="$BIN_DIR/tracey"
-LOADER_BIN="$BIN_DIR/tracey-loader"
+TRACEY_BIN="$BIN_DIR/tracey${BINARY_SUFFIX}"
+LOADER_BIN="$BIN_DIR/tracey-loader${BINARY_SUFFIX}"
+TRACEY_BIN_NAME="tracey${BINARY_SUFFIX}"
+LOADER_BIN_NAME="tracey-loader${BINARY_SUFFIX}"
 
 if (( ! SKIP_BUILD )) || [[ ! -x "$TRACEY_BIN" || ! -x "$LOADER_BIN" ]]; then
   build_binaries
@@ -161,20 +254,22 @@ ARCHIVE_BASENAME="tracey-${VERSION}-${PLATFORM}"
 OUTPUT_DIR=$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)
 STAGE_ROOT="$OUTPUT_DIR/.stage"
 PAYLOAD_DIR="$STAGE_ROOT/$ARCHIVE_BASENAME"
-ARCHIVE_PATH="$OUTPUT_DIR/${ARCHIVE_BASENAME}.tar.gz"
+ARCHIVE_PATH="$OUTPUT_DIR/${ARCHIVE_BASENAME}.$(archive_extension)"
 CHECKSUM_PATH="$OUTPUT_DIR/${ARCHIVE_BASENAME}.sha256.txt"
 
 rm -rf "$STAGE_ROOT"
 mkdir -p "$PAYLOAD_DIR"
 mkdir -p "$PAYLOAD_DIR/docs"
 
-install -m 0755 "$TRACEY_BIN" "$PAYLOAD_DIR/tracey"
-install -m 0755 "$LOADER_BIN" "$PAYLOAD_DIR/tracey-loader"
-install -m 0755 "$REPO_ROOT/scripts/install-service.sh" "$PAYLOAD_DIR/install-service.sh"
+install -m 0755 "$TRACEY_BIN" "$PAYLOAD_DIR/$TRACEY_BIN_NAME"
+install -m 0755 "$LOADER_BIN" "$PAYLOAD_DIR/$LOADER_BIN_NAME"
+if should_include_install_service; then
+  install -m 0755 "$REPO_ROOT/scripts/install-service.sh" "$PAYLOAD_DIR/install-service.sh"
+fi
 install -m 0644 "$REPO_ROOT/README.md" "$PAYLOAD_DIR/README.md"
 install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$PAYLOAD_DIR/docs/OPERATIONS.md"
 
-tar -C "$STAGE_ROOT" -czf "$ARCHIVE_PATH" "$ARCHIVE_BASENAME"
+create_archive
 
 artifacts=("$ARCHIVE_PATH")
 

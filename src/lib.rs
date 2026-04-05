@@ -7,6 +7,7 @@ pub mod autoscaler;
 pub mod bus;
 pub mod capabilities;
 pub mod config;
+pub mod continuum_telemetry;
 pub mod coordination;
 pub mod dashboard;
 pub mod discovery;
@@ -208,6 +209,12 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         shutdown_listener.clone(),
         &config.discovery.shared_key,
     );
+    let continuum_telemetry = continuum_telemetry::spawn_continuum_telemetry(
+        config.agent_id.clone(),
+        bus.subscribe(),
+        decision_tx.subscribe(),
+        shutdown_listener.clone(),
+    );
     let continuum_autoscaler = autoscaler::spawn_continuum_autoscaler(
         config.continuum_autoscaler.clone(),
         config.agent_id.clone(),
@@ -268,6 +275,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     slurm: slurm_runtime.clone(),
                     prometheus_export: prometheus_export_handle.clone(),
                     continuum_autoscaler: Some(continuum_autoscaler.clone()),
+                    continuum_telemetry: Some(continuum_telemetry.clone()),
                     loader_threats: match loader_threat::LoaderThreatStatusHandle::from_config(
                         &config.loader,
                     ) {

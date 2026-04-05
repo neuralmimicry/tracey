@@ -284,10 +284,11 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 Current behavior:
 
 - every pull request and push to `main` runs the Rust verification job
-- pushing a `v*` tag packages release artifacts and publishes a GitHub release
+- pushing a `v*` tag packages release artifacts for Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64, iOS arm64, and Android arm64, then publishes a GitHub release
 - manual `workflow_dispatch` runs can package artifacts from any ref
-- manual publishing is allowed only when the workflow is run against a `v*` tag ref
-- release packaging emits a Linux `tracey`/`tracey-loader` tarball, checksum file, and optional signed `tracey.update` bundle
+- manual publishing is allowed only when the workflow is run against a `v*` tag ref and `publish_release` is enabled
+- release packaging emits per-platform archives plus checksum files; Linux packages also include optional signed `tracey.update` bundles when signing is enabled
+- iOS and Android outputs are raw target binaries packaged for distribution and testing, not signed app-store bundles
 
 If the repository secret `TRACEY_UPDATE_KEY` is configured, tagged releases automatically attach signed update artifacts compatible with the loader/update pipeline.
 

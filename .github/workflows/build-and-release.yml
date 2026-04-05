@@ -82,35 +82,19 @@ jobs:
       - name: Validate release scripts
         run: bash -n scripts/install-service.sh scripts/package-release.sh
 
-  package-release:
-    name: package-release
+  release-meta:
+    name: release-meta
     needs: verify
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.ref, 'refs/tags/v')
     outputs:
-      artifact_name: ${{ steps.meta.outputs.artifact_name }}
       artifact_version: ${{ steps.meta.outputs.artifact_version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
       - name: Compute artifact metadata
         id: meta
@@ -137,14 +121,142 @@ jobs:
             exit 1
           fi
 
-          artifact_name="tracey-release-${artifact_version}-linux-x86_64"
-
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "artifact_version=$artifact_version" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+  package-release:
+    name: package-release (${{ matrix.platform }})
+    needs:
+      - verify
+      - release-meta
+    runs-on: ${{ matrix.runner }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: true
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: true
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            platform: macos-x86_64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: false
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            platform: macos-aarch64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: false
+          - runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            archive_format: zip
+            binary_suffix: ".exe"
+            supports_update_bundle: false
+          - runner: macos-15
+            rust_target: aarch64-apple-ios
+            platform: ios-arm64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: false
+          - runner: ubuntu-24.04
+            rust_target: aarch64-linux-android
+            platform: android-arm64
+            archive_format: tar.gz
+            binary_suffix: ""
+            supports_update_bundle: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Configure Android linker
+        if: ${{ matrix.platform == 'android-arm64' }}
+        run: |
+          set -euo pipefail
+          ndk_root="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}"
+          if [[ -z "$ndk_root" ]]; then
+            sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+            if [[ -z "$sdk_root" || ! -d "$sdk_root/ndk" ]]; then
+              echo "::error::Android SDK/NDK path was not found on the runner"
+              exit 1
+            fi
+            ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+
+          if [[ -z "$ndk_root" || ! -d "$ndk_root" ]]; then
+            echo "::error::Android NDK directory could not be resolved"
+            exit 1
+          fi
+
+          toolchain="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64"
+          linker="$toolchain/bin/aarch64-linux-android21-clang"
+          cxx="$toolchain/bin/aarch64-linux-android21-clang++"
+          ar="$toolchain/bin/llvm-ar"
+
+          if [[ ! -x "$linker" || ! -x "$cxx" || ! -x "$ar" ]]; then
+            echo "::error::Android NDK toolchain binaries were not found under $toolchain"
+            exit 1
+          fi
+
+          {
+            echo "ANDROID_NDK_ROOT=$ndk_root"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$linker"
+            echo "CC_aarch64_linux_android=$linker"
+            echo "CXX_aarch64_linux_android=$cxx"
+            echo "AR_aarch64_linux_android=$ar"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure iOS linker
+        if: ${{ matrix.platform == 'ios-arm64' }}
+        run: |
+          set -euo pipefail
+          sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang_path="$(xcrun --sdk iphoneos --find clang)"
+          ar_path="$(xcrun --sdk iphoneos --find ar)"
+
+          {
+            echo "SDKROOT=$sdk_path"
+            echo "CARGO_TARGET_AARCH64_APPLE_IOS_LINKER=$clang_path"
+            echo "CC_aarch64_apple_ios=$clang_path"
+            echo "AR_aarch64_apple_ios=$ar_path"
+          } >> "$GITHUB_ENV"
 
       - name: Package release artifacts
-        shell: bash
         env:
           TRACEY_UPDATE_KEY: ${{ secrets.TRACEY_UPDATE_KEY }}
           MANUAL_SIGN_REQUEST: >-
@@ -153,20 +265,26 @@ jobs:
         run: |
           set -euo pipefail
           args=(
-            --version "${{ steps.meta.outputs.artifact_version }}"
+            --version "${{ needs.release-meta.outputs.artifact_version }}"
             --output-dir "./dist"
+            --target-triple "${{ matrix.rust_target }}"
+            --platform "${{ matrix.platform }}"
+            --archive-format "${{ matrix.archive_format }}"
+            --binary-suffix "${{ matrix.binary_suffix }}"
           )
 
-          if [[ -n "${{ steps.meta.outputs.release_tag }}" && \
-                -n "${TRACEY_UPDATE_KEY:-}" ]]; then
-            args+=(--sign-update)
-          elif [[ "${MANUAL_SIGN_REQUEST}" == "true" ]]; then
-            if [[ -z "${TRACEY_UPDATE_KEY:-}" ]]; then
-              echo "::error::TRACEY_UPDATE_KEY secret is required"
-              echo "::error::when sign_update_bundle is enabled"
-              exit 1
+          if [[ "${{ matrix.supports_update_bundle }}" == "true" ]]; then
+            if [[ -n "${{ needs.release-meta.outputs.release_tag }}" && \
+                  -n "${TRACEY_UPDATE_KEY:-}" ]]; then
+              args+=(--sign-update)
+            elif [[ "${MANUAL_SIGN_REQUEST}" == "true" ]]; then
+              if [[ -z "${TRACEY_UPDATE_KEY:-}" ]]; then
+                echo "::error::TRACEY_UPDATE_KEY secret is required"
+                echo "::error::when sign_update_bundle is enabled"
+                exit 1
+              fi
+              args+=(--sign-update)
             fi
-            args+=(--sign-update)
           fi
 
           chmod +x scripts/package-release.sh
@@ -175,18 +293,22 @@ jobs:
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ steps.meta.outputs.artifact_name }}
+          name: release-assets-${{ matrix.platform }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14
 
   publish-release:
     name: publish-release
-    needs: package-release
+    needs:
+      - release-meta
+      - package-release
     runs-on: ubuntu-latest
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      inputs.publish_release)
     permissions:
       contents: write
     steps:
@@ -194,7 +316,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${{ needs.package-release.outputs.release_tag }}" ]]; then
+          if [[ -z "${{ needs.release-meta.outputs.release_tag }}" ]]; then
             echo "::error::Publishing requires a v* tag ref"
             exit 1
           fi
@@ -202,7 +324,6 @@ jobs:
       - name: Download packaged artifacts
         uses: actions/download-artifact@v7
         with:
-          name: ${{ needs.package-release.outputs.artifact_name }}
           path: ./dist
 
       - name: Create or update GitHub release
@@ -210,7 +331,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
+          RELEASE_TAG: ${{ needs.release-meta.outputs.release_tag }}
           DRAFT_RELEASE: >-
             ${{ github.event_name == 'workflow_dispatch' &&
             inputs.draft_release }}
@@ -219,9 +340,7 @@ jobs:
             inputs.prerelease }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          files=(dist/*)
+          mapfile -d '' files < <(find dist -type f -print0 | sort -z)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::error::No packaged artifacts were downloaded"
             exit 1

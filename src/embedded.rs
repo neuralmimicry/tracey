@@ -228,6 +228,89 @@ impl CollectorState {
             .await;
         }
 
+        let fans = read_hwmon_fans().await;
+        for fan in fans.into_iter().take(self.config.max_thermals) {
+            if let Some(rpm) = fan.rpm {
+                emit_metric(
+                    bus,
+                    storage,
+                    "embedded",
+                    "fan_rpm",
+                    rpm as f64,
+                    "rpm",
+                    0.0,
+                    fan.severity,
+                    &[("fan", fan.name.clone()), ("label", fan.label.clone())],
+                )
+                .await;
+            }
+            if let Some(pwm_percent) = fan.pwm_percent {
+                emit_metric(
+                    bus,
+                    storage,
+                    "embedded",
+                    "fan_pwm_percent",
+                    pwm_percent,
+                    "percent",
+                    (pwm_percent / 100.0).clamp(0.0, 1.0),
+                    fan.severity,
+                    &[("fan", fan.name.clone()), ("label", fan.label.clone())],
+                )
+                .await;
+            }
+        }
+
+        let power_sensors = read_hwmon_power_sensors().await;
+        for sensor in power_sensors.into_iter().take(self.config.max_thermals) {
+            emit_metric(
+                bus,
+                storage,
+                "embedded",
+                "sensor_power_w",
+                sensor.power_w,
+                "watt",
+                (sensor.power_w / 1600.0).clamp(0.0, 1.0),
+                sensor.severity,
+                &[("sensor", sensor.name.clone()), ("label", sensor.label.clone())],
+            )
+            .await;
+        }
+
+        if let Some(ecc) = read_edac_totals().await {
+            emit_metric(
+                bus,
+                storage,
+                "embedded",
+                "ecc_corrected_total",
+                ecc.corrected_total as f64,
+                "count",
+                0.0,
+                if ecc.corrected_total > 0 {
+                    Severity::Medium
+                } else {
+                    Severity::Low
+                },
+                &[],
+            )
+            .await;
+            emit_metric(
+                bus,
+                storage,
+                "embedded",
+                "ecc_uncorrected_total",
+                ecc.uncorrected_total as f64,
+                "count",
+                0.0,
+                if ecc.uncorrected_total > 0 {
+                    Severity::High
+                } else {
+                    Severity::Low
+                },
+                &[],
+            )
+            .await;
+        }
+
         if let Some(disks) = read_disks().await {
             for disk in disks.into_iter().take(self.config.max_disks) {
                 let prev = self.prev_disk.get(&disk.name).cloned();
@@ -368,6 +451,21 @@ impl CollectorState {
                         &[],
                     )
                     .await;
+                    emit_metric(
+                        bus,
+                        storage,
+                        "embedded",
+                        "fan_rpm",
+                        rpm as f64,
+                        "rpm",
+                        0.0,
+                        Severity::Low,
+                        &[
+                            ("fan", "jetson-fan-1".to_string()),
+                            ("label", "Jetson PWM Fan".to_string()),
+                        ],
+                    )
+                    .await;
                 }
             }
             if let Some(path) = &jetson.fan_pwm {
@@ -382,6 +480,22 @@ impl CollectorState {
                         0.0,
                         Severity::Low,
                         &[],
+                    )
+                    .await;
+                    let pwm_percent = ((pwm as f64 / 255.0) * 100.0).clamp(0.0, 100.0);
+                    emit_metric(
+                        bus,
+                        storage,
+                        "embedded",
+                        "fan_pwm_percent",
+                        pwm_percent,
+                        "percent",
+                        (pwm_percent / 100.0).clamp(0.0, 1.0),
+                        Severity::Low,
+                        &[
+                            ("fan", "jetson-fan-1".to_string()),
+                            ("label", "Jetson PWM Fan".to_string()),
+                        ],
                     )
                     .await;
                 }
@@ -400,6 +514,29 @@ impl CollectorState {
                         &[("rail", sensor.label.clone())],
                     )
                     .await;
+                    if let Some(power_w) = convert_power_to_watts(power as f64, sensor.unit.as_str()) {
+                        emit_metric(
+                            bus,
+                            storage,
+                            "embedded",
+                            "sensor_power_w",
+                            power_w,
+                            "watt",
+                            (power_w / 1600.0).clamp(0.0, 1.0),
+                            if power_w >= 1200.0 {
+                                Severity::High
+                            } else if power_w >= 900.0 {
+                                Severity::Medium
+                            } else {
+                                Severity::Low
+                            },
+                            &[
+                                ("sensor", sanitize_sensor_name(&sensor.label)),
+                                ("label", sensor.label.clone()),
+                            ],
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -910,6 +1047,26 @@ struct ThermalReading {
     temp_c: f64,
 }
 
+struct FanReading {
+    name: String,
+    label: String,
+    rpm: Option<u64>,
+    pwm_percent: Option<f64>,
+    severity: Severity,
+}
+
+struct PowerSensorReading {
+    name: String,
+    label: String,
+    power_w: f64,
+    severity: Severity,
+}
+
+struct EdacTotals {
+    corrected_total: u64,
+    uncorrected_total: u64,
+}
+
 struct DiskReading {
     name: String,
     read_bytes: u64,
@@ -1106,6 +1263,219 @@ async fn read_thermals() -> Vec<ThermalReading> {
     }
     readings.sort_by(|a, b| a.zone.cmp(&b.zone));
     readings
+}
+
+async fn read_hwmon_fans() -> Vec<FanReading> {
+    let mut out = Vec::new();
+    let Ok(mut dir) = fs::read_dir("/sys/class/hwmon").await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let hwmon_path = entry.path();
+        let hwmon_name = read_trimmed(hwmon_path.join("name"))
+            .await
+            .unwrap_or_else(|| "hwmon".to_string());
+        let Ok(mut files) = fs::read_dir(&hwmon_path).await else {
+            continue;
+        };
+
+        let mut labels: HashMap<String, String> = HashMap::new();
+        let mut rpms: HashMap<String, u64> = HashMap::new();
+        let mut pwms: HashMap<String, u64> = HashMap::new();
+
+        while let Ok(Some(file)) = files.next_entry().await {
+            let filename = file.file_name().to_string_lossy().to_string();
+            if filename.starts_with("fan") && filename.ends_with("_label") {
+                if let Some(index) = filename
+                    .strip_prefix("fan")
+                    .and_then(|value| value.strip_suffix("_label"))
+                    && let Some(label) = read_trimmed(file.path()).await
+                {
+                    labels.insert(index.to_string(), label);
+                }
+                continue;
+            }
+            if filename.starts_with("fan") && filename.ends_with("_input") {
+                if let Some(index) = filename
+                    .strip_prefix("fan")
+                    .and_then(|value| value.strip_suffix("_input"))
+                    && let Some(rpm) = read_u64(file.path()).await
+                {
+                    rpms.insert(index.to_string(), rpm);
+                }
+                continue;
+            }
+            if filename.starts_with("pwm")
+                && filename.len() > 3
+                && filename[3..].chars().all(|ch| ch.is_ascii_digit())
+                && let Some(value) = read_u64(file.path()).await
+            {
+                pwms.insert(filename[3..].to_string(), value);
+            }
+        }
+
+        let mut indexes = std::collections::BTreeSet::new();
+        indexes.extend(labels.keys().cloned());
+        indexes.extend(rpms.keys().cloned());
+        indexes.extend(pwms.keys().cloned());
+
+        for index in indexes {
+            let rpm = rpms.get(&index).copied();
+            let pwm_percent = pwms
+                .get(&index)
+                .map(|value| ((*value as f64 / 255.0) * 100.0).clamp(0.0, 100.0));
+            let label = labels
+                .get(&index)
+                .cloned()
+                .unwrap_or_else(|| format!("{hwmon_name} fan {index}"));
+            let severity = if rpm == Some(0) && pwm_percent.unwrap_or(0.0) >= 60.0 {
+                Severity::High
+            } else if pwm_percent.unwrap_or(0.0) >= 90.0 {
+                Severity::Medium
+            } else {
+                Severity::Low
+            };
+            out.push(FanReading {
+                name: format!("{hwmon_name}-fan-{index}"),
+                label,
+                rpm,
+                pwm_percent,
+                severity,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+async fn read_hwmon_power_sensors() -> Vec<PowerSensorReading> {
+    let mut out = Vec::new();
+    let Ok(mut dir) = fs::read_dir("/sys/class/hwmon").await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let hwmon_path = entry.path();
+        let hwmon_name = read_trimmed(hwmon_path.join("name"))
+            .await
+            .unwrap_or_else(|| "hwmon".to_string());
+        let Ok(mut files) = fs::read_dir(&hwmon_path).await else {
+            continue;
+        };
+
+        let mut labels: HashMap<String, String> = HashMap::new();
+        let mut sensors: Vec<(String, PathBuf, String)> = Vec::new();
+
+        while let Ok(Some(file)) = files.next_entry().await {
+            let filename = file.file_name().to_string_lossy().to_string();
+            if filename.starts_with("power")
+                && (filename.ends_with("_label") || filename.ends_with("_average_label"))
+            {
+                let base = filename
+                    .trim_end_matches("_label")
+                    .trim_end_matches("_average");
+                if let Some(label) = read_trimmed(file.path()).await {
+                    labels.insert(base.to_string(), label);
+                }
+                continue;
+            }
+            if filename.starts_with("in")
+                && (filename.ends_with("_label") || filename.ends_with("_input_label"))
+            {
+                let base = filename
+                    .trim_end_matches("_label")
+                    .trim_end_matches("_input");
+                if let Some(label) = read_trimmed(file.path()).await {
+                    labels.insert(base.to_string(), label);
+                }
+                continue;
+            }
+            if filename.starts_with("power")
+                && (filename.ends_with("_average") || filename.ends_with("_input"))
+            {
+                let base = filename
+                    .trim_end_matches("_average")
+                    .trim_end_matches("_input");
+                sensors.push((base.to_string(), file.path(), filename));
+                continue;
+            }
+            if filename.starts_with("in_power") && filename.ends_with("_input") {
+                sensors.push((
+                    filename.trim_end_matches("_input").to_string(),
+                    file.path(),
+                    filename,
+                ));
+            }
+        }
+
+        for (base, path, filename) in sensors {
+            let Some(raw) = read_i64(path).await else {
+                continue;
+            };
+            let unit = if filename.contains("in_power") {
+                "microwatt"
+            } else if raw.unsigned_abs() > 100_000 {
+                "microwatt"
+            } else if raw.unsigned_abs() > 1_000 {
+                "milliwatt"
+            } else {
+                "watt"
+            };
+            let Some(power_w) = convert_power_to_watts(raw as f64, unit) else {
+                continue;
+            };
+            let severity = if power_w >= 1200.0 {
+                Severity::High
+            } else if power_w >= 900.0 {
+                Severity::Medium
+            } else {
+                Severity::Low
+            };
+            let label = labels
+                .get(&base)
+                .cloned()
+                .unwrap_or_else(|| format!("{hwmon_name} {base}"));
+            out.push(PowerSensorReading {
+                name: sanitize_sensor_name(&format!("{hwmon_name}-{base}")),
+                label,
+                power_w,
+                severity,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+async fn read_edac_totals() -> Option<EdacTotals> {
+    let Ok(mut dir) = fs::read_dir("/sys/devices/system/edac/mc").await else {
+        return None;
+    };
+    let mut corrected_total = 0u64;
+    let mut uncorrected_total = 0u64;
+    let mut found = false;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("mc") {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(value) = read_u64(path.join("ce_count")).await {
+            corrected_total = corrected_total.saturating_add(value);
+            found = true;
+        }
+        if let Some(value) = read_u64(path.join("ue_count")).await {
+            uncorrected_total = uncorrected_total.saturating_add(value);
+            found = true;
+        }
+    }
+    if found {
+        Some(EdacTotals {
+            corrected_total,
+            uncorrected_total,
+        })
+    } else {
+        None
+    }
 }
 
 async fn read_disks() -> Option<Vec<DiskReading>> {
@@ -1401,6 +1771,38 @@ fn is_ignored_disk(name: &str) -> bool {
         || name.starts_with("ram")
         || name.starts_with("fd")
         || name.starts_with("sr")
+}
+
+fn sanitize_sensor_name(label: &str) -> String {
+    let sanitized: String = label
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn convert_power_to_watts(value: f64, unit: &str) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let watts = match unit {
+        "microwatt" | "uw" | "uW" => value / 1_000_000.0,
+        "milliwatt" | "mw" | "mW" => value / 1_000.0,
+        "watt" | "w" | "W" => value,
+        _ => return None,
+    };
+    Some(watts.max(0.0))
 }
 
 async fn read_trimmed(path: PathBuf) -> Option<String> {

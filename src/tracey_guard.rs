@@ -22,6 +22,7 @@ static TRACEY_GUARD_EVENT_COUNTER: AtomicU64 = AtomicU64::new(30_000_000);
 const LOCAL_SNAPSHOT_MAX_FAULTS: usize = 128;
 const LOCAL_SNAPSHOT_MAX_GPUS: usize = 64;
 const LOCAL_SNAPSHOT_MAX_BUCKETS: usize = 360;
+const LOCAL_SNAPSHOT_MAX_EXECUTIONS: usize = 96;
 
 /// TraceyGuard probe identifiers translated from the upstream TraceyGuard probe-agent.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -127,6 +128,7 @@ struct DeviceTelemetryContext {
 #[derive(Clone, Debug)]
 struct DeviceState {
     gpu_id: String,
+    sm_count: u32,
     // Bayesian reliability posterior (Beta distribution parameters).
     state: TraceyGuardGpuState,
     alpha: f64,
@@ -146,9 +148,9 @@ struct DeviceState {
 
 impl DeviceState {
     fn new(gpu_id: String, sm_count: u32, cfg: &TraceyGuardConfig) -> Self {
-        let _ = sm_count;
         Self {
             gpu_id,
+            sm_count: sm_count.max(1),
             state: TraceyGuardGpuState::Healthy,
             alpha: 100.0,
             beta: 1.0,
@@ -487,6 +489,7 @@ pub struct ProbeExecution {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GpuHealthView {
     pub gpu_id: String,
+    pub sm_count: u32,
     pub state: TraceyGuardGpuState,
     pub reliability_score: f64,
     pub probe_pass_count: u64,
@@ -494,6 +497,9 @@ pub struct GpuHealthView {
     pub probe_error_count: u64,
     pub consecutive_failures: u32,
     pub last_transition_ms: u64,
+    pub last_probe_ms: u64,
+    pub last_risk: f64,
+    pub last_confidence: f64,
     pub last_reason: String,
 }
 
@@ -561,6 +567,7 @@ pub struct TraceyGuardStatusSnapshot {
     /// Full runtime snapshot consumed by `/status`, `/tracey_guard`, and deep-dive paths.
     pub summary: TraceyGuardSummary,
     pub gpu_health: Vec<GpuHealthView>,
+    pub recent_executions: Vec<ProbeExecution>,
     pub recent_faults: Vec<FaultAdvertisementEntry>,
     pub remote_faults: Vec<FaultAdvertisementEntry>,
     pub timeline: Vec<TimelineBucket>,
@@ -903,6 +910,7 @@ async fn run_tracey_guard_runtime(
     let mut last_force_scan_epoch = 0u64;
     let mut budget_window: VecDeque<(u64, u64)> = VecDeque::new();
     let mut recent_outcomes: VecDeque<RecentProbeOutcome> = VecDeque::new();
+    let mut recent_executions: VecDeque<ProbeExecution> = VecDeque::new();
     let mut scheduler_state = AdaptiveSchedulerState::new(now_ms());
     let mut random_audit_state = RandomAuditState::new();
 
@@ -981,6 +989,7 @@ async fn run_tracey_guard_runtime(
                         &control_state,
                         &per_probe_counters,
                         &device_state,
+                        &recent_executions,
                         &fault_hub,
                         &timeline,
                         profile,
@@ -1036,6 +1045,7 @@ async fn run_tracey_guard_runtime(
                     &control_state,
                     &per_probe_counters,
                     &device_state,
+                    &recent_executions,
                     &fault_hub,
                     &timeline,
                     profile,
@@ -1085,6 +1095,10 @@ async fn run_tracey_guard_runtime(
                 execution.confidence = scored.confidence;
                 execution.severity = severity;
                 device.observe_probe_score(execution.ts_ms, execution.risk, execution.confidence);
+                execution.context.insert(
+                    "remote_support".to_string(),
+                    remote_support.to_string(),
+                );
 
                 event = event
                     .with_attr("fuzzy_risk", format!("{:.5}", execution.risk))
@@ -1154,6 +1168,11 @@ async fn run_tracey_guard_runtime(
                     timeline.pop_front();
                 }
 
+                recent_executions.push_front(execution.clone());
+                while recent_executions.len() > LOCAL_SNAPSHOT_MAX_EXECUTIONS {
+                    recent_executions.pop_back();
+                }
+
                 if execution.probe_state != ProbeState::Pass {
                     let entry = FaultAdvertisementEntry {
                         key: build_fault_key(&execution),
@@ -1221,6 +1240,7 @@ async fn refresh_snapshot(
     control: &TraceyGuardControlState,
     per_probe_counters: &HashMap<ProbeType, ProbeCounters>,
     device_state: &HashMap<String, DeviceState>,
+    recent_executions: &VecDeque<ProbeExecution>,
     fault_hub: &FaultIntelHub,
     timeline: &VecDeque<TimelineBucket>,
     profile: AdaptiveScheduleProfile,
@@ -1252,6 +1272,7 @@ async fn refresh_snapshot(
         }
         gpu_health.push(GpuHealthView {
             gpu_id: state.gpu_id.clone(),
+            sm_count: state.sm_count,
             state: state.state,
             reliability_score: state.reliability(),
             probe_pass_count: state.probe_pass_count,
@@ -1259,6 +1280,9 @@ async fn refresh_snapshot(
             probe_error_count: state.probe_error_count,
             consecutive_failures: state.consecutive_failures,
             last_transition_ms: state.last_transition_ms,
+            last_probe_ms: state.last_probe_ms,
+            last_risk: state.last_risk,
+            last_confidence: state.last_confidence,
             last_reason: state.last_reason.clone(),
         });
     }
@@ -1309,6 +1333,7 @@ async fn refresh_snapshot(
     write.summary = summary;
     write.control = control.clone();
     write.gpu_health = gpu_health;
+    write.recent_executions = recent_executions.iter().cloned().collect();
     write.recent_faults = fault_snapshot.local_entries;
     write.remote_faults = fault_snapshot.remote_entries;
     write.timeline = timeline.iter().cloned().collect();
@@ -1976,6 +2001,10 @@ fn ingest_telemetry_context(
         return;
     }
 
+    if metric.contains("ecc") && gpu_id.is_none() && !metric.starts_with("gpu_") {
+        return;
+    }
+
     let id = gpu_id.unwrap_or_else(|| "synthetic-gpu-0".to_string());
     let ctx = telemetry_ctx.entry(id).or_default();
     let value = event
@@ -2120,6 +2149,15 @@ fn execute_probe_kernel(
         "decoder_util_ratio".to_string(),
         format!("{:.4}", ctx.decoder_util_ratio),
     );
+    context.insert(
+        "mem_used_ratio".to_string(),
+        format!("{:.4}", ctx.mem_used_ratio),
+    );
+    context.insert(
+        "ecc_error_count".to_string(),
+        ctx.ecc_error_count.to_string(),
+    );
+    context.insert("deep_dive".to_string(), deep_dive.to_string());
 
     ProbeExecution {
         ts_ms,
@@ -2905,5 +2943,22 @@ mod tests {
         assert!(ctx.clock_anomaly_count >= 1);
         assert!(ctx.codec_pressure_count >= 1);
         assert!(compute_stress(ctx) > 0.25);
+    }
+
+    #[test]
+    fn host_level_ecc_metrics_do_not_create_gpu_context() {
+        let mut telemetry = HashMap::new();
+        let event = Event::new(
+            6,
+            "embedded",
+            EventKind::SystemMetric,
+            0.2,
+            Severity::Low,
+        )
+        .with_attr("metric", "ecc_corrected_total")
+        .with_attr("value", "12");
+
+        ingest_telemetry_context(&event, &mut telemetry);
+        assert!(telemetry.is_empty());
     }
 }

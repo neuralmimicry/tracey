@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -45,6 +46,7 @@ pub struct StatusService {
     pub slurm: crate::slurm::SlurmRuntimeHandle,
     pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
     pub continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerHandle>,
+    pub continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetryHandle>,
     pub loader_threats: Option<crate::loader_threat::LoaderThreatStatusHandle>,
 }
 
@@ -98,6 +100,8 @@ struct StatusSnapshot {
     slurm: Option<crate::slurm::SlurmSnapshot>,
     #[serde(default)]
     continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerSnapshot>,
+    #[serde(default)]
+    continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetrySnapshot>,
     #[serde(default)]
     loader_threats: Option<crate::loader_threat::LoaderThreatSnapshot>,
     #[serde(default)]
@@ -315,6 +319,11 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let mut continuum_telemetry = if let Some(continuum) = &service.continuum_telemetry {
+        Some(continuum.snapshot().await)
+    } else {
+        None
+    };
     let loader_threats = if let Some(loader_threats) = &service.loader_threats {
         loader_threats.snapshot().await
     } else {
@@ -329,6 +338,9 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     );
     if location.agent_version.is_none() {
         location.agent_version = Some(service.agent_version.clone());
+    }
+    if let Some(continuum) = continuum_telemetry.as_mut() {
+        merge_continuum_snapshot(continuum, &location, tracey_guard.as_ref());
     }
 
     StatusSnapshot {
@@ -374,6 +386,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         tracey_guard,
         slurm,
         continuum_autoscaler,
+        continuum_telemetry,
         loader_threats,
         location,
         peer_locations,
@@ -388,6 +401,63 @@ fn status_for_posture(posture: crate::governance::Posture) -> String {
         crate::governance::Posture::Strict => "degraded".to_string(),
         crate::governance::Posture::Lockdown => "offline".to_string(),
     }
+}
+
+fn merge_continuum_snapshot(
+    snapshot: &mut crate::continuum_telemetry::ContinuumTelemetrySnapshot,
+    location: &AgentLocationSnapshot,
+    tracey_guard: Option<&crate::tracey_guard::TraceyGuardStatusSnapshot>,
+) {
+    if snapshot.identity.host.trim().is_empty() && !location.host.trim().is_empty() {
+        snapshot.identity.host = location.host.clone();
+    }
+    fill_continuum_location(&mut snapshot.identity.site, location.site.as_ref());
+    fill_continuum_location(&mut snapshot.identity.building, location.building.as_ref());
+    fill_continuum_location(&mut snapshot.identity.room, location.room.as_ref());
+    fill_continuum_location(&mut snapshot.identity.network, location.network.as_ref());
+    fill_continuum_location(&mut snapshot.identity.physical, location.physical.as_ref());
+    fill_continuum_location(&mut snapshot.identity.zone, location.geo.as_ref());
+
+    let Some(guard) = tracey_guard else {
+        return;
+    };
+
+    let by_gpu: HashMap<_, _> = guard
+        .gpu_health
+        .iter()
+        .map(|entry| (entry.gpu_id.as_str(), entry))
+        .collect();
+
+    for gpu in &mut snapshot.gpus {
+        if let Some(view) = by_gpu.get(gpu.gpu_id.as_str()) {
+            gpu.guard_state = Some(format!("{:?}", view.state).to_ascii_lowercase());
+            gpu.reliability_score = Some(view.reliability_score.clamp(0.0, 1.0));
+            gpu.probe_fail_count = Some(view.probe_fail_count);
+            gpu.probe_error_count = Some(view.probe_error_count);
+            gpu.consecutive_failures = Some(view.consecutive_failures);
+            gpu.sm_count = Some(view.sm_count);
+            gpu.last_guard_reason = Some(view.last_reason.clone());
+            gpu.last_guard_transition_ms = Some(view.last_transition_ms);
+            gpu.last_guard_risk = Some(view.last_risk.clamp(0.0, 1.0));
+            gpu.last_guard_confidence = Some(view.last_confidence.clamp(0.0, 1.0));
+        }
+    }
+}
+
+fn fill_continuum_location(
+    target: &mut Option<String>,
+    guess: Option<&crate::location::LocationGuess>,
+) {
+    if target.is_some() {
+        return;
+    }
+    let Some(guess) = guess else {
+        return;
+    };
+    if guess.label.trim().is_empty() {
+        return;
+    }
+    *target = Some(guess.label.clone());
 }
 
 fn normalize_url(addr: &str, path: &str) -> String {
@@ -691,6 +761,10 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             continuum_autoscaler: parse_object_field(
                 map,
                 &["continuum_autoscaler", "continuumAutoscaler", "autoscaler"],
+            ),
+            continuum_telemetry: parse_object_field(
+                map,
+                &["continuum_telemetry", "continuumTelemetry", "continuum"],
             ),
             loader_threats: parse_object_field(
                 map,
