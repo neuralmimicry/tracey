@@ -7,6 +7,7 @@ pub mod autoscaler;
 pub mod bus;
 pub mod capabilities;
 pub mod config;
+pub mod continuum_assessment;
 pub mod continuum_telemetry;
 pub mod coordination;
 pub mod dashboard;
@@ -215,6 +216,36 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         decision_tx.subscribe(),
         shutdown_listener.clone(),
     );
+    let loader_threat_status = match loader_threat::LoaderThreatStatusHandle::from_config(
+        &config.loader,
+    ) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "loader threat snapshot handle unavailable; status and assessment will omit loader threat intel"
+            );
+            None
+        }
+    };
+    let mut continuum_assessment_config = config.continuum_assessment.clone();
+    if continuum_assessment_config.inherit_global_fuzzy {
+        continuum_assessment_config.fuzzy = config.fuzzy.clone();
+        continuum_assessment_config.min_samples = config.min_samples;
+    }
+    let continuum_assessment = continuum_assessment::spawn_continuum_assessment(
+        continuum_assessment_config,
+        config.agent_id.clone(),
+        bus.clone(),
+        storage.clone(),
+        config.policy.clone(),
+        config.min_samples,
+        config.fuzzy.clone(),
+        continuum_telemetry.clone(),
+        tracey_guard.clone(),
+        loader_threat_status.clone(),
+        shutdown_listener.clone(),
+    );
     let continuum_autoscaler = autoscaler::spawn_continuum_autoscaler(
         config.continuum_autoscaler.clone(),
         config.agent_id.clone(),
@@ -275,19 +306,9 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     slurm: slurm_runtime.clone(),
                     prometheus_export: prometheus_export_handle.clone(),
                     continuum_autoscaler: Some(continuum_autoscaler.clone()),
+                    continuum_assessment: Some(continuum_assessment.clone()),
                     continuum_telemetry: Some(continuum_telemetry.clone()),
-                    loader_threats: match loader_threat::LoaderThreatStatusHandle::from_config(
-                        &config.loader,
-                    ) {
-                        Ok(handle) => Some(handle),
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "loader threat snapshot handle unavailable; status will omit loader threat intel"
-                            );
-                            None
-                        }
-                    },
+                    loader_threats: loader_threat_status.clone(),
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));

@@ -1,5 +1,6 @@
 use crate::autoscaler::ContinuumAutoscalerSnapshot;
 use crate::config::{Config, StatusConfig, StorageConfig};
+use crate::continuum_assessment::ContinuumAssessmentSnapshot;
 use crate::continuum_telemetry::ContinuumTelemetrySnapshot;
 use crate::event::{Event, EventKind, Severity, now_ms};
 use crate::governance::GovernanceUpdate;
@@ -740,6 +741,8 @@ struct StatusSnapshot {
     slurm: Option<SlurmSnapshot>,
     #[serde(default)]
     continuum_autoscaler: Option<ContinuumAutoscalerSnapshot>,
+    #[serde(default)]
+    continuum_assessment: Option<ContinuumAssessmentSnapshot>,
     #[serde(default)]
     continuum_telemetry: Option<ContinuumTelemetrySnapshot>,
     #[serde(default)]
@@ -1721,17 +1724,33 @@ fn render_telemetry_server_panel(frame: &mut Frame, area: Rect, app: &TraceyTopA
             ),
             Some(autonomy_tone),
         ),
-        kv_line(
-            theme,
-            "sensors",
-            &format!(
-                "{} thermal / {} fan / {} power",
-                telemetry.server.thermal_sensors.len(),
-                telemetry.server.fan_sensors.len(),
-                telemetry.server.power_sensors.len()
-            ),
-            Some(Tone::Neutral),
-        ),
+        if let Some(assessment) = assessment_snapshot(app) {
+            kv_line(
+                theme,
+                "assessment",
+                &format!(
+                    "{} risk {} cve={} kev={} {}",
+                    assessment.summary.status,
+                    format_ratio_pct(assessment.summary.compromise_risk),
+                    assessment.summary.cve_matches,
+                    assessment.summary.kev_matches,
+                    assessment_comm_brief(assessment)
+                ),
+                Some(assessment_tone(assessment)),
+            )
+        } else {
+            kv_line(
+                theme,
+                "sensors",
+                &format!(
+                    "{} thermal / {} fan / {} power",
+                    telemetry.server.thermal_sensors.len(),
+                    telemetry.server.fan_sensors.len(),
+                    telemetry.server.power_sensors.len()
+                ),
+                Some(Tone::Neutral),
+            )
+        },
     ];
 
     frame.render_widget(
@@ -2208,7 +2227,7 @@ fn render_telemetry_execution_panel(
     frame.render_widget(block, area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(4)])
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(inner);
 
     let summary = vec![
@@ -2238,6 +2257,29 @@ fn render_telemetry_execution_panel(
                     bool_word(guard.control.tmr_enabled)
                 ),
                 Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("assess ", Style::default().fg(theme.muted)),
+            Span::styled(
+                assessment_snapshot(app)
+                    .map(|assessment| {
+                        format!(
+                            "{} risk={} cve={} kev={} {} {}",
+                            assessment.summary.status,
+                            format_ratio_pct(assessment.summary.compromise_risk),
+                            assessment.summary.cve_matches,
+                            assessment.summary.kev_matches,
+                            assessment.summary.recommended_action,
+                            assessment_comm_brief(assessment)
+                        )
+                    })
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                Style::default().fg(
+                    assessment_snapshot(app)
+                        .map(|assessment| tone_color(assessment_tone(assessment), theme))
+                        .unwrap_or(theme.muted),
+                ),
             ),
         ]),
     ];
@@ -3714,6 +3756,36 @@ fn telemetry_snapshot(app: &TraceyTopApp) -> Option<&ContinuumTelemetrySnapshot>
         .and_then(|status| status.continuum_telemetry.as_ref())
 }
 
+fn assessment_snapshot(app: &TraceyTopApp) -> Option<&ContinuumAssessmentSnapshot> {
+    app.status
+        .as_ref()
+        .and_then(|status| status.continuum_assessment.as_ref())
+}
+
+fn assessment_comm_brief(assessment: &ContinuumAssessmentSnapshot) -> String {
+    let comm = &assessment.communication;
+    format!(
+        "comm p{}/{} r{}/{} dup={} sm={}",
+        comm.plan_fetch_successes,
+        comm.plan_fetch_failures,
+        comm.report_successes,
+        comm.report_failures,
+        comm.duplicate_reports,
+        comm.semantic_failures + comm.stale_plan_recoveries
+    )
+}
+
+fn assessment_tone(assessment: &ContinuumAssessmentSnapshot) -> Tone {
+    let risk_tone = tone_for_ratio(assessment.summary.compromise_risk);
+    if assessment.communication.consecutive_failures > 0
+        || assessment.communication.auth_failures > 0
+    {
+        Tone::Warn
+    } else {
+        risk_tone
+    }
+}
+
 fn guard_snapshot(app: &TraceyTopApp) -> Option<&TraceyGuardStatusSnapshot> {
     app.status
         .as_ref()
@@ -4127,6 +4199,7 @@ mod tests {
             tracey_guard: None,
             slurm: None,
             continuum_autoscaler: None,
+            continuum_assessment: None,
             continuum_telemetry: None,
             location: AgentLocationSnapshot::default(),
             peer_locations: Vec::new(),

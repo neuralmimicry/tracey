@@ -46,6 +46,7 @@ pub struct StatusService {
     pub slurm: crate::slurm::SlurmRuntimeHandle,
     pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
     pub continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerHandle>,
+    pub continuum_assessment: Option<crate::continuum_assessment::ContinuumAssessmentHandle>,
     pub continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetryHandle>,
     pub loader_threats: Option<crate::loader_threat::LoaderThreatStatusHandle>,
 }
@@ -100,6 +101,8 @@ struct StatusSnapshot {
     slurm: Option<crate::slurm::SlurmSnapshot>,
     #[serde(default)]
     continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerSnapshot>,
+    #[serde(default)]
+    continuum_assessment: Option<crate::continuum_assessment::ContinuumAssessmentSnapshot>,
     #[serde(default)]
     continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetrySnapshot>,
     #[serde(default)]
@@ -319,6 +322,11 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let continuum_assessment = if let Some(assessment) = &service.continuum_assessment {
+        Some(assessment.snapshot().await)
+    } else {
+        None
+    };
     let mut continuum_telemetry = if let Some(continuum) = &service.continuum_telemetry {
         Some(continuum.snapshot().await)
     } else {
@@ -386,6 +394,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         tracey_guard,
         slurm,
         continuum_autoscaler,
+        continuum_assessment,
         continuum_telemetry,
         loader_threats,
         location,
@@ -761,6 +770,15 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             continuum_autoscaler: parse_object_field(
                 map,
                 &["continuum_autoscaler", "continuumAutoscaler", "autoscaler"],
+            ),
+            continuum_assessment: parse_object_field(
+                map,
+                &[
+                    "continuum_assessment",
+                    "continuumAssessment",
+                    "compromise_assessment",
+                    "compromiseAssessment",
+                ],
             ),
             continuum_telemetry: parse_object_field(
                 map,

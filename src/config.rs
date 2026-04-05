@@ -598,6 +598,7 @@ pub struct Config {
     pub governance: crate::governance::GovernanceConfig,
     pub coordination: CoordinationConfig,
     pub continuum_autoscaler: ContinuumAutoscalerConfig,
+    pub continuum_assessment: ContinuumAssessmentConfig,
     pub loader: LoaderConfig,
     pub status: StatusConfig,
     pub stimuli: StimuliConfig,
@@ -638,6 +639,7 @@ impl Default for Config {
             governance: crate::governance::GovernanceConfig::default(),
             coordination: CoordinationConfig::default(),
             continuum_autoscaler: ContinuumAutoscalerConfig::default(),
+            continuum_assessment: ContinuumAssessmentConfig::default(),
             loader: LoaderConfig::default(),
             status: StatusConfig::default(),
             stimuli: StimuliConfig::default(),
@@ -954,6 +956,72 @@ impl Config {
             || self.continuum_autoscaler.recruit_hosts.is_empty()
         {
             self.continuum_autoscaler.enabled = false;
+        }
+        self.continuum_assessment.plan_poll_interval_ms = self
+            .continuum_assessment
+            .plan_poll_interval_ms
+            .clamp(5_000, 900_000);
+        self.continuum_assessment.request_timeout_ms = self
+            .continuum_assessment
+            .request_timeout_ms
+            .clamp(500, 120_000);
+        self.continuum_assessment.slot_lead_ms = self
+            .continuum_assessment
+            .slot_lead_ms
+            .clamp(0, 3_600_000);
+        self.continuum_assessment.inventory_cache_ttl_ms = self
+            .continuum_assessment
+            .inventory_cache_ttl_ms
+            .clamp(60_000, 24 * 3_600_000);
+        self.continuum_assessment.process_cache_ttl_ms = self
+            .continuum_assessment
+            .process_cache_ttl_ms
+            .clamp(1_000, 3_600_000);
+        self.continuum_assessment.package_max =
+            self.continuum_assessment.package_max.clamp(64, 131_072);
+        self.continuum_assessment.module_max =
+            self.continuum_assessment.module_max.clamp(8, 16_384);
+        self.continuum_assessment.service_max =
+            self.continuum_assessment.service_max.clamp(8, 8_192);
+        self.continuum_assessment.process_max =
+            self.continuum_assessment.process_max.clamp(8, 8_192);
+        self.continuum_assessment.min_samples =
+            self.continuum_assessment.min_samples.clamp(3, 10_000);
+        self.continuum_assessment.fuzzy.order =
+            self.continuum_assessment.fuzzy.order.clamp(1, 8);
+        self.continuum_assessment.fuzzy.uncertainty = self
+            .continuum_assessment
+            .fuzzy
+            .uncertainty
+            .clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.edge_bias = self
+            .continuum_assessment
+            .fuzzy
+            .edge_bias
+            .clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.aarnn_weight = self
+            .continuum_assessment
+            .fuzzy
+            .aarnn_weight
+            .clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.security_weight = self
+            .continuum_assessment
+            .fuzzy
+            .security_weight
+            .clamp(0.0, 1.0);
+        if self.continuum_assessment.base_url.trim().is_empty()
+            && !self.continuum_autoscaler.base_url.trim().is_empty()
+        {
+            self.continuum_assessment.base_url = self.continuum_autoscaler.base_url.clone();
+        }
+        if self.continuum_assessment.bearer_token.is_none()
+            && self.continuum_autoscaler.bearer_token.is_some()
+        {
+            self.continuum_assessment.bearer_token =
+                self.continuum_autoscaler.bearer_token.clone();
+        }
+        if self.continuum_assessment.base_url.trim().is_empty() {
+            self.continuum_assessment.enabled = false;
         }
 
         if self.status.listen_addr.trim().is_empty() {
@@ -1299,6 +1367,126 @@ impl Config {
         ]) {
             self.continuum_autoscaler.max_recruits_per_tick = value as usize;
         }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_ENABLED",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_ENABLED",
+        ]) {
+            self.continuum_assessment.enabled = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_URL",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_URL",
+        ]) {
+            self.continuum_assessment.base_url = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_TOKEN",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_TOKEN",
+        ]) {
+            self.continuum_assessment.bearer_token = Some(value);
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_PLAN_POLL_MS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_PLAN_POLL_MS",
+        ]) {
+            self.continuum_assessment.plan_poll_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_REQUEST_TIMEOUT_MS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_REQUEST_TIMEOUT_MS",
+        ]) {
+            self.continuum_assessment.request_timeout_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_SLOT_LEAD_MS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_SLOT_LEAD_MS",
+        ]) {
+            self.continuum_assessment.slot_lead_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_INVENTORY_CACHE_TTL_MS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_INVENTORY_CACHE_TTL_MS",
+        ]) {
+            self.continuum_assessment.inventory_cache_ttl_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_PROCESS_CACHE_TTL_MS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_PROCESS_CACHE_TTL_MS",
+        ]) {
+            self.continuum_assessment.process_cache_ttl_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_PACKAGE_MAX",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_PACKAGE_MAX",
+        ]) {
+            self.continuum_assessment.package_max = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_MODULE_MAX",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_MODULE_MAX",
+        ]) {
+            self.continuum_assessment.module_max = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_SERVICE_MAX",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_SERVICE_MAX",
+        ]) {
+            self.continuum_assessment.service_max = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_PROCESS_MAX",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_PROCESS_MAX",
+        ]) {
+            self.continuum_assessment.process_max = value as usize;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_INHERIT_GLOBAL_FUZZY",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_INHERIT_GLOBAL_FUZZY",
+        ]) {
+            self.continuum_assessment.inherit_global_fuzzy = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_MIN_SAMPLES",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_MIN_SAMPLES",
+        ]) {
+            self.continuum_assessment.min_samples = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ENABLED",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ENABLED",
+        ]) {
+            self.continuum_assessment.fuzzy.enabled = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ORDER",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ORDER",
+        ]) {
+            self.continuum_assessment.fuzzy.order = value as u8;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_UNCERTAINTY",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_UNCERTAINTY",
+        ]) {
+            self.continuum_assessment.fuzzy.uncertainty = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_EDGE_BIAS",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_EDGE_BIAS",
+        ]) {
+            self.continuum_assessment.fuzzy.edge_bias = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_AARNN_WEIGHT",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_AARNN_WEIGHT",
+        ]) {
+            self.continuum_assessment.fuzzy.aarnn_weight = value;
+        }
+        if let Some(value) = env_f64_any(&[
+            "TRACEY_CONTINUUM_ASSESSMENT_FUZZY_SECURITY_WEIGHT",
+            "NM_TRACEY_CONTINUUM_ASSESSMENT_FUZZY_SECURITY_WEIGHT",
+        ]) {
+            self.continuum_assessment.fuzzy.security_weight = value;
+        }
         if let Some(value) = env_any(&["TRACEY_REFINER_SOURCE", "NM_REFINER_SOURCE"]) {
             self.refiner.source = value;
         }
@@ -1589,6 +1777,48 @@ impl Default for ContinuumAutoscalerConfig {
             slurm_pending_jobs: 1,
             slurm_allocated_ratio: 0.80,
             max_recruits_per_tick: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumAssessmentConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub bearer_token: Option<String>,
+    pub plan_poll_interval_ms: u64,
+    pub request_timeout_ms: u64,
+    pub slot_lead_ms: u64,
+    pub inventory_cache_ttl_ms: u64,
+    pub process_cache_ttl_ms: u64,
+    pub package_max: usize,
+    pub module_max: usize,
+    pub service_max: usize,
+    pub process_max: usize,
+    pub inherit_global_fuzzy: bool,
+    pub min_samples: u64,
+    pub fuzzy: FuzzyConfig,
+}
+
+impl Default for ContinuumAssessmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: String::new(),
+            bearer_token: None,
+            plan_poll_interval_ms: 60_000,
+            request_timeout_ms: 15_000,
+            slot_lead_ms: 60_000,
+            inventory_cache_ttl_ms: 8 * 60 * 60 * 1000,
+            process_cache_ttl_ms: 5 * 60 * 1000,
+            package_max: 8_192,
+            module_max: 2_048,
+            service_max: 1_024,
+            process_max: 256,
+            inherit_global_fuzzy: true,
+            min_samples: 24,
+            fuzzy: FuzzyConfig::default(),
         }
     }
 }

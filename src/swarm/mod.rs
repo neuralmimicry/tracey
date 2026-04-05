@@ -6,4 +6,4 @@ mod learning;
 
 pub use agent::{Agent, SwarmDirective};
 pub use coordinator::{Coordinator, Decision};
-pub use learning::{AdaptiveScorer, LearningSnapshot};
+pub use learning::{AdaptiveScorer, FuzzyTelemetry, LearningSnapshot};
