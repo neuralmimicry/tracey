@@ -461,6 +461,7 @@ pub struct TraceyBanConfig {
     pub sudo_program: String,
     pub sudo_non_interactive: bool,
     pub use_sudo_for_actions: bool,
+    pub allow_shell_actions: bool,
     pub inherit_global_fuzzy: bool,
     pub min_samples: u64,
     pub fuzzy: FuzzyConfig,
@@ -484,6 +485,7 @@ impl Default for TraceyBanConfig {
             sudo_program: "sudo".to_string(),
             sudo_non_interactive: true,
             use_sudo_for_actions: true,
+            allow_shell_actions: false,
             inherit_global_fuzzy: true,
             min_samples: 12,
             fuzzy: FuzzyConfig::default(),
@@ -501,7 +503,10 @@ pub struct TraceyBanJailConfig {
     pub name: String,
     pub enabled: bool,
     pub backend: String,
+    pub filter_catalog: Option<String>,
+    pub action_catalog: Option<String>,
     pub log_paths: Vec<PathBuf>,
+    pub journal_matches: Vec<String>,
     pub filter_files: Vec<PathBuf>,
     pub fail_regex: Vec<String>,
     pub ignore_regex: Vec<String>,
@@ -516,6 +521,14 @@ pub struct TraceyBanJailConfig {
     pub ignore_ips: Vec<String>,
     pub poll_interval_ms: u64,
     pub event_ip_keys: Vec<String>,
+    pub event_require_message_match: bool,
+    pub scan_all_event_attrs_for_ip: bool,
+    pub ports: Vec<u16>,
+    pub protocol: String,
+    pub firewall_backend: String,
+    pub firewalld_zone: Option<String>,
+    pub nftables_table: String,
+    pub nftables_chain: String,
     pub action_start: Option<String>,
     pub action_stop: Option<String>,
     pub action_ban: Option<String>,
@@ -529,13 +542,13 @@ impl Default for TraceyBanJailConfig {
         Self {
             name: "tracey-default".to_string(),
             enabled: true,
-            backend: "tracey_event".to_string(),
+            backend: "auto".to_string(),
+            filter_catalog: Some("sshd".to_string()),
+            action_catalog: Some("auto".to_string()),
             log_paths: Vec::new(),
+            journal_matches: Vec::new(),
             filter_files: Vec::new(),
-            fail_regex: vec![
-                r"(?i)(failed|invalid|denied|rejected|unauthorized).*?(?P<host>(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4})".to_string(),
-                r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4})".to_string(),
-            ],
+            fail_regex: Vec::new(),
             ignore_regex: Vec::new(),
             prefilter_regex: None,
             max_retry: 3,
@@ -553,7 +566,16 @@ impl Default for TraceyBanJailConfig {
                 "source_ip".to_string(),
                 "client_ip".to_string(),
                 "remote_addr".to_string(),
+                "tracey_ban_ip".to_string(),
             ],
+            event_require_message_match: true,
+            scan_all_event_attrs_for_ip: false,
+            ports: vec![22],
+            protocol: "tcp".to_string(),
+            firewall_backend: "auto".to_string(),
+            firewalld_zone: None,
+            nftables_table: "tracey_ban".to_string(),
+            nftables_chain: "tracey_input".to_string(),
             action_start: None,
             action_stop: None,
             action_ban: None,
@@ -884,8 +906,18 @@ impl Config {
             }
             jail.backend = jail.backend.trim().to_ascii_lowercase();
             if jail.backend.is_empty() {
-                jail.backend = "tracey_event".to_string();
+                jail.backend = "auto".to_string();
             }
+            jail.filter_catalog = jail
+                .filter_catalog
+                .as_ref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty());
+            jail.action_catalog = jail
+                .action_catalog
+                .as_ref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty());
             jail.max_retry = jail.max_retry.clamp(1, 100);
             jail.find_time_ms = jail.find_time_ms.clamp(1_000, 86_400_000);
             jail.ban_time_ms = jail.ban_time_ms.clamp(-1, 86_400_000);
@@ -894,6 +926,26 @@ impl Config {
             jail.ban_randomize_ms = jail.ban_randomize_ms.clamp(0, 300_000);
             jail.poll_interval_ms = jail.poll_interval_ms.clamp(100, 120_000);
             jail.action_timeout_ms = jail.action_timeout_ms.clamp(250, 120_000);
+            jail.protocol = jail.protocol.trim().to_ascii_lowercase();
+            if jail.protocol.is_empty() {
+                jail.protocol = "tcp".to_string();
+            }
+            jail.firewall_backend = jail.firewall_backend.trim().to_ascii_lowercase();
+            if jail.firewall_backend.is_empty() {
+                jail.firewall_backend = "auto".to_string();
+            }
+            jail.ports.retain(|port| *port > 0);
+            jail.ports.sort_unstable();
+            jail.ports.dedup();
+            if jail.ports.is_empty() {
+                jail.ports = TraceyBanJailConfig::default().ports;
+            }
+            if jail.nftables_table.trim().is_empty() {
+                jail.nftables_table = "tracey_ban".to_string();
+            }
+            if jail.nftables_chain.trim().is_empty() {
+                jail.nftables_chain = "tracey_input".to_string();
+            }
             if jail.shell.trim().is_empty() {
                 jail.shell = "/bin/sh".to_string();
             }
@@ -965,10 +1017,8 @@ impl Config {
             .continuum_assessment
             .request_timeout_ms
             .clamp(500, 120_000);
-        self.continuum_assessment.slot_lead_ms = self
-            .continuum_assessment
-            .slot_lead_ms
-            .clamp(0, 3_600_000);
+        self.continuum_assessment.slot_lead_ms =
+            self.continuum_assessment.slot_lead_ms.clamp(0, 3_600_000);
         self.continuum_assessment.inventory_cache_ttl_ms = self
             .continuum_assessment
             .inventory_cache_ttl_ms
@@ -987,23 +1037,13 @@ impl Config {
             self.continuum_assessment.process_max.clamp(8, 8_192);
         self.continuum_assessment.min_samples =
             self.continuum_assessment.min_samples.clamp(3, 10_000);
-        self.continuum_assessment.fuzzy.order =
-            self.continuum_assessment.fuzzy.order.clamp(1, 8);
-        self.continuum_assessment.fuzzy.uncertainty = self
-            .continuum_assessment
-            .fuzzy
-            .uncertainty
-            .clamp(0.0, 1.0);
-        self.continuum_assessment.fuzzy.edge_bias = self
-            .continuum_assessment
-            .fuzzy
-            .edge_bias
-            .clamp(0.0, 1.0);
-        self.continuum_assessment.fuzzy.aarnn_weight = self
-            .continuum_assessment
-            .fuzzy
-            .aarnn_weight
-            .clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.order = self.continuum_assessment.fuzzy.order.clamp(1, 8);
+        self.continuum_assessment.fuzzy.uncertainty =
+            self.continuum_assessment.fuzzy.uncertainty.clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.edge_bias =
+            self.continuum_assessment.fuzzy.edge_bias.clamp(0.0, 1.0);
+        self.continuum_assessment.fuzzy.aarnn_weight =
+            self.continuum_assessment.fuzzy.aarnn_weight.clamp(0.0, 1.0);
         self.continuum_assessment.fuzzy.security_weight = self
             .continuum_assessment
             .fuzzy
@@ -1017,8 +1057,7 @@ impl Config {
         if self.continuum_assessment.bearer_token.is_none()
             && self.continuum_autoscaler.bearer_token.is_some()
         {
-            self.continuum_assessment.bearer_token =
-                self.continuum_autoscaler.bearer_token.clone();
+            self.continuum_assessment.bearer_token = self.continuum_autoscaler.bearer_token.clone();
         }
         if self.continuum_assessment.base_url.trim().is_empty() {
             self.continuum_assessment.enabled = false;
@@ -1127,6 +1166,12 @@ impl Config {
             "NM_TRACEY_BAN_USE_SUDO_FOR_ACTIONS",
         ]) {
             self.tracey_ban.use_sudo_for_actions = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_ALLOW_SHELL_ACTIONS",
+            "NM_TRACEY_BAN_ALLOW_SHELL_ACTIONS",
+        ]) {
+            self.tracey_ban.allow_shell_actions = value;
         }
         if let Some(value) = env_bool_any(&[
             "TRACEY_BAN_INHERIT_GLOBAL_FUZZY",

@@ -1,6 +1,6 @@
 # Compliance Posture
 
-This document describes the compliance-relevant controls that are actually present in the repository as of **31 March 2026**. It does **not** claim that this codebase, on its own, delivers ISO/IEC 27001 certification, SOC 2 attestation, or any other formal assurance outcome.
+This document describes the compliance-relevant controls that are actually present in the repository as of **7 April 2026**. It does **not** claim that this codebase, on its own, delivers ISO/IEC 27001 certification, SOC 2 attestation, or any other formal assurance outcome.
 
 Formal compliance depends on organisational scope, operating procedures, change control, access governance, evidence retention, legal review, audit sampling, and independent assessment. The repository can support those activities, but it does not replace them.
 

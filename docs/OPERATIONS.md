@@ -1,10 +1,10 @@
 # Operations Guide
 
-This guide documents how the current codebase operates in practice as of **31 March 2026**. It is intended for engineers running Tracey locally, under supervisor mode, or through the separate `tracey-loader` service model.
+This guide documents how the current codebase operates in practice as of **8 April 2026**. It is intended for engineers running Tracey locally, under supervisor mode, or through the separate `tracey-loader` service model.
 
 ## Runtime Modes
 
-The repository exposes three distinct execution patterns.
+The repository exposes three runtime modes plus an attach-only operator dashboard.
 
 ### 1. Main runtime: `tracey`
 
@@ -56,6 +56,59 @@ Behaviour:
 - can promote locally staged updates handed to it by the core runtime
 - can synchronise newer production cores from peers
 - maintains rollback state during a probation window before redistributing the new core
+- records suspicious provider and artifact incidents into loader-threat state and exposes the current summary via `/loader/status`
+
+### 4. Operator dashboard: `tracey --tui` / `tracey-top`
+
+Use this when you want an attach-only dashboard over the status surface and JSONL activity log.
+
+```bash
+cargo run -- --tui
+cargo run -- --tui --help
+cargo run --bin tracey-top -- --help
+```
+
+Behaviour:
+
+- `tracey --tui` and `tracey-top` expose the same dashboard interface
+- page 1 is the overview, page 2 is locations, and page 3 is Continuum telemetry
+- current options are `--status`, `--bearer`, `--log-path` or `--no-log`, `--refresh-ms`, and `--tail-bytes`
+- when `--status` is omitted, the dashboard prefers a reachable local agent instead of starting duplicate collectors
+- the minimum supported terminal size is `120x33`
+
+## Operator CLI
+
+Use this when you want status and control access without hand-writing `curl` requests.
+
+```bash
+cargo run -- status
+TRACEY_STATUS_ADDR=http://127.0.0.1:48000 cargo run -- tracey-ban status
+cargo run -- tracey-ban filters
+cargo run -- tracey-ban actions
+cargo run -- tracey-ban ban --jail sshd-auth --ip 198.51.100.42 --reason manual
+cargo run -- tracey-ban unban --jail sshd-auth --ip 198.51.100.42 --reason cleared
+cargo run -- tracey-ban refresh-backend --jail sshd-auth
+cargo run -- tracey-guard status
+cargo run -- tracey-guard enable
+cargo run -- tracey-guard deep-dive on
+cargo run -- tracey-guard tmr off
+cargo run -- tracey-guard set-overhead --pct 7.5
+cargo run -- tracey-guard set-parallelism --count 8
+cargo run -- tracey-guard force-scan
+```
+
+Operational notes:
+
+- `tracey status` reads `/status`
+- `tracey tracey-ban status|ban|unban|refresh-backend` read or write `/tracey_ban` and `/control/tracey_ban`
+- `tracey tracey-ban filters|actions` print the built-in filter and action catalogs without contacting the API
+- `tracey tracey-guard status` reads `/tracey_guard`
+- `tracey tracey-guard enable|disable|deep-dive|tmr|set-overhead|set-parallelism|force-scan` write `/control/tracey_guard`
+- `--addr`, `TRACEY_STATUS_ADDR`, `status.public_addr`, and `status.listen_addr` are resolved in that order
+- `--token`, `TRACEY_STATUS_TOKEN`, and `TRACEY_AUTH_BEARER` all provide the bearer token
+- local no-scheme targets default to `http://`; non-local no-scheme targets default to `https://`
+- listener binds such as `0.0.0.0:48000` and `[::]:48000` are rewritten to loopback for local operator use
+- add `--json` to print the raw API payload
 
 ## Update Signing Command
 
@@ -84,9 +137,9 @@ The main runtime in `src/lib.rs` starts in a fixed order.
 1. Parse the CLI for `sign-update`, `--version`, and `--supervisor`.
 2. Load config from defaults, optional JSON, environment overrides, and sanitisation.
 3. Optionally re-exec via `sudo` if TraceyBan requires elevated access.
-4. Build shutdown, storage, inventory, governance state, coordination, and swarm channels.
-5. Start coordination, coordinator, Prometheus export, and swarm agents.
-6. Start status, sensors, embedded collectors, stimuli, telemetry, TraceyBan, discovery, asset feed, Refiner tracking, and the update manager.
+4. Build shutdown, storage, inventory, governance state, coordination, auth, Slurm, and loader-threat handles plus the swarm channels.
+5. Start coordination election, the coordinator, Prometheus export, Continuum telemetry, Continuum assessment, Continuum autoscaler, swarm agents, and the status server.
+6. Start the remaining producers and side runtimes: stimuli, telemetry ingest, synthetic sensors, embedded collectors, TraceyBan, discovery, asset feed, Refiner tracking, and the update manager.
 7. Signal hand-off readiness if a parent process requested it.
 
 Operational consequence: the decision-making core is always started before most producers and side subsystems.
@@ -95,7 +148,7 @@ Operational consequence: the decision-making core is always started before most 
 
 | Surface | Default bind | Purpose | Security note |
 | --- | --- | --- | --- |
-| Status API | `0.0.0.0:48000` | Status, health, readiness, TraceyGuard views and control, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is always unauthenticated in-process. |
+| Status API | `0.0.0.0:48000` | Status, health, readiness, location, TraceyBan, TraceyGuard, Continuum surfaces, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is always unauthenticated in-process. |
 | Discovery gossip | `0.0.0.0:47990` | Peer presence, capability, ban, fault, Slurm, and Prometheus-probe gossip | Shared-key authenticated, not encrypted. |
 | Loader gossip | `0.0.0.0:47989` | Loader peer announcements | Shared-key authenticated, not encrypted. |
 | Loader transfer | `0.0.0.0:47988` | Loader health, status, metadata, signature, and bundle distribution | Plain HTTP; integrity is checked after download. |
@@ -112,6 +165,8 @@ When `status.enabled` is true, the Axum server exposes:
 - `GET /status`
 - `GET /health`
 - `GET /ready`
+- `GET /tracey_ban`
+- `POST /control/tracey_ban`
 - `GET /tracey_guard`
 - `GET /tracey_guard/deepdive`
 - `POST /control/tracey_guard`
@@ -122,9 +177,12 @@ Important operational notes:
 
 - `/status`, `/health`, and `/ready` all return the same status snapshot shape
 - followers may proxy `/status` to the elected proxy node
+- `/tracey_ban` returns TraceyBan jail state, active bans, and remote ban intelligence
 - `/tracey_guard/deepdive` currently returns the same snapshot shape as `/tracey_guard`
+- `/control/tracey_ban` and `/control/tracey_guard` are the endpoints used by the operator CLI
 - `/metrics` does not pass through OIDC route protection
 - `/prometheus/ingest` is authenticated by a shared-key request MAC rather than OIDC
+- the status snapshot includes posture and coordination plus optional Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and inferred location snapshots
 
 ### Loader transfer server
 
@@ -138,6 +196,7 @@ When `tracey-loader` is running, the transfer server exposes:
 
 Important operational notes:
 
+- `/loader/status` returns the current core version/channel, distributable state, pending rollback state, and the current loader-threat snapshot
 - bundle-serving routes return `404` unless the local core is distributable
 - a core is distributable only when both the loader policy channel and the current core channel are production, and there is no pending rollback probation
 
@@ -201,6 +260,8 @@ Important files and directories include:
 - `loader/rollback/tracey-core.previous.sig`
 - `loader/tracey-loader.rollback.json`
 - `loader/tracey-loader.manifest.json`
+- `loader/tracey-loader.threats.state.json`
+- `loader/tracey-loader.threats.snapshot.json`
 - `loader/staging/`
 
 Operational meaning:
@@ -209,6 +270,8 @@ Operational meaning:
 - `rollback/` stores the previous verified core during a probation window
 - `tracey-loader.rollback.json` records the current probation state
 - `tracey-loader.manifest.json` records the loader binary digest and last verification timestamp
+- `tracey-loader.threats.state.json` stores persisted local loader-threat incidents
+- `tracey-loader.threats.snapshot.json` stores the latest loader-threat snapshot used by `/loader/status` and the main `/status` surface
 - `staging/` is used for fetched peer cores and archived failed promotions
 
 ### TraceyBan state
@@ -230,9 +293,11 @@ cargo run
 cargo test --all-targets
 ```
 
-Current verified result on **31 March 2026**:
+Current verified result on **7 April 2026**:
 
-- `cargo test --all-targets` passed with `99 passed, 0 failed`
+- `cargo test --all-targets` passed with `145 passed, 0 failed`
+- `cargo run --locked --bin tracey -- --tui --help` printed the current three-page dashboard help
+- `cargo run --locked --bin tracey-top -- --help` matched the same interface
 
 Practical expectations for an unconfigured run:
 
@@ -240,7 +305,9 @@ Practical expectations for an unconfigured run:
 - embedded collectors and TraceyGuard are active
 - discovery and status surfaces are active
 - status binds to `0.0.0.0:48000`
-- Prometheus pertinent-log export begins probing `http://prometheus.neuralmimicry.ai/-/ready`
+- Continuum telemetry and inferred location snapshots are available on `/status` and in the dashboard even before any external Continuum service is configured
+- Continuum assessment and Continuum autoscaler remain disabled until a Continuum base URL is configured
+- Prometheus pertinent-log export begins probing `https://prometheus.neuralmimicry.ai/-/ready`
 
 ## Loader Bootstrap Workflow
 
@@ -396,6 +463,8 @@ By default the installer writes a minimal JSON config containing:
 
 The generated config relies on the built-in default status surface of `0.0.0.0:48000` unless an existing config is being preserved.
 
+That installer-generated Prometheus URL intentionally overrides the compiled `https://` default unless you preserve or replace the config.
+
 It does **not** write discovery or update shared keys automatically.
 
 ### Generated environment file
@@ -444,7 +513,7 @@ A minimal production hardening pass should normally include all of the following
 2. Move `status.listen_addr` to loopback or place the service behind a trusted reverse proxy or service mesh.
 3. Enable OIDC if any status or OTLP surface is reachable by untrusted clients.
 4. Decide whether synthetic sensors and TraceyGuard synthetic fallback are acceptable in the target environment.
-5. Disable Prometheus pertinent-log export if probing `http://prometheus.neuralmimicry.ai/-/ready` is not desired.
+5. Disable Prometheus pertinent-log export if probing `https://prometheus.neuralmimicry.ai/-/ready` is not desired, or `http://prometheus.neuralmimicry.ai/-/ready` when using the installer-generated config.
 6. Review all TraceyBan action hooks as privileged code before enabling them.
 7. Restrict loader transfer reachability and add external TLS if bundle confidentiality matters.
 8. Review relative-path behaviour so logs, updates, loader state, and TraceyBan state land in the intended directory tree.

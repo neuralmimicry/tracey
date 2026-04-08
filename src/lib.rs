@@ -6,6 +6,7 @@ pub mod auth;
 pub mod autoscaler;
 pub mod bus;
 pub mod capabilities;
+mod cli;
 pub mod config;
 pub mod continuum_assessment;
 pub mod continuum_telemetry;
@@ -43,7 +44,7 @@ use crate::bus::EventBus;
 use crate::config::Config;
 use crate::shutdown::Shutdown;
 use crate::swarm::{AdaptiveScorer, Agent, Coordinator, LearningSnapshot, SwarmDirective};
-use crate::tracey_ban::BanIntelHub;
+use crate::tracey_ban::{BanIntelHub, TraceyBanRuntimeHandle};
 use crate::tracey_guard::TraceyGuardRuntimeHandle;
 use crate::update::UpdateManager;
 use std::net::SocketAddr;
@@ -73,6 +74,9 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
     }
     if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
         println!("{}", package_version());
+        return Ok(());
+    }
+    if cli::maybe_run_cli(&args).await? {
         return Ok(());
     }
 
@@ -253,6 +257,22 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         slurm_runtime.clone(),
         shutdown_listener.clone(),
     );
+    let mut tracey_ban_config = config.tracey_ban.clone();
+    if tracey_ban_config.inherit_global_fuzzy {
+        tracey_ban_config.fuzzy = config.fuzzy.clone();
+        tracey_ban_config.min_samples = config.min_samples;
+    }
+    let tracey_ban_runtime = if config.tracey_ban.enabled {
+        tracey_ban::spawn_tracey_ban(
+            tracey_ban_config,
+            bus.clone(),
+            storage.clone(),
+            shutdown_listener.clone(),
+            ban_intel.clone(),
+        )
+    } else {
+        TraceyBanRuntimeHandle::disabled(ban_intel.clone())
+    };
 
     for id in 0..config.agents {
         let agent = Agent::new(
@@ -302,6 +322,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     } else {
                         None
                     },
+                    tracey_ban: Some(tracey_ban_runtime.clone()),
                     tracey_guard: Some(tracey_guard.clone()),
                     slurm: slurm_runtime.clone(),
                     prometheus_export: prometheus_export_handle.clone(),
@@ -367,26 +388,6 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
             telemetry_shutdown,
             telemetry_governance,
             telemetry_auth,
-        )
-        .await;
-    });
-
-    let mut tracey_ban_config = config.tracey_ban.clone();
-    if tracey_ban_config.inherit_global_fuzzy {
-        tracey_ban_config.fuzzy = config.fuzzy.clone();
-        tracey_ban_config.min_samples = config.min_samples;
-    }
-    let tracey_ban_bus = bus.clone();
-    let tracey_ban_storage = storage.clone();
-    let tracey_ban_shutdown = shutdown_listener.clone();
-    let tracey_ban_intel = ban_intel.clone();
-    tokio::spawn(async move {
-        tracey_ban::spawn_tracey_ban(
-            tracey_ban_config,
-            tracey_ban_bus,
-            tracey_ban_storage,
-            tracey_ban_shutdown,
-            tracey_ban_intel,
         )
         .await;
     });

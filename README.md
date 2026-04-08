@@ -24,9 +24,12 @@ The current code does all of the following:
 - enables Linux embedded collectors by default when running on Linux
 - enables `TraceyGuard` by default and falls back to synthetic GPU identities when no real devices are discovered
 - enables authenticated discovery gossip by default on UDP `47990`
+- always attempts Slurm/Continuum environment detection and folds the result into capability tags and status snapshots when a local deployment is detected
 - enables the HTTP status surface by default on `0.0.0.0:48000`
+- always maintains bounded Continuum telemetry and inferred location snapshots for the status and dashboard surfaces
 - leaves `auth.mode` off by default, which means status and TraceyGuard control routes are unauthenticated unless you explicitly enable OIDC
 - enables the Prometheus log exporter by default, which probes `https://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
+- ships Continuum assessment and autoscaler integrations, but both sanitize off until a Continuum base URL is configured and the autoscaler also has recruit hosts
 
 That default profile is useful for local evaluation and continuous self-exercise, but it is not a hardened deployment baseline.
 
@@ -40,7 +43,11 @@ That default profile is useful for local evaluation and continuous self-exercise
 | Discovery gossip | On | Broadcast UDP with a shared-key MAC; default key is a development placeholder. |
 | Status API | On | Binds to `0.0.0.0:48000`; authorisation is off until OIDC is enabled. |
 | Prometheus log export | On | Depends on status being enabled; exposes `/metrics` and signed `/prometheus/ingest`. |
+| Slurm detection | On | Best-effort native and Continuum Podman detection; contributes capability tags and status snapshots when found. |
+| Continuum telemetry snapshot | On | Always builds bounded host, GPU, action, and probe telemetry for `/status` and page 3 of the dashboard. |
 | Coordination and governance | On | Leader election, proxy selection, and posture voting run automatically. |
+| Continuum assessment | Off by effective default | The config struct defaults `enabled=true`, but sanitisation disables it until `continuum_assessment.base_url` or an inherited Continuum URL is available. |
+| Continuum autoscaler | Off | Requires a Continuum `base_url` plus non-empty recruit hosts; otherwise sanitisation disables it. |
 | Telemetry ingest | Off | Prometheus scraping and OTLP receivers are disabled until configured. |
 | Refiner tracking | Off | Health polling and security-feed ingestion are opt-in. |
 | Asset feed | Off | JSONL host-observation ingestion is opt-in. |
@@ -87,19 +94,48 @@ Preferred operator TUI entrypoint, inspired by `btop` and built around Tracey's 
 - `cargo run --bin tracey -- --tui --status http://127.0.0.1:48000 --log-path ./tracey.log.jsonl`
 - `cargo run --bin tracey -- --tui --no-log`
 
-`tracey --tui` reads `/status` for governance, coordination, TraceyGuard, Slurm, and autoscaler snapshots, then tails the JSONL storage log for signal history, recent decisions, and hot processes.
+`tracey --tui` reads `/status` for governance, coordination, TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and location snapshots, then tails the JSONL storage log for signal history, recent decisions, and hot processes.
 
 When `--status` is omitted, the dashboard prefers a reachable local `tracey` or loader-managed `tracey-core` agent if one is already running, so `--tui` stays attach-only instead of starting duplicate collectors.
 
 No-scheme loopback targets default to `http://`; other no-scheme dashboard targets default to `https://`. The header shows `🔒 https` or `🔓 http` for the active status connection.
 
-The dashboard now has two pages: the original overview and a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency.
+The dashboard now has three pages: the original overview, a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency, and a telemetry page for Continuum host, GPU, action, and probe snapshots.
 
 Location confidence improves when the runtime can see direct hints. `TRACEY_SITE`, `TRACEY_BUILDING`, `TRACEY_ROOM`, and `TRACEY_GEO` are consumed automatically, propagated through discovery capability tags, and reused by the location page when peers are close enough to share the same inferred room/building/site.
 
 The dashboard expects at least a `120x33` terminal. Smaller windows render a resize notice instead of a broken layout.
 
 `tracey-top` remains available as a thin compatibility wrapper around the same dashboard.
+
+`tracey --tui --help` and `tracey-top --help` expose the current dashboard flags: `--status`, `--bearer`, `--log-path` or `--no-log`, `--refresh-ms`, and `--tail-bytes`.
+
+## Operator CLI
+
+The main `tracey` binary also exposes a lightweight operator CLI that talks to the same status and control routes used by the dashboard.
+
+- `cargo run --bin tracey -- status`
+- `TRACEY_STATUS_ADDR=http://127.0.0.1:48000 cargo run --bin tracey -- tracey-ban status`
+- `cargo run --bin tracey -- tracey-ban filters`
+- `cargo run --bin tracey -- tracey-ban actions`
+- `cargo run --bin tracey -- tracey-ban ban --jail sshd-auth --ip 198.51.100.42 --reason manual`
+- `cargo run --bin tracey -- tracey-ban unban --jail sshd-auth --ip 198.51.100.42 --reason cleared`
+- `cargo run --bin tracey -- tracey-ban refresh-backend --jail sshd-auth`
+- `cargo run --bin tracey -- tracey-guard status`
+- `cargo run --bin tracey -- tracey-guard enable`
+- `cargo run --bin tracey -- tracey-guard deep-dive on`
+- `cargo run --bin tracey -- tracey-guard tmr off`
+- `cargo run --bin tracey -- tracey-guard set-overhead --pct 7.5`
+- `cargo run --bin tracey -- tracey-guard set-parallelism --count 8`
+- `cargo run --bin tracey -- tracey-guard force-scan`
+
+Operator CLI notes:
+
+- `--addr`, `TRACEY_STATUS_ADDR`, `status.public_addr`, and `status.listen_addr` are resolved in that order
+- `--token`, `TRACEY_STATUS_TOKEN`, and `TRACEY_AUTH_BEARER` all provide the bearer token for protected status/control routes
+- loopback-like addresses without a scheme default to `http://`; non-local addresses default to `https://`
+- listener binds such as `0.0.0.0:48000` and `[::]:48000` are rewritten to loopback for local CLI use
+- `--json` prints the raw API payload for scripting or troubleshooting
 
 ## End-to-End Workflow Summary
 
@@ -120,7 +156,7 @@ The dashboard expects at least a `120x33` terminal. Smaller windows render a res
 
 | Surface | Default bind | Protocol | Purpose | Security note |
 | --- | --- | --- | --- | --- |
-| Status API | `0.0.0.0:48000` | HTTP | `/status`, `/health`, `/ready`, TraceyGuard views and control, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is never OIDC-gated. |
+| Status API | `0.0.0.0:48000` | HTTP | `/status`, `/health`, `/ready`, TraceyBan and TraceyGuard views/control, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is never OIDC-gated. |
 | Discovery | `0.0.0.0:47990` to broadcast `255.255.255.255:47990` | UDP | Peer presence, capability, ban, fault, Slurm, and Prometheus-probe gossip | Shared-key authenticated, but not encrypted. |
 | Loader gossip | `0.0.0.0:47989` | UDP | Loader peer announcements for distributable cores | Shared-key authenticated, not encrypted. |
 | Loader transfer | `0.0.0.0:47988` | HTTP | Health, loader status, current core metadata, signature, and bundle | Plain HTTP; integrity is checked after download. |
@@ -133,10 +169,16 @@ The dashboard expects at least a `120x33` terminal. Smaller windows render a res
 When `status.enabled` is true, the Axum server exposes:
 
 - `/status`, `/health`, `/ready`: JSON status snapshots; followers may proxy these to the selected proxy address
+- `/tracey_ban`: TraceyBan jail and ban-intelligence status snapshot
+- `/control/tracey_ban`: TraceyBan manual ban, unban, and backend refresh control updates
 - `/tracey_guard` and `/tracey_guard/deepdive`: TraceyGuard status snapshots
 - `/control/tracey_guard`: runtime control updates for TraceyGuard
 - `/metrics`: Prometheus exposition for the elected pertinent-log exporter
 - `/prometheus/ingest`: signed follower-to-exporter batch intake
+
+The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and inferred self/peer location snapshots.
+
+The operator CLI subcommands `tracey status`, `tracey tracey-ban ...`, and `tracey tracey-guard ...` are thin wrappers over these same routes.
 
 ### Loader transfer routes
 
@@ -147,6 +189,8 @@ When `tracey-loader` is running, the transfer server exposes:
 - `/loader/core/metadata`
 - `/loader/core/signature`
 - `/loader/core/bundle`
+
+The `/loader/status` payload includes the active core version/channel, distributable state, rollback state, and the current loader-threat snapshot.
 
 The bundle-serving routes only respond when the local core is considered distributable, which in the current implementation means a production-channel core with no pending rollback probation.
 
@@ -226,6 +270,8 @@ The OTA update path uses `update.update_dir` and expects:
 - `loader/staging/*`
 - `loader/tracey-loader.manifest.json`
 - `loader/tracey-loader.rollback.json`
+- `loader/tracey-loader.threats.state.json`
+- `loader/tracey-loader.threats.snapshot.json`
 
 ## Update and Loader Behaviour
 
@@ -255,6 +301,7 @@ The built-in update manager can:
 - fetches newer production cores from peers, verifies them locally, and hands over without stopping the service
 - maintains a rollback probation window before redistributing a newly promoted core
 - restores the previous signed core automatically when a newly promoted core crashes during probation
+- records suspicious provider and artifact incidents in loader-threat state and exposes the current summary through `/loader/status`
 
 A new loader deployment must be bootstrapped with a core binary at `loader/current/tracey-core`. If metadata and signature are missing, the loader generates them locally using the configured shared key.
 
@@ -275,6 +322,8 @@ What the script does in the current implementation:
 - enables and optionally starts the service
 - in system scope, prefers `sudo` and disables a conflicting user-scope Tracey service when necessary
 
+The installer-written JSON config also overrides `prometheus_log_export.server_url` to `http://prometheus.neuralmimicry.ai`, which differs from the compiled `https://` default unless an existing config is preserved.
+
 See `[docs/OPERATIONS.md](docs/OPERATIONS.md)` for operational detail.
 
 ## GitHub Release Workflow
@@ -284,6 +333,7 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 Current behavior:
 
 - every pull request and push to `main` runs the Rust verification job
+- the verification job also smoke-tests `tracey --tui --help` and shell-syntax checks the release scripts
 - pushing a `v*` tag packages release artifacts for Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64, iOS arm64, and Android arm64, then publishes a GitHub release
 - manual `workflow_dispatch` runs can package artifacts from any ref
 - manual publishing is allowed only when the workflow is run against a `v*` tag ref and `publish_release` is enabled
@@ -316,10 +366,15 @@ Detailed guidance is in `[SECURITY.md](SECURITY.md)`. Compliance posture notes a
 
 ## Local Verification
 
-Last locally verified on **31 March 2026**:
+Last locally verified on **8 April 2026**:
 
 ```bash
-cargo test --all-targets
+cargo test
+cargo run --locked --bin tracey -- --help
+cargo run --locked --bin tracey -- tracey-ban actions
+cargo run --locked --bin tracey -- tracey-guard --help
+cargo run --locked --bin tracey -- --tui --help
+cargo run --locked --bin tracey-top -- --help
 ```
 
-Result: **99 tests passed, 0 failed**.
+Result: **171 tests passed, 0 failed**. The dashboard help commands still matched the documented three-page interface and the operator CLI help/catalog commands matched the documented `tracey-ban` and `tracey-guard` surfaces.

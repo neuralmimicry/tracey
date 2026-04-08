@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This reference describes the configuration model implemented in the repository as of **31 March 2026**. It is based on `src/config.rs` and the runtime wiring in `src/lib.rs`, `src/update.rs`, `src/loader.rs`, `src/status.rs`, and related modules.
+This reference describes the configuration model implemented in the repository as of **7 April 2026**. It is based on `src/config.rs` and the runtime wiring in `src/lib.rs`, `src/update.rs`, `src/loader.rs`, `src/status.rs`, and related modules.
 
 ## Loading Order
 
@@ -42,8 +42,12 @@ A plain `cargo run` or `tracey` launch with no config file currently results in 
 - TraceyGuard enabled
 - discovery enabled on UDP `47990`
 - status enabled on `0.0.0.0:48000`
+- best-effort Slurm detection active, contributing status snapshots and capability tags when a local deployment is detected
 - OIDC support present but disabled
 - Prometheus pertinent-log export enabled
+- Continuum telemetry snapshots always populated for `/status` and the dashboard
+- Continuum assessment effectively disabled until a Continuum base URL is available
+- Continuum autoscaler disabled until both a Continuum base URL and recruit hosts are configured
 - telemetry ingest disabled
 - TraceyBan disabled
 - asset feed disabled
@@ -220,7 +224,7 @@ Important behaviour:
 | Field | Default | Notes |
 | --- | --- | --- |
 | `prometheus_log_export.enabled` | `true` | Enables the exporter runtime when status is enabled. |
-| `prometheus_log_export.server_url` | `http://prometheus.neuralmimicry.ai` | External Prometheus instance probed for readiness. |
+| `prometheus_log_export.server_url` | `https://prometheus.neuralmimicry.ai` | External Prometheus instance probed for readiness. |
 | `prometheus_log_export.probe_path` | `/-/ready` | Readiness path appended to `server_url`. |
 | `prometheus_log_export.probe_interval_ms` | `5000` | Probe cadence. |
 | `prometheus_log_export.probe_timeout_ms` | `1500` | Probe timeout. |
@@ -435,6 +439,69 @@ Important behaviour:
 | `tuning.max_threshold` | `0.95` |
 | `tuning.window_ms` | `10_000` |
 
+## Continuum Integrations
+
+### Continuum autoscaler
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `continuum_autoscaler.enabled` | `false` | Enables the autoscaler runtime. |
+| `continuum_autoscaler.poll_interval_ms` | `5000` | Autoscaler evaluation cadence. |
+| `continuum_autoscaler.base_url` | empty | Continuum API base URL used for `/node/recruit`. |
+| `continuum_autoscaler.bearer_token` | `null` | Optional bearer token for Continuum API calls. |
+| `continuum_autoscaler.recruit_hosts` | `[]` | Ordered host list eligible for recruitment. |
+| `continuum_autoscaler.recruit_user` | `ubuntu` | SSH user sent to the Continuum API. |
+| `continuum_autoscaler.ssh_key_path` | `null` | Optional SSH key path passed through to Continuum. |
+| `continuum_autoscaler.node_type` | `kubernetes` | Requested node type label. |
+| `continuum_autoscaler.region` | `null` | Optional region hint. |
+| `continuum_autoscaler.tenant_id` | `null` | Optional tenant identifier. |
+| `continuum_autoscaler.tenant_name` | `null` | Optional tenant name. |
+| `continuum_autoscaler.tenant_environment` | `null` | Optional tenant-environment label. |
+| `continuum_autoscaler.recruit_token` | `null` | Optional Continuum-side recruitment token. |
+| `continuum_autoscaler.auto_configure` | `true` | Passed through in recruit requests. |
+| `continuum_autoscaler.dry_run` | `true` | Requests are dry-run by default. |
+| `continuum_autoscaler.local_cpu_usage_pct` | `75.0` | Local CPU pressure threshold. |
+| `continuum_autoscaler.local_memory_usage_pct` | `80.0` | Local memory pressure threshold. |
+| `continuum_autoscaler.coordination_latency_ms` | `40` | Coordination-latency pressure threshold. |
+| `continuum_autoscaler.prometheus_latency_ms` | `35` | Prometheus-latency pressure threshold. |
+| `continuum_autoscaler.slurm_pending_jobs` | `1` | Pending-job threshold for Slurm pressure. |
+| `continuum_autoscaler.slurm_allocated_ratio` | `0.80` | Allocated-node ratio threshold for Slurm pressure. |
+| `continuum_autoscaler.max_recruits_per_tick` | `1` | Maximum recruit calls per evaluation cycle. |
+
+Important behaviour:
+
+- if `continuum_autoscaler.base_url` is blank or `recruit_hosts` is empty after overrides, sanitisation disables the autoscaler
+- only the elected primary coordinator attempts recruit calls; non-primary nodes stay in standby and still publish snapshots
+- pressure is derived from local CPU and memory, coordination latency, Prometheus latency, and optional Slurm saturation
+
+### Continuum assessment
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `continuum_assessment.enabled` | `true` | Config-struct default only; the effective runtime default is disabled until a base URL resolves. |
+| `continuum_assessment.base_url` | empty | Continuum assessment API base URL. |
+| `continuum_assessment.bearer_token` | `null` | Optional bearer token for assessment API calls. |
+| `continuum_assessment.plan_poll_interval_ms` | `60_000` | Plan refresh interval. |
+| `continuum_assessment.request_timeout_ms` | `15_000` | HTTP timeout for plan/report calls. |
+| `continuum_assessment.slot_lead_ms` | `60_000` | How early the runtime prepares the next assigned slot. |
+| `continuum_assessment.inventory_cache_ttl_ms` | `28_800_000` | Static inventory cache TTL. |
+| `continuum_assessment.process_cache_ttl_ms` | `300_000` | Process snapshot cache TTL. |
+| `continuum_assessment.package_max` | `8192` | Package cap per report. |
+| `continuum_assessment.module_max` | `2048` | Kernel-module cap per report. |
+| `continuum_assessment.service_max` | `1024` | Service cap per report. |
+| `continuum_assessment.process_max` | `256` | Process cap per report. |
+| `continuum_assessment.inherit_global_fuzzy` | `true` | Reuses the top-level fuzzy settings and `min_samples` when enabled. |
+| `continuum_assessment.min_samples` | `24` | Local-only value used when inheritance is disabled. |
+
+Important behaviour:
+
+- if `continuum_assessment.base_url` is blank and `continuum_autoscaler.base_url` is set, sanitisation copies the autoscaler URL; the bearer token is inherited the same way
+- if the resulting `continuum_assessment.base_url` is still blank, sanitisation disables the assessment runtime
+- the runtime reports plan, progress, mirror, inventory, communication, summary, recent-match, and evidence snapshots through `/status`
+- compromise risk is derived from assessment-server findings plus local telemetry, TraceyGuard, and loader-threat context
+
+There is currently no dedicated config block for Continuum telemetry. That snapshot is always maintained from local events and decisions and exposed on `/status` and page 3 of the dashboard.
+
 ## Status API and Authentication
 
 ### Status
@@ -451,6 +518,7 @@ Important behaviour:
 - if `status.listen_addr` is blank, sanitisation disables the status server
 - when status is disabled, sanitisation also disables the Prometheus pertinent-log exporter
 - invalid non-blank status addresses are not sanitised; the runtime logs a warning and skips server start if parsing fails
+- the status snapshot includes posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and location snapshots
 
 ### Authentication
 
@@ -577,6 +645,51 @@ The code supports both `TRACEY_*` and `NM_*` aliases for many settings. Coverage
 - `TRACEY_UPDATE_LOCAL_CHANNEL`
 - `TRACEY_LOADER_ROLLBACK_WINDOW_MS`
 
+### Continuum autoscaler and assessment
+
+- `TRACEY_CONTINUUM_AUTOSCALER_ENABLED`
+- `TRACEY_CONTINUUM_URL`
+- `TRACEY_CONTINUUM_TOKEN`
+- `TRACEY_CONTINUUM_HOSTS`
+- `TRACEY_CONTINUUM_USER`
+- `TRACEY_CONTINUUM_SSH_KEY`
+- `TRACEY_CONTINUUM_NODE_TYPE`
+- `TRACEY_CONTINUUM_REGION`
+- `TRACEY_CONTINUUM_TENANT_ID`
+- `TRACEY_CONTINUUM_TENANT_NAME`
+- `TRACEY_CONTINUUM_TENANT_ENV`
+- `TRACEY_CONTINUUM_RECRUIT_TOKEN`
+- `TRACEY_CONTINUUM_AUTO_CONFIGURE`
+- `TRACEY_CONTINUUM_DRY_RUN`
+- `TRACEY_CONTINUUM_POLL_INTERVAL_MS`
+- `TRACEY_CONTINUUM_LOCAL_CPU_PCT`
+- `TRACEY_CONTINUUM_LOCAL_MEMORY_PCT`
+- `TRACEY_CONTINUUM_COORDINATION_LATENCY_MS`
+- `TRACEY_CONTINUUM_PROMETHEUS_LATENCY_MS`
+- `TRACEY_CONTINUUM_SLURM_PENDING_JOBS`
+- `TRACEY_CONTINUUM_SLURM_ALLOCATED_RATIO`
+- `TRACEY_CONTINUUM_MAX_RECRUITS_PER_TICK`
+- `TRACEY_CONTINUUM_ASSESSMENT_ENABLED`
+- `TRACEY_CONTINUUM_ASSESSMENT_URL`
+- `TRACEY_CONTINUUM_ASSESSMENT_TOKEN`
+- `TRACEY_CONTINUUM_ASSESSMENT_PLAN_POLL_MS`
+- `TRACEY_CONTINUUM_ASSESSMENT_REQUEST_TIMEOUT_MS`
+- `TRACEY_CONTINUUM_ASSESSMENT_SLOT_LEAD_MS`
+- `TRACEY_CONTINUUM_ASSESSMENT_INVENTORY_CACHE_TTL_MS`
+- `TRACEY_CONTINUUM_ASSESSMENT_PROCESS_CACHE_TTL_MS`
+- `TRACEY_CONTINUUM_ASSESSMENT_PACKAGE_MAX`
+- `TRACEY_CONTINUUM_ASSESSMENT_MODULE_MAX`
+- `TRACEY_CONTINUUM_ASSESSMENT_SERVICE_MAX`
+- `TRACEY_CONTINUUM_ASSESSMENT_PROCESS_MAX`
+- `TRACEY_CONTINUUM_ASSESSMENT_INHERIT_GLOBAL_FUZZY`
+- `TRACEY_CONTINUUM_ASSESSMENT_MIN_SAMPLES`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ENABLED`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_ORDER`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_UNCERTAINTY`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_EDGE_BIAS`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_AARNN_WEIGHT`
+- `TRACEY_CONTINUUM_ASSESSMENT_FUZZY_SECURITY_WEIGHT`
+
 ### TraceyGuard
 
 - `TRACEY_GUARD_ENABLED`
@@ -679,6 +792,8 @@ The following conditions disable subsystems automatically:
 
 - blank `discovery.shared_key` disables discovery
 - blank `update.shared_key` disables the update manager
+- blank `continuum_autoscaler.base_url` or an empty `continuum_autoscaler.recruit_hosts` list disables the Continuum autoscaler
+- blank `continuum_assessment.base_url` disables Continuum assessment after any autoscaler URL inheritance is applied
 - blank `refiner.health_url` disables Refiner tracking
 - blank `status.listen_addr` disables the status API
 - disabled status also disables Prometheus pertinent-log export
@@ -691,6 +806,8 @@ The following values are normalised automatically:
 
 - `assessment_quorum` is clamped into `1..=agents`
 - `storage.max_total_bytes` is raised if it would otherwise be below `storage.max_bytes`
+- blank `continuum_assessment.base_url` inherits `continuum_autoscaler.base_url` when present
+- blank `continuum_assessment.bearer_token` inherits `continuum_autoscaler.bearer_token` when present
 - TraceyBan blank `agent_id` is replaced from the top-level `agent_id`
 - TraceyBan blank jail names become `tracey-jail-N`
 - TraceyBan blank `backend` becomes `tracey_event`
@@ -705,7 +822,7 @@ Numerous fields are clamped to defensive bounds, including:
 - top-level capacities and timing values
 - fuzzy order and weights
 - storage budgets and intervals
-- discovery, telemetry, update, loader, governance, coordination, and stimuli intervals
+- discovery, telemetry, update, loader, continuum, governance, coordination, and stimuli intervals
 - TraceyGuard probe, TMR, correlation, and snapshot limits
 - TraceyBan retry counts, ban windows, action timeouts, and fuzzy thresholds
 - OIDC cache TTL, leeway, and HTTP timeout

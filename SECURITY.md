@@ -1,6 +1,6 @@
 # Security Notes
 
-This document describes the security mechanisms that are actually present in the repository as of **31 March 2026**. It is intentionally narrower and more precise than a marketing-style security overview.
+This document describes the security mechanisms that are actually present in the repository as of **7 April 2026**. It is intentionally narrower and more precise than a marketing-style security overview.
 
 The project contains meaningful controls, but it is not secure by default in every deployment shape. Several network surfaces are enabled or reachable without authorisation until you explicitly harden them.
 

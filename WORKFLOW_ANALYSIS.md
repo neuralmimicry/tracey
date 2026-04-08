@@ -836,7 +836,7 @@ The project uses shared-key MACs, not asymmetric signatures, for several distrib
 
 ## Verification Snapshot
 
-Local verification performed on **31 March 2026**:
+Local verification performed on **7 April 2026**:
 
 ```bash
 cargo test --all-targets
@@ -844,6 +844,6 @@ cargo test --all-targets
 
 Observed result:
 
-- `99` unit and property tests passed in `src/lib.rs`
+- `145` unit and property tests passed in `src/lib.rs`
 - `0` tests failed
 - the binary entry points compiled and their zero-test harnesses passed

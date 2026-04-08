@@ -1,0 +1,59 @@
+{
+  "status": {
+    "listen_addr": "127.0.0.1:48000"
+  },
+  "discovery": {
+    "enabled": false
+  },
+  "prometheus_log_export": {
+    "enabled": false
+  },
+  "telemetry": {
+    "enabled": false
+  },
+  "tracey_guard": {
+    "enabled": false
+  },
+  "tracey_ban": {
+    "enabled": true,
+    "auto_elevate_root": false,
+    "sudo_non_interactive": true,
+    "use_sudo_for_actions": true,
+    "allow_shell_actions": false,
+    "jails": [
+      {
+        "name": "sshd-auth",
+        "enabled": true,
+        "backend": "auto",
+        "filter_catalog": "sshd",
+        "action_catalog": "auto",
+        "firewall_backend": "auto",
+        "log_paths": [
+          "/var/log/auth.log",
+          "/var/log/secure"
+        ],
+        "journal_matches": [
+          "_SYSTEMD_UNIT=sshd.service + _COMM=sshd",
+          "_SYSTEMD_UNIT=ssh.service + _COMM=sshd"
+        ],
+        "ports": [
+          22
+        ],
+        "protocol": "tcp",
+        "ignore_ips": [
+          "127.0.0.1",
+          "::1"
+        ],
+        "max_retry": 5,
+        "find_time_ms": 600000,
+        "ban_time_ms": 3600000,
+        "ban_increment": true,
+        "ban_multiplier": 2.0,
+        "ban_max_time_ms": 86400000,
+        "ban_randomize_ms": 15000,
+        "event_require_message_match": true,
+        "scan_all_event_attrs_for_ip": false
+      }
+    ]
+  }
+}

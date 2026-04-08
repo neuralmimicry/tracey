@@ -2291,6 +2291,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

@@ -42,6 +42,7 @@ pub struct StatusService {
     pub status_addr: Option<String>,
     pub auth: AuthGate,
     pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
+    pub tracey_ban: Option<crate::tracey_ban::TraceyBanRuntimeHandle>,
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
     pub slurm: crate::slurm::SlurmRuntimeHandle,
     pub prometheus_export: Option<crate::prometheus_export::PrometheusExportHandle>,
@@ -118,16 +119,7 @@ pub async fn spawn_status(
     listen_addr: SocketAddr,
     mut shutdown: crate::shutdown::ShutdownListener,
 ) {
-    let app = Router::new()
-        .route("/status", get(status_handler))
-        .route("/health", get(status_handler))
-        .route("/ready", get(status_handler))
-        .route("/tracey_guard", get(tracey_guard_handler))
-        .route("/tracey_guard/deepdive", get(tracey_guard_handler))
-        .route("/control/tracey_guard", post(tracey_guard_control_handler))
-        .route("/metrics", get(metrics_handler))
-        .route("/prometheus/ingest", post(prometheus_ingest_handler))
-        .with_state(service);
+    let app = status_router(service);
     let listener = match tokio::net::TcpListener::bind(listen_addr).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -141,6 +133,21 @@ pub async fn spawn_status(
     {
         tracing::warn!("status server failed: {}", err);
     }
+}
+
+fn status_router(service: StatusService) -> Router {
+    Router::new()
+        .route("/status", get(status_handler))
+        .route("/health", get(status_handler))
+        .route("/ready", get(status_handler))
+        .route("/tracey_ban", get(tracey_ban_handler))
+        .route("/control/tracey_ban", post(tracey_ban_control_handler))
+        .route("/tracey_guard", get(tracey_guard_handler))
+        .route("/tracey_guard/deepdive", get(tracey_guard_handler))
+        .route("/control/tracey_guard", post(tracey_guard_control_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/prometheus/ingest", post(prometheus_ingest_handler))
+        .with_state(service)
 }
 
 async fn status_handler(
@@ -177,6 +184,35 @@ async fn status_handler(
     }
 
     Ok(Json(local_snapshot(&service, &role).await))
+}
+
+async fn tracey_ban_handler(
+    State(service): State<StatusService>,
+    headers: HeaderMap,
+) -> Result<Json<crate::tracey_ban::TraceyBanStatusSnapshot>, StatusCode> {
+    service.auth.authorize_http(&headers).await?;
+    let Some(runtime) = &service.tracey_ban else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(runtime.snapshot().await))
+}
+
+async fn tracey_ban_control_handler(
+    State(service): State<StatusService>,
+    headers: HeaderMap,
+    Json(request): Json<crate::tracey_ban::TraceyBanControlRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    service.auth.authorize_http(&headers).await?;
+    let Some(runtime) = &service.tracey_ban else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let control = runtime.apply_control(request).await;
+    let snapshot = runtime.snapshot().await;
+    Ok(Json(serde_json::json!({
+        "control": control,
+        "summary": snapshot.summary,
+        "updated_ms": now_ms()
+    })))
 }
 
 async fn tracey_guard_handler(
@@ -833,7 +869,257 @@ fn body_preview(body: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthSystem;
+    use crate::bus::EventBus;
+    use crate::capabilities::Capabilities;
+    use crate::config::Config;
+    use crate::gpu::GpuBackendConfig;
+    use crate::shutdown::Shutdown;
+    use crate::storage::Storage;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
     use proptest::prelude::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tower::util::ServiceExt;
+
+    struct TraceyGuardRouteHarness {
+        app: Router,
+        runtime: crate::tracey_guard::TraceyGuardRuntimeHandle,
+        shutdown: Shutdown,
+        log_path: PathBuf,
+    }
+
+    impl TraceyGuardRouteHarness {
+        async fn cleanup(self) {
+            self.shutdown.trigger();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = tokio::fs::remove_file(&self.log_path).await;
+        }
+    }
+
+    async fn tracey_guard_harness() -> TraceyGuardRouteHarness {
+        let mut cfg = Config::default();
+        cfg.agent_id = "status-test-agent".to_string();
+        cfg.tracey_guard.synthetic_devices = 1;
+        cfg.tracey_guard.max_devices = 1;
+
+        let coordination = Coordination::new(
+            cfg.agent_id.clone(),
+            cfg.coordination.clone(),
+            &cfg.discovery.shared_key,
+            Capabilities {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                cpu_cores: 4,
+                tags: vec!["test".to_string()],
+            },
+            "test-version".to_string(),
+        );
+        let coordination_role = coordination.role_handle();
+        let governance_state =
+            Arc::new(tokio::sync::RwLock::new(GovernanceState::from_config(&cfg)));
+        let auth = AuthSystem::from_config(&cfg.auth).status_gate();
+
+        let log_path = std::env::temp_dir().join(format!(
+            "tracey-status-tracey-guard-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut storage_cfg = cfg.storage.clone();
+        storage_cfg.log_path = log_path.clone();
+
+        let (shutdown, shutdown_listener) = Shutdown::new();
+        let storage = Storage::new(storage_cfg, shutdown_listener.clone())
+            .await
+            .expect("storage should start");
+        let runtime = crate::tracey_guard::spawn_tracey_guard(
+            cfg.tracey_guard.clone(),
+            GpuBackendConfig {
+                sysfs_enabled: false,
+                nvml_enabled: false,
+                rocm_enabled: false,
+                max_devices: 1,
+            },
+            EventBus::new(64),
+            storage,
+            shutdown_listener,
+        );
+
+        TraceyGuardRouteHarness {
+            app: status_router(StatusService {
+                agent_id: cfg.agent_id.clone(),
+                agent_version: "test-version".to_string(),
+                coordination,
+                coordination_role,
+                governance_state,
+                client: reqwest::Client::new(),
+                status_addr: Some("http://127.0.0.1:48000".to_string()),
+                auth,
+                ban_intel: None,
+                tracey_ban: None,
+                tracey_guard: Some(runtime.clone()),
+                slurm: crate::slurm::SlurmRuntimeHandle::default(),
+                prometheus_export: None,
+                continuum_autoscaler: None,
+                continuum_assessment: None,
+                continuum_telemetry: None,
+                loader_threats: None,
+            }),
+            runtime,
+            shutdown,
+            log_path,
+        }
+    }
+
+    async fn request_json(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid json")
+        };
+        (status, value)
+    }
+
+    async fn wait_for_runtime_snapshot(
+        runtime: &crate::tracey_guard::TraceyGuardRuntimeHandle,
+    ) -> crate::tracey_guard::TraceyGuardStatusSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = runtime.snapshot().await;
+                if snapshot.summary.total_devices > 0
+                    && snapshot.control.max_parallel_tasks > 0
+                    && !snapshot.gpu_health.is_empty()
+                {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("tracey_guard runtime should publish a snapshot")
+    }
+
+    #[tokio::test]
+    async fn tracey_guard_route_returns_runtime_snapshot() {
+        let harness = tracey_guard_harness().await;
+        let expected = wait_for_runtime_snapshot(&harness.runtime).await;
+
+        let (status, body) = request_json(
+            &harness.app,
+            Request::builder()
+                .uri("/tracey_guard")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["summary"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            body["summary"]["total_devices"].as_u64(),
+            Some(expected.summary.total_devices as u64)
+        );
+        assert_eq!(
+            body["control"]["max_parallel_tasks"].as_u64(),
+            Some(expected.control.max_parallel_tasks as u64)
+        );
+        assert_eq!(
+            body["gpu_health"]
+                .as_array()
+                .map(|entries| entries.len())
+                .unwrap_or_default(),
+            expected.gpu_health.len()
+        );
+
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn tracey_guard_control_route_updates_runtime_controls() {
+        let harness = tracey_guard_harness().await;
+        wait_for_runtime_snapshot(&harness.runtime).await;
+
+        let (status, body) = request_json(
+            &harness.app,
+            Request::builder()
+                .method("POST")
+                .uri("/control/tracey_guard")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "enabled": false,
+                        "deep_dive": true,
+                        "tmr_enabled": false,
+                        "overhead_budget_pct": 7.5,
+                        "max_parallel_tasks": 8,
+                        "force_scan": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["control"]["enabled"], Value::Bool(false));
+        assert_eq!(body["control"]["deep_dive"], Value::Bool(true));
+        assert_eq!(body["control"]["tmr_enabled"], Value::Bool(false));
+        assert_eq!(body["control"]["overhead_budget_pct"].as_f64(), Some(7.5));
+        assert_eq!(body["control"]["max_parallel_tasks"].as_u64(), Some(8));
+        assert!(
+            body["control"]["force_scan_epoch"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+
+        let reflected = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (status, body) = request_json(
+                    &harness.app,
+                    Request::builder()
+                        .uri("/tracey_guard")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await;
+                if status == StatusCode::OK
+                    && body["control"]["enabled"] == Value::Bool(false)
+                    && body["control"]["deep_dive"] == Value::Bool(true)
+                    && body["control"]["tmr_enabled"] == Value::Bool(false)
+                    && body["control"]["max_parallel_tasks"].as_u64() == Some(8)
+                    && body["control"]["force_scan_epoch"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        >= 1
+                    && body["summary"]["enabled"] == Value::Bool(false)
+                {
+                    return body;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("tracey_guard route should reflect updated controls");
+
+        assert_eq!(reflected["summary"]["enabled"], Value::Bool(false));
+        assert_eq!(
+            reflected["control"]["overhead_budget_pct"].as_f64(),
+            Some(7.5)
+        );
+
+        harness.cleanup().await;
+    }
 
     #[test]
     fn parse_proxy_snapshot_rejects_semantic_violations() {

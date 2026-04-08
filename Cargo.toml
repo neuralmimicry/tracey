@@ -29,3 +29,4 @@ crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1.9"
+tower = { version = "0.5", features = ["util"] }
