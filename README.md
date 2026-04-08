@@ -27,6 +27,7 @@ The current code does all of the following:
 - always attempts Slurm/Continuum environment detection and folds the result into capability tags and status snapshots when a local deployment is detected
 - enables the HTTP status surface by default on `0.0.0.0:48000`
 - always maintains bounded Continuum telemetry and inferred location snapshots for the status and dashboard surfaces
+- always derives a Continuum closed-loop `plan / ramp / optimize / repeat` snapshot from autoscaler, assessment, telemetry, TraceyGuard, loader-threat, and Slurm state
 - leaves `auth.mode` off by default, which means status and TraceyGuard control routes are unauthenticated unless you explicitly enable OIDC
 - enables the Prometheus log exporter by default, which probes `https://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
 - ships Continuum assessment and autoscaler integrations, but both sanitize off until a Continuum base URL is configured and the autoscaler also has recruit hosts
@@ -45,6 +46,7 @@ That default profile is useful for local evaluation and continuous self-exercise
 | Prometheus log export | On | Depends on status being enabled; exposes `/metrics` and signed `/prometheus/ingest`. |
 | Slurm detection | On | Best-effort native and Continuum Podman detection; contributes capability tags and status snapshots when found. |
 | Continuum telemetry snapshot | On | Always builds bounded host, GPU, action, and probe telemetry for `/status` and page 3 of the dashboard. |
+| Continuum closed-loop snapshot | On | Always derives `continuum_loop` from autoscaler, assessment, telemetry, TraceyGuard, loader-threat, and Slurm state for `/status` and page 1 of the dashboard. |
 | Coordination and governance | On | Leader election, proxy selection, and posture voting run automatically. |
 | Continuum assessment | Off by effective default | The config struct defaults `enabled=true`, but sanitisation disables it until `continuum_assessment.base_url` or an inherited Continuum URL is available. |
 | Continuum autoscaler | Off | Requires a Continuum `base_url` plus non-empty recruit hosts; otherwise sanitisation disables it. |
@@ -94,13 +96,13 @@ Preferred operator TUI entrypoint, inspired by `btop` and built around Tracey's 
 - `cargo run --bin tracey -- --tui --status http://127.0.0.1:48000 --log-path ./tracey.log.jsonl`
 - `cargo run --bin tracey -- --tui --no-log`
 
-`tracey --tui` reads `/status` for governance, coordination, TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and location snapshots, then tails the JSONL storage log for signal history, recent decisions, and hot processes.
+`tracey --tui` reads `/status` for governance, coordination, TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and location snapshots, then tails the JSONL storage log for signal history, recent decisions, and hot processes.
 
 When `--status` is omitted, the dashboard prefers a reachable local `tracey` or loader-managed `tracey-core` agent if one is already running, so `--tui` stays attach-only instead of starting duplicate collectors.
 
 No-scheme loopback targets default to `http://`; other no-scheme dashboard targets default to `https://`. The header shows `🔒 https` or `🔓 http` for the active status connection.
 
-The dashboard now has three pages: the original overview, a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency, and a telemetry page for Continuum host, GPU, action, and probe snapshots.
+The dashboard now has three pages: an overview page with the closed-loop `plan / ramp / optimize / repeat` summary plus autoscaler and Slurm context, a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency, and a telemetry page for Continuum host, GPU, action, and probe snapshots.
 
 Location confidence improves when the runtime can see direct hints. `TRACEY_SITE`, `TRACEY_BUILDING`, `TRACEY_ROOM`, and `TRACEY_GEO` are consumed automatically, propagated through discovery capability tags, and reused by the location page when peers are close enough to share the same inferred room/building/site.
 
@@ -176,7 +178,7 @@ When `status.enabled` is true, the Axum server exposes:
 - `/metrics`: Prometheus exposition for the elected pertinent-log exporter
 - `/prometheus/ingest`: signed follower-to-exporter batch intake
 
-The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and inferred self/peer location snapshots.
+The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and inferred self/peer location snapshots.
 
 The operator CLI subcommands `tracey status`, `tracey tracey-ban ...`, and `tracey tracey-guard ...` are thin wrappers over these same routes.
 

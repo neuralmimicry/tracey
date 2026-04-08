@@ -71,7 +71,7 @@ cargo run --bin tracey-top -- --help
 Behaviour:
 
 - `tracey --tui` and `tracey-top` expose the same dashboard interface
-- page 1 is the overview, page 2 is locations, and page 3 is Continuum telemetry
+- page 1 is the overview with the derived `plan / ramp / optimize / repeat` loop, page 2 is locations, and page 3 is Continuum telemetry
 - current options are `--status`, `--bearer`, `--log-path` or `--no-log`, `--refresh-ms`, and `--tail-bytes`
 - when `--status` is omitted, the dashboard prefers a reachable local agent instead of starting duplicate collectors
 - the minimum supported terminal size is `120x33`
@@ -182,7 +182,8 @@ Important operational notes:
 - `/control/tracey_ban` and `/control/tracey_guard` are the endpoints used by the operator CLI
 - `/metrics` does not pass through OIDC route protection
 - `/prometheus/ingest` is authenticated by a shared-key request MAC rather than OIDC
-- the status snapshot includes posture and coordination plus optional Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and inferred location snapshots
+- the status snapshot includes posture and coordination plus optional Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and inferred location snapshots
+- the same `continuum_loop` snapshot is what keeps the dashboard overview and Continuum-facing operator views in parity
 
 ### Loader transfer server
 

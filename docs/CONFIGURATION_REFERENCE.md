@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This reference describes the configuration model implemented in the repository as of **7 April 2026**. It is based on `src/config.rs` and the runtime wiring in `src/lib.rs`, `src/update.rs`, `src/loader.rs`, `src/status.rs`, and related modules.
+This reference describes the configuration model implemented in the repository as of **8 April 2026**. It is based on `src/config.rs`, `src/lib.rs`, `src/update.rs`, `src/loader.rs`, `src/status.rs`, and related modules.
 
 ## Loading Order
 
@@ -46,6 +46,7 @@ A plain `cargo run` or `tracey` launch with no config file currently results in 
 - OIDC support present but disabled
 - Prometheus pertinent-log export enabled
 - Continuum telemetry snapshots always populated for `/status` and the dashboard
+- a derived `continuum_loop` snapshot always populated for `/status` and page 1 of the dashboard
 - Continuum assessment effectively disabled until a Continuum base URL is available
 - Continuum autoscaler disabled until both a Continuum base URL and recruit hosts are configured
 - telemetry ingest disabled
@@ -498,9 +499,10 @@ Important behaviour:
 - if `continuum_assessment.base_url` is blank and `continuum_autoscaler.base_url` is set, sanitisation copies the autoscaler URL; the bearer token is inherited the same way
 - if the resulting `continuum_assessment.base_url` is still blank, sanitisation disables the assessment runtime
 - the runtime reports plan, progress, mirror, inventory, communication, summary, recent-match, and evidence snapshots through `/status`
+- those assessment snapshots feed the derived `continuum_loop` summary alongside telemetry, autoscaler, TraceyGuard, loader-threat, and Slurm state
 - compromise risk is derived from assessment-server findings plus local telemetry, TraceyGuard, and loader-threat context
 
-There is currently no dedicated config block for Continuum telemetry. That snapshot is always maintained from local events and decisions and exposed on `/status` and page 3 of the dashboard.
+There is currently no dedicated config block for Continuum telemetry. That snapshot is always maintained from local events and decisions, exposed on `/status` and page 3 of the dashboard, and reused when deriving the status-plane `continuum_loop`.
 
 ## Status API and Authentication
 
@@ -518,7 +520,7 @@ Important behaviour:
 - if `status.listen_addr` is blank, sanitisation disables the status server
 - when status is disabled, sanitisation also disables the Prometheus pertinent-log exporter
 - invalid non-blank status addresses are not sanitised; the runtime logs a warning and skips server start if parsing fails
-- the status snapshot includes posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, loader-threat, and location snapshots
+- the status snapshot includes posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and location snapshots
 
 ### Authentication
 

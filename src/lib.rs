@@ -9,6 +9,7 @@ pub mod capabilities;
 mod cli;
 pub mod config;
 pub mod continuum_assessment;
+pub mod continuum_loop;
 pub mod continuum_telemetry;
 pub mod coordination;
 pub mod dashboard;

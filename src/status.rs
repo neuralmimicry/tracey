@@ -4,6 +4,7 @@
 //! status/control endpoints with optional auth gating.
 
 use crate::auth::AuthGate;
+use crate::continuum_loop::{ContinuumLoopSnapshot, derive_continuum_loop_snapshot};
 use crate::coordination::{Coordination, CoordinatorRole};
 use crate::event::now_ms;
 use crate::governance::GovernanceState;
@@ -106,6 +107,8 @@ struct StatusSnapshot {
     continuum_assessment: Option<crate::continuum_assessment::ContinuumAssessmentSnapshot>,
     #[serde(default)]
     continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetrySnapshot>,
+    #[serde(default)]
+    continuum_loop: Option<ContinuumLoopSnapshot>,
     #[serde(default)]
     loader_threats: Option<crate::loader_threat::LoaderThreatSnapshot>,
     #[serde(default)]
@@ -373,6 +376,14 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let continuum_loop = Some(derive_continuum_loop_snapshot(
+        continuum_autoscaler.as_ref(),
+        continuum_assessment.as_ref(),
+        continuum_telemetry.as_ref(),
+        tracey_guard.as_ref(),
+        loader_threats.as_ref(),
+        slurm.as_ref(),
+    ));
     let local_probe = role.prometheus_probe.clone();
     let (mut location, peer_locations) = crate::location::infer_cluster_locations(
         &service.agent_id,
@@ -432,6 +443,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         continuum_autoscaler,
         continuum_assessment,
         continuum_telemetry,
+        continuum_loop,
         loader_threats,
         location,
         peer_locations,
@@ -819,6 +831,15 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             continuum_telemetry: parse_object_field(
                 map,
                 &["continuum_telemetry", "continuumTelemetry", "continuum"],
+            ),
+            continuum_loop: parse_object_field(
+                map,
+                &[
+                    "continuum_loop",
+                    "continuumLoop",
+                    "adaptive_loop",
+                    "adaptiveLoop",
+                ],
             ),
             loader_threats: parse_object_field(
                 map,
