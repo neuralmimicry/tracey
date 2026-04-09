@@ -1,13 +1,14 @@
 //! Authentication gates for HTTP and gRPC endpoints.
 //!
-//! Supports disabled mode and OIDC JWT validation with cached discovery/JWKS.
+//! Supports disabled mode, shared token introspection, and OIDC JWT validation.
 
-use crate::config::{AuthConfig, OidcAuthConfig};
+use crate::config::{AuthConfig, OidcAuthConfig, TokenAuthConfig};
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -15,12 +16,14 @@ use tokio::sync::RwLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     Off,
+    Token,
     Oidc,
 }
 
 impl AuthMode {
     fn parse(raw: &str) -> Self {
         match raw.trim().to_lowercase().as_str() {
+            "token" => AuthMode::Token,
             "oidc" => AuthMode::Oidc,
             _ => AuthMode::Off,
         }
@@ -30,7 +33,8 @@ impl AuthMode {
 #[derive(Clone)]
 pub struct AuthSystem {
     mode: AuthMode,
-    validator: Option<Arc<OidcValidator>>,
+    token_validator: Option<Arc<TokenValidator>>,
+    oidc_validator: Option<Arc<OidcValidator>>,
     protect_status: bool,
     protect_otlp_http: bool,
     protect_otlp_grpc: bool,
@@ -40,14 +44,20 @@ impl AuthSystem {
     /// Builds auth system from runtime config.
     pub fn from_config(cfg: &AuthConfig) -> Self {
         let mode = AuthMode::parse(&cfg.mode);
-        let validator = if mode == AuthMode::Oidc && cfg.oidc.enabled() {
+        let token_validator = if mode == AuthMode::Token && cfg.token.enabled() {
+            Some(Arc::new(TokenValidator::new(cfg.token.clone())))
+        } else {
+            None
+        };
+        let oidc_validator = if mode == AuthMode::Oidc && cfg.oidc.enabled() {
             Some(Arc::new(OidcValidator::new(cfg.oidc.clone())))
         } else {
             None
         };
         Self {
             mode,
-            validator,
+            token_validator,
+            oidc_validator,
             protect_status: cfg.protect_status,
             protect_otlp_http: cfg.protect_otlp_http,
             protect_otlp_grpc: cfg.protect_otlp_grpc,
@@ -56,17 +66,32 @@ impl AuthSystem {
 
     /// Gate for status endpoints.
     pub fn status_gate(&self) -> AuthGate {
-        AuthGate::new(self.mode, self.protect_status, self.validator.clone())
+        AuthGate::new(
+            self.mode,
+            self.protect_status,
+            self.token_validator.clone(),
+            self.oidc_validator.clone(),
+        )
     }
 
     /// Gate for OTLP/HTTP ingest endpoint.
     pub fn otlp_http_gate(&self) -> AuthGate {
-        AuthGate::new(self.mode, self.protect_otlp_http, self.validator.clone())
+        AuthGate::new(
+            self.mode,
+            self.protect_otlp_http,
+            self.token_validator.clone(),
+            self.oidc_validator.clone(),
+        )
     }
 
     /// Gate for OTLP/gRPC ingest endpoint.
     pub fn otlp_grpc_gate(&self) -> AuthGate {
-        AuthGate::new(self.mode, self.protect_otlp_grpc, self.validator.clone())
+        AuthGate::new(
+            self.mode,
+            self.protect_otlp_grpc,
+            self.token_validator.clone(),
+            self.oidc_validator.clone(),
+        )
     }
 }
 
@@ -74,15 +99,22 @@ impl AuthSystem {
 pub struct AuthGate {
     mode: AuthMode,
     enabled: bool,
-    validator: Option<Arc<OidcValidator>>,
+    token_validator: Option<Arc<TokenValidator>>,
+    oidc_validator: Option<Arc<OidcValidator>>,
 }
 
 impl AuthGate {
-    fn new(mode: AuthMode, enabled: bool, validator: Option<Arc<OidcValidator>>) -> Self {
+    fn new(
+        mode: AuthMode,
+        enabled: bool,
+        token_validator: Option<Arc<TokenValidator>>,
+        oidc_validator: Option<Arc<OidcValidator>>,
+    ) -> Self {
         Self {
             mode,
             enabled,
-            validator,
+            token_validator,
+            oidc_validator,
         }
     }
 
@@ -94,15 +126,28 @@ impl AuthGate {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(extract_bearer);
-        match token {
-            Some(token) => self
-                .validator
-                .as_ref()
-                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
-                .validate(token)
-                .await
-                .map_err(|err| err.to_status_code()),
-            None => Err(StatusCode::UNAUTHORIZED),
+        match self.mode {
+            AuthMode::Off => Ok(()),
+            AuthMode::Token => match token {
+                Some(token) => self
+                    .token_validator
+                    .as_ref()
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                    .validate(token)
+                    .await
+                    .map_err(|err| err.to_status_code()),
+                None => Err(StatusCode::UNAUTHORIZED),
+            },
+            AuthMode::Oidc => match token {
+                Some(token) => self
+                    .oidc_validator
+                    .as_ref()
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                    .validate(token)
+                    .await
+                    .map_err(|err| err.to_status_code()),
+                None => Err(StatusCode::UNAUTHORIZED),
+            },
         }
     }
 
@@ -117,16 +162,34 @@ impl AuthGate {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(extract_bearer);
-        let validator = self
-            .validator
-            .as_ref()
-            .ok_or_else(|| tonic::Status::unavailable("oidc not configured"))?;
-        match token {
-            Some(token) => validator
-                .validate(token)
-                .await
-                .map_err(|err| err.to_tonic_status()),
-            None => Err(tonic::Status::unauthenticated("missing authorization")),
+        match self.mode {
+            AuthMode::Off => Ok(()),
+            AuthMode::Token => {
+                let validator = self
+                    .token_validator
+                    .as_ref()
+                    .ok_or_else(|| tonic::Status::unavailable("token auth not configured"))?;
+                match token {
+                    Some(token) => validator
+                        .validate(token)
+                        .await
+                        .map_err(|err| err.to_tonic_status()),
+                    None => Err(tonic::Status::unauthenticated("missing authorization")),
+                }
+            }
+            AuthMode::Oidc => {
+                let validator = self
+                    .oidc_validator
+                    .as_ref()
+                    .ok_or_else(|| tonic::Status::unavailable("oidc not configured"))?;
+                match token {
+                    Some(token) => validator
+                        .validate(token)
+                        .await
+                        .map_err(|err| err.to_tonic_status()),
+                    None => Err(tonic::Status::unauthenticated("missing authorization")),
+                }
+            }
         }
     }
 }
@@ -140,6 +203,210 @@ fn extract_bearer(raw: &str) -> Option<&str> {
         return Some(value.trim());
     }
     None
+}
+
+#[derive(Debug)]
+pub struct TokenValidator {
+    cfg: TokenAuthConfig,
+    client: reqwest::Client,
+    cache: RwLock<HashMap<String, TokenCacheEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenCacheEntry {
+    authenticated: bool,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenSessionResponse {
+    authenticated: bool,
+    user: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum TokenError {
+    MissingToken,
+    MissingConfig,
+    ServiceUnavailable,
+    InvalidToken,
+}
+
+impl TokenError {
+    fn to_status_code(&self) -> StatusCode {
+        match self {
+            TokenError::MissingToken | TokenError::InvalidToken => StatusCode::UNAUTHORIZED,
+            TokenError::MissingConfig | TokenError::ServiceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    }
+
+    fn to_tonic_status(&self) -> tonic::Status {
+        match self {
+            TokenError::MissingToken => tonic::Status::unauthenticated("missing token"),
+            TokenError::InvalidToken => tonic::Status::unauthenticated("invalid token"),
+            TokenError::MissingConfig => tonic::Status::unavailable("token auth not configured"),
+            TokenError::ServiceUnavailable => {
+                tonic::Status::unavailable("central token validation unavailable")
+            }
+        }
+    }
+}
+
+impl TokenValidator {
+    /// Creates a token validator with a bounded TTL cache for Refiner session lookups.
+    pub fn new(cfg: TokenAuthConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.http_timeout_ms))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            cfg,
+            client,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Validates a bearer token via the central session endpoint, with static-token fallback.
+    pub async fn validate(&self, token: &str) -> Result<(), TokenError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(TokenError::MissingToken);
+        }
+        if !self.cfg.enabled() {
+            return Err(TokenError::MissingConfig);
+        }
+
+        if let Some(entry) = self.cached(token).await {
+            return if entry.authenticated {
+                Ok(())
+            } else {
+                Err(TokenError::InvalidToken)
+            };
+        }
+
+        match self.validate_central_session(token).await {
+            Ok(Some(true)) => {
+                self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
+                Ok(())
+            }
+            Ok(Some(false)) | Ok(None) => {
+                if self.matches_static_token(token) {
+                    self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
+                    Ok(())
+                } else {
+                    self.cache_result(token, false, self.negative_cache_ttl_ms())
+                        .await;
+                    Err(TokenError::InvalidToken)
+                }
+            }
+            Err(err) => {
+                if self.matches_static_token(token) {
+                    self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
+                    Ok(())
+                } else {
+                    self.cache_result(token, false, self.negative_cache_ttl_ms())
+                        .await;
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    async fn validate_central_session(&self, token: &str) -> Result<Option<bool>, TokenError> {
+        let Some(session_url) = self
+            .cfg
+            .session_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let response = self
+            .client
+            .get(session_url)
+            .header("Accept", "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| TokenError::ServiceUnavailable)?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(Some(false));
+        }
+        if status.is_server_error() || !status.is_success() {
+            return Err(TokenError::ServiceUnavailable);
+        }
+
+        let payload = response
+            .json::<TokenSessionResponse>()
+            .await
+            .map_err(|_| TokenError::ServiceUnavailable)?;
+        Ok(Some(
+            payload.authenticated
+                && payload
+                    .user
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some(),
+        ))
+    }
+
+    fn matches_static_token(&self, token: &str) -> bool {
+        self.cfg
+            .static_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            == Some(token)
+    }
+
+    fn negative_cache_ttl_ms(&self) -> u64 {
+        self.cfg.cache_ttl_ms.min(2_000).max(250)
+    }
+
+    async fn cached(&self, token: &str) -> Option<TokenCacheEntry> {
+        let now = Instant::now();
+        {
+            let cache = self.cache.read().await;
+            if let Some(entry) = cache.get(token) {
+                if entry.expires_at > now {
+                    return Some(entry.clone());
+                }
+            }
+        }
+        let mut cache = self.cache.write().await;
+        if let Some(entry) = cache.get(token) {
+            if entry.expires_at > now {
+                return Some(entry.clone());
+            }
+        }
+        cache.remove(token)
+    }
+
+    async fn cache_result(&self, token: &str, authenticated: bool, ttl_ms: u64) {
+        const MAX_CACHE_ENTRIES: usize = 1024;
+
+        let now = Instant::now();
+        let mut cache = self.cache.write().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            token.to_string(),
+            TokenCacheEntry {
+                authenticated,
+                expires_at: now + Duration::from_millis(ttl_ms.max(1)),
+            },
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -387,6 +654,8 @@ fn is_supported_alg(alg: Algorithm) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::get};
+    use serde_json::json;
 
     #[test]
     fn auth_mode_parse_defaults_to_off() {
@@ -422,5 +691,76 @@ mod tests {
         assert!(is_supported_alg(Algorithm::RS256));
         assert!(is_supported_alg(Algorithm::EdDSA));
         assert!(!is_supported_alg(Algorithm::HS256));
+    }
+
+    #[tokio::test]
+    async fn token_validator_accepts_static_token_without_central_auth() {
+        let validator = TokenValidator::new(TokenAuthConfig {
+            session_url: None,
+            static_token: Some("static-secret".to_string()),
+            cache_ttl_ms: 15_000,
+            http_timeout_ms: 1_000,
+        });
+        assert!(validator.validate("static-secret").await.is_ok());
+        assert!(matches!(
+            validator.validate("wrong-token").await,
+            Err(TokenError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_validator_uses_central_session_endpoint() {
+        let (base_url, handle) = spawn_session_server(
+            axum::http::StatusCode::OK,
+            json!({"authenticated": true, "user": "pbisaacs"}),
+        )
+        .await;
+        let validator = TokenValidator::new(TokenAuthConfig {
+            session_url: Some(format!("{}/api/session", base_url)),
+            static_token: None,
+            cache_ttl_ms: 15_000,
+            http_timeout_ms: 1_000,
+        });
+
+        assert!(validator.validate("central-token").await.is_ok());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn token_validator_falls_back_to_static_token_when_central_auth_fails() {
+        let (base_url, handle) =
+            spawn_session_server(axum::http::StatusCode::INTERNAL_SERVER_ERROR, json!({})).await;
+        let validator = TokenValidator::new(TokenAuthConfig {
+            session_url: Some(format!("{}/api/session", base_url)),
+            static_token: Some("fallback-token".to_string()),
+            cache_ttl_ms: 15_000,
+            http_timeout_ms: 1_000,
+        });
+
+        assert!(validator.validate("fallback-token").await.is_ok());
+        handle.abort();
+    }
+
+    async fn spawn_session_server(
+        status: axum::http::StatusCode,
+        payload: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock session server");
+        let addr = listener.local_addr().expect("mock session server addr");
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let payload = payload.clone();
+                async move { (status, Json(payload)) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run mock session server");
+        });
+        (format!("http://{}", addr), handle)
     }
 }

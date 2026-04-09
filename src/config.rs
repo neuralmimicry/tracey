@@ -1079,6 +1079,8 @@ impl Config {
         self.stimuli.max_batch = self.stimuli.max_batch.clamp(1, 4096);
         self.stimuli.max_packet_bytes = self.stimuli.max_packet_bytes.clamp(256, 65_000);
 
+        self.auth.token.cache_ttl_ms = self.auth.token.cache_ttl_ms.clamp(1_000, 300_000);
+        self.auth.token.http_timeout_ms = self.auth.token.http_timeout_ms.clamp(500, 15_000);
         self.auth.oidc.cache_ttl_ms = self.auth.oidc.cache_ttl_ms.clamp(5_000, 300_000);
         self.auth.oidc.leeway_sec = self.auth.oidc.leeway_sec.clamp(0, 300);
         self.auth.oidc.http_timeout_ms = self.auth.oidc.http_timeout_ms.clamp(500, 15_000);
@@ -1259,6 +1261,18 @@ impl Config {
 
         if let Some(mode) = env_any(&["TRACEY_AUTH_MODE", "NM_AUTH_MODE"]) {
             self.auth.mode = mode.to_lowercase();
+        }
+        if let Some(value) = env_any(&["TRACEY_AUTH_SESSION_URL", "NM_TRACEY_AUTH_SESSION_URL"]) {
+            self.auth.token.session_url = Some(value);
+        }
+        if let Some(value) = env_any(&["TRACEY_AUTH_TOKEN", "NM_TRACEY_AUTH_TOKEN"]) {
+            self.auth.token.static_token = Some(value);
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_AUTH_CACHE_TTL_MS", "NM_TRACEY_AUTH_CACHE_TTL_MS"]) {
+            self.auth.token.cache_ttl_ms = value;
+        }
+        if let Some(value) = env_u64_any(&["TRACEY_AUTH_TIMEOUT_MS", "NM_TRACEY_AUTH_TIMEOUT_MS"]) {
+            self.auth.token.http_timeout_ms = value;
         }
         if let Some(value) = env_any(&["TRACEY_STORAGE_PATH", "NM_STORAGE_PATH"]) {
             self.storage.log_path = PathBuf::from(value);
@@ -1963,6 +1977,7 @@ pub struct AuthConfig {
     pub protect_status: bool,
     pub protect_otlp_http: bool,
     pub protect_otlp_grpc: bool,
+    pub token: TokenAuthConfig,
     pub oidc: OidcAuthConfig,
 }
 
@@ -1973,7 +1988,44 @@ impl Default for AuthConfig {
             protect_status: true,
             protect_otlp_http: true,
             protect_otlp_grpc: false,
+            token: TokenAuthConfig::default(),
             oidc: OidcAuthConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenAuthConfig {
+    pub session_url: Option<String>,
+    pub static_token: Option<String>,
+    pub cache_ttl_ms: u64,
+    pub http_timeout_ms: u64,
+}
+
+impl TokenAuthConfig {
+    pub fn enabled(&self) -> bool {
+        self.session_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+            || self
+                .static_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+    }
+}
+
+impl Default for TokenAuthConfig {
+    fn default() -> Self {
+        Self {
+            session_url: None,
+            static_token: None,
+            cache_ttl_ms: 15_000,
+            http_timeout_ms: 3_000,
         }
     }
 }
