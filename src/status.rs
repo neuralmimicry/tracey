@@ -50,6 +50,7 @@ pub struct StatusService {
     pub continuum_autoscaler: Option<crate::autoscaler::ContinuumAutoscalerHandle>,
     pub continuum_assessment: Option<crate::continuum_assessment::ContinuumAssessmentHandle>,
     pub continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetryHandle>,
+    pub resource_forecast: Option<crate::resource_forecast::ResourceForecastHandle>,
     pub loader_threats: Option<crate::loader_threat::LoaderThreatStatusHandle>,
 }
 
@@ -107,6 +108,8 @@ struct StatusSnapshot {
     continuum_assessment: Option<crate::continuum_assessment::ContinuumAssessmentSnapshot>,
     #[serde(default)]
     continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetrySnapshot>,
+    #[serde(default)]
+    resource_forecast: Option<crate::resource_forecast::ResourceForecastSnapshot>,
     #[serde(default)]
     continuum_loop: Option<ContinuumLoopSnapshot>,
     #[serde(default)]
@@ -371,6 +374,11 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let resource_forecast = if let Some(forecast) = &service.resource_forecast {
+        Some(forecast.snapshot().await)
+    } else {
+        None
+    };
     let loader_threats = if let Some(loader_threats) = &service.loader_threats {
         loader_threats.snapshot().await
     } else {
@@ -443,6 +451,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         continuum_autoscaler,
         continuum_assessment,
         continuum_telemetry,
+        resource_forecast,
         continuum_loop,
         loader_threats,
         location,
@@ -832,6 +841,10 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
                 map,
                 &["continuum_telemetry", "continuumTelemetry", "continuum"],
             ),
+            resource_forecast: parse_object_field(
+                map,
+                &["resource_forecast", "resourceForecast", "forecast"],
+            ),
             continuum_loop: parse_object_field(
                 map,
                 &[
@@ -985,6 +998,7 @@ mod tests {
                 continuum_autoscaler: None,
                 continuum_assessment: None,
                 continuum_telemetry: None,
+                resource_forecast: None,
                 loader_threats: None,
             }),
             runtime,

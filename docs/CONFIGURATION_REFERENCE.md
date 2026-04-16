@@ -257,6 +257,12 @@ Important behaviour:
 | `embedded.process_top_n` | `5` | Number of processes surfaced. |
 | `embedded.process_window_ms` | `5000` | Process window duration. |
 | `embedded.process_max` | `2048` | Process scan cap. |
+| `embedded.network_attribution_enabled` | `true` | Enables low-overhead Linux socket-to-process attribution from `/proc/net/*` and `/proc/<pid>/fd`. |
+| `embedded.network_window_ms` | `5000` | Minimum cadence for attributed network snapshots and growth calculations. |
+| `embedded.network_top_flows` | `10` | Maximum attributed flows retained in the Continuum snapshot. |
+| `embedded.network_top_processes` | `8` | Maximum process-port aggregates retained in the Continuum snapshot. |
+| `embedded.network_top_listeners` | `8` | Maximum listener sockets retained in the Continuum snapshot. |
+| `embedded.network_owner_cache_ttl_ms` | `30_000` | TTL for socket inode to process-owner cache entries. |
 | `embedded.gpu_enabled` | `true` | Enables GPU telemetry collection. |
 | `embedded.gpu_sysfs_enabled` | `true` | Enables Linux sysfs GPU probing. |
 | `embedded.gpu_nvml_enabled` | `true` | Enables NVML probing where available. |
@@ -502,7 +508,30 @@ Important behaviour:
 - those assessment snapshots feed the derived `continuum_loop` summary alongside telemetry, autoscaler, TraceyGuard, loader-threat, and Slurm state
 - compromise risk is derived from assessment-server findings plus local telemetry, TraceyGuard, and loader-threat context
 
-There is currently no dedicated config block for Continuum telemetry. That snapshot is always maintained from local events and decisions, exposed on `/status` and page 3 of the dashboard, and reused when deriving the status-plane `continuum_loop`.
+There is currently no dedicated config block for Continuum telemetry. That snapshot is always maintained from local events and decisions, exposed on `/status` and page 3 of the dashboard, and reused when deriving the status-plane `continuum_loop`. The server section now also carries bounded attributed-network summaries, top flows, top listeners, and process-port aggregates.
+
+### Resource forecast
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `resource_forecast.enabled` | `true` | Enables the forecast worker that consumes bounded Continuum telemetry snapshots. |
+| `resource_forecast.poll_interval_ms` | `5000` | Forecast update cadence. |
+| `resource_forecast.history_points` | `24` | Number of bounded telemetry points retained for linear growth estimation. |
+| `resource_forecast.gail.enabled` | `false` | Enables optional Gail advisory enrichment. |
+| `resource_forecast.gail.base_url` | empty | Gail base URL used for `/v1/llm/complete`. |
+| `resource_forecast.gail.bearer_token` | `null` | Optional bearer token for Gail requests. |
+| `resource_forecast.gail.request_interval_ms` | `300_000` | Minimum time between Gail advisory refreshes. |
+| `resource_forecast.gail.timeout_ms` | `8000` | Gail request timeout. |
+| `resource_forecast.gail.max_tokens` | `180` | Maximum advisory completion length. |
+| `resource_forecast.gail.workflow` | `assistant_requirements` | Workflow hint sent to Gail. |
+| `resource_forecast.gail.role` | `assistant` | Role hint sent to Gail. |
+
+Important behaviour:
+
+- the forecast worker stays off the event hot path and only consumes `ContinuumTelemetryHandle` snapshots
+- local projections remain available even when Gail is disabled or unavailable
+- Gail advice is refreshed only when the forecast digest changes and the request interval has elapsed
+- the forecast snapshot is exposed through `/status`, reused by the NMC Tracey dashboard, and designed to feed external simulation tooling
 
 ## Status API and Authentication
 
@@ -521,6 +550,7 @@ Important behaviour:
 - when status is disabled, sanitisation also disables the Prometheus pertinent-log exporter
 - invalid non-blank status addresses are not sanitised; the runtime logs a warning and skips server start if parsing fails
 - the status snapshot includes posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and location snapshots
+- the status snapshot also includes `resource_forecast`, which carries bounded traffic-growth projections, simulation-sizing estimates, and optional Gail advisory text
 
 ### Authentication
 
@@ -755,11 +785,31 @@ The code supports both `TRACEY_*` and `NM_*` aliases for many settings. Coverage
 - `TRACEY_EMBEDDED_PROCESS_TOP_N`
 - `TRACEY_EMBEDDED_PROCESS_WINDOW_MS`
 - `TRACEY_EMBEDDED_PROCESS_MAX`
+- `TRACEY_EMBEDDED_NETWORK_ATTRIBUTION_ENABLED`
+- `TRACEY_EMBEDDED_NETWORK_WINDOW_MS`
+- `TRACEY_EMBEDDED_NETWORK_TOP_FLOWS`
+- `TRACEY_EMBEDDED_NETWORK_TOP_PROCESSES`
+- `TRACEY_EMBEDDED_NETWORK_TOP_LISTENERS`
+- `TRACEY_EMBEDDED_NETWORK_OWNER_CACHE_TTL_MS`
 - `TRACEY_EMBEDDED_GPU_ENABLED`
 - `TRACEY_EMBEDDED_GPU_SYSFS_ENABLED`
 - `TRACEY_EMBEDDED_GPU_NVML_ENABLED`
 - `TRACEY_EMBEDDED_GPU_ROCM_ENABLED`
 - `TRACEY_EMBEDDED_GPU_MAX_DEVICES`
+
+### Resource forecast
+
+- `TRACEY_RESOURCE_FORECAST_ENABLED`
+- `TRACEY_RESOURCE_FORECAST_POLL_INTERVAL_MS`
+- `TRACEY_RESOURCE_FORECAST_HISTORY_POINTS`
+- `TRACEY_RESOURCE_FORECAST_GAIL_ENABLED`
+- `TRACEY_RESOURCE_FORECAST_GAIL_URL`
+- `TRACEY_RESOURCE_FORECAST_GAIL_TOKEN`
+- `TRACEY_RESOURCE_FORECAST_GAIL_REQUEST_INTERVAL_MS`
+- `TRACEY_RESOURCE_FORECAST_GAIL_TIMEOUT_MS`
+- `TRACEY_RESOURCE_FORECAST_GAIL_MAX_TOKENS`
+- `TRACEY_RESOURCE_FORECAST_GAIL_WORKFLOW`
+- `TRACEY_RESOURCE_FORECAST_GAIL_ROLE`
 
 ### Prometheus pertinent-log export
 
@@ -825,6 +875,8 @@ Numerous fields are clamped to defensive bounds, including:
 - fuzzy order and weights
 - storage budgets and intervals
 - discovery, telemetry, update, loader, continuum, governance, coordination, and stimuli intervals
+- embedded network-attribution windows and cache TTLs
+- resource-forecast cadence, history, and Gail request bounds
 - TraceyGuard probe, TMR, correlation, and snapshot limits
 - TraceyBan retry counts, ban windows, action timeouts, and fuzzy thresholds
 - OIDC cache TTL, leeway, and HTTP timeout

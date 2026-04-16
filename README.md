@@ -39,13 +39,14 @@ That default profile is useful for local evaluation and continuous self-exercise
 | Area | Default state | Notes |
 | --- | --- | --- |
 | Synthetic sensors | On | No configuration flag currently disables them. |
-| Embedded collectors | On | Linux-only; publishes CPU, memory, disk, network, process, battery, Jetson, and GPU metrics. |
+| Embedded collectors | On | Linux-only; publishes CPU, memory, disk, network, process, battery, Jetson, and GPU metrics, including low-overhead socket-to-process attribution on Linux. |
 | TraceyGuard | On | Discovers GPUs where possible, otherwise creates synthetic devices and synthetic probe activity. |
 | Discovery gossip | On | Broadcast UDP with a shared-key MAC; default key is a development placeholder. |
 | Status API | On | Binds to `0.0.0.0:48000`; authorisation is off until OIDC is enabled. |
 | Prometheus log export | On | Depends on status being enabled; exposes `/metrics` and signed `/prometheus/ingest`. |
 | Slurm detection | On | Best-effort native and Continuum Podman detection; contributes capability tags and status snapshots when found. |
-| Continuum telemetry snapshot | On | Always builds bounded host, GPU, action, and probe telemetry for `/status` and page 3 of the dashboard. |
+| Continuum telemetry snapshot | On | Always builds bounded host, GPU, action, probe, and attributed network telemetry for `/status` and page 3 of the dashboard. |
+| Resource forecast | On | Builds bounded 5-minute and 15-minute growth projections plus simulation-sizing hints from Continuum telemetry; Gail advice is optional and off until configured. |
 | Continuum closed-loop snapshot | On | Always derives `continuum_loop` from autoscaler, assessment, telemetry, TraceyGuard, loader-threat, and Slurm state for `/status` and page 1 of the dashboard. |
 | Coordination and governance | On | Leader election, proxy selection, and posture voting run automatically. |
 | Continuum assessment | Off by effective default | The config struct defaults `enabled=true`, but sanitisation disables it until `continuum_assessment.base_url` or an inherited Continuum URL is available. |
@@ -178,7 +179,7 @@ When `status.enabled` is true, the Axum server exposes:
 - `/metrics`: Prometheus exposition for the elected pertinent-log exporter
 - `/prometheus/ingest`: signed follower-to-exporter batch intake
 
-The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, the derived `continuum_loop`, loader-threat, and inferred self/peer location snapshots.
+The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, resource-forecast projections, the derived `continuum_loop`, loader-threat, and inferred self/peer location snapshots.
 
 The operator CLI subcommands `tracey status`, `tracey tracey-ban ...`, and `tracey tracey-guard ...` are thin wrappers over these same routes.
 

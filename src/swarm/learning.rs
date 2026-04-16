@@ -351,11 +351,45 @@ fn metric_context(event: &Event) -> f64 {
         "mem_bufcache" => {
             score += triangle(signal, 0.10, 0.45, 0.85) * 0.08;
         }
+        "network_latency_pressure" => {
+            score += right_shoulder(signal, 0.45, 0.75) * 0.38;
+        }
+        "network_queue_pressure" => {
+            score += right_shoulder(signal, 0.50, 0.82) * 0.32;
+        }
+        "network_process_flow_bps"
+        | "network_process_total_bps"
+        | "network_attributed_total_bps"
+        | "network_cross_network_bps"
+        | "network_udp_estimated_total_bps" => {
+            score += right_shoulder(signal, 0.55, 0.88) * 0.22;
+        }
+        "network_active_flows"
+        | "network_established_flows"
+        | "network_cross_network_flows"
+        | "network_unknown_remote_mac_flows"
+        | "network_owner_misses"
+        | "network_estimated_flows"
+        | "network_udp_active_flows"
+        | "network_udp_drop_delta" => {
+            score += right_shoulder(signal, 0.45, 0.78) * 0.20;
+        }
+        "network_attribution_confidence" => {
+            score += right_shoulder(1.0 - signal, 0.20, 0.55) * 0.28;
+        }
+        "network_traffic_growth_pct_per_min"
+        | "network_cross_network_growth_pct_per_min"
+        | "network_flow_growth_pct_per_min" => {
+            score += right_shoulder(signal, 0.35, 0.70) * 0.24;
+        }
         _ => {}
     }
 
     if metric.starts_with("gpu_") {
         score += 0.05;
+    }
+    if metric.starts_with("network_") {
+        score += 0.06;
     }
     if event.source.eq_ignore_ascii_case("embedded") {
         score += 0.03;

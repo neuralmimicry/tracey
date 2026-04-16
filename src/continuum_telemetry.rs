@@ -17,10 +17,15 @@ const MAX_POWER_SENSORS: usize = 12;
 const MAX_DISKS: usize = 8;
 const MAX_PROCESSES: usize = 8;
 const MAX_GPUS: usize = 32;
+const MAX_NETWORK_PROCESSES: usize = 16;
+const MAX_NETWORK_FLOWS: usize = 16;
+const MAX_NETWORK_LISTENERS: usize = 16;
 const MAX_RECENT_ACTIONS: usize = 48;
 const MAX_DETAIL_LEN: usize = 160;
 const MAX_LABEL_LEN: usize = 64;
 const MAX_HOSTNAME_LEN: usize = 96;
+const MIN_NETWORK_RETENTION_MS: u64 = 15_000;
+const MAX_NETWORK_RETENTION_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -141,6 +146,130 @@ pub struct ContinuumActionRecord {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ContinuumNetworkSummarySnapshot {
+    pub window_ms: u64,
+    pub updated_ms: u64,
+    pub collector_backend: String,
+    pub active_flows: usize,
+    pub established_flows: usize,
+    pub listeners: usize,
+    pub owner_misses: usize,
+    pub estimated_flows: usize,
+    pub remote_endpoints: usize,
+    pub cross_network_flows: usize,
+    pub lan_flows: usize,
+    pub local_host_flows: usize,
+    pub unknown_remote_mac_flows: usize,
+    pub udp_active_flows: usize,
+    pub udp_drop_delta: u64,
+    pub attributed_rx_bps: Option<f64>,
+    pub attributed_tx_bps: Option<f64>,
+    pub attributed_total_bps: Option<f64>,
+    pub cross_network_bps: Option<f64>,
+    pub udp_estimated_total_bps: Option<f64>,
+    pub attribution_confidence: Option<f64>,
+    pub latency_pressure: Option<f64>,
+    pub queue_pressure: Option<f64>,
+    pub queue_bytes: Option<f64>,
+    pub rtt_ms_max: Option<f64>,
+    pub traffic_growth_pct_per_min: f64,
+    pub cross_network_growth_pct_per_min: f64,
+    pub flow_growth_pct_per_min: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumNetworkFlowSnapshot {
+    pub flow_id: String,
+    pub pid: u32,
+    pub process: String,
+    pub protocol: String,
+    pub socket_state: String,
+    pub uid: u32,
+    pub iface: Option<String>,
+    pub local_ip: String,
+    pub local_port: u16,
+    pub local_mac: Option<String>,
+    pub remote_ip: Option<String>,
+    pub remote_port: Option<u16>,
+    pub remote_mac: Option<String>,
+    pub exe_path: Option<String>,
+    pub cmdline: Option<String>,
+    pub cgroup: Option<String>,
+    pub rx_bps: Option<f64>,
+    pub tx_bps: Option<f64>,
+    pub total_bps: f64,
+    pub queue_bytes: Option<f64>,
+    pub collector_backend: String,
+    pub attribution_confidence: Option<f64>,
+    pub udp_drop_delta: Option<u64>,
+    pub rtt_ms: Option<f64>,
+    pub retransmits: Option<u32>,
+    pub cross_network: bool,
+    pub same_lan: bool,
+    pub local_host: bool,
+    pub bytes_estimated: bool,
+    pub anomaly: bool,
+    pub severity: String,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumNetworkProcessSnapshot {
+    pub pid: u32,
+    pub name: String,
+    pub exe_path: Option<String>,
+    pub cmdline: Option<String>,
+    pub cgroup: Option<String>,
+    pub flow_count: usize,
+    pub listener_count: usize,
+    pub cross_network_flows: usize,
+    pub rx_bps: Option<f64>,
+    pub tx_bps: Option<f64>,
+    pub total_bps: f64,
+    pub queue_bytes: Option<f64>,
+    pub collector_backend: String,
+    pub attribution_confidence: Option<f64>,
+    pub max_rtt_ms: Option<f64>,
+    pub dominant_remote_ip: Option<String>,
+    pub local_ports: Vec<u16>,
+    pub remote_ports: Vec<u16>,
+    pub severity: String,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumNetworkListenerSnapshot {
+    pub listener_id: String,
+    pub pid: u32,
+    pub process: String,
+    pub protocol: String,
+    pub socket_state: String,
+    pub uid: u32,
+    pub iface: Option<String>,
+    pub local_ip: String,
+    pub local_port: u16,
+    pub local_mac: Option<String>,
+    pub queue_bytes: Option<f64>,
+    pub collector_backend: String,
+    pub attribution_confidence: Option<f64>,
+    pub severity: String,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuumNetworkSnapshot {
+    pub summary: ContinuumNetworkSummarySnapshot,
+    pub top_processes: Vec<ContinuumNetworkProcessSnapshot>,
+    pub top_flows: Vec<ContinuumNetworkFlowSnapshot>,
+    pub top_listeners: Vec<ContinuumNetworkListenerSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContinuumServerSnapshot {
     pub cpu_usage_pct: Option<f64>,
     pub mem_used_pct: Option<f64>,
@@ -157,6 +286,7 @@ pub struct ContinuumServerSnapshot {
     pub autonomy_risk: Option<f64>,
     pub autonomy_action: Option<String>,
     pub ecc: ContinuumEccSnapshot,
+    pub network: ContinuumNetworkSnapshot,
     pub thermal_sensors: Vec<ContinuumThermalSensor>,
     pub fan_sensors: Vec<ContinuumFanSensor>,
     pub power_sensors: Vec<ContinuumPowerSensor>,
@@ -210,6 +340,7 @@ pub fn spawn_continuum_telemetry(
         };
         let mut state = ContinuumTelemetryState {
             identity,
+            network_window_ms: 5_000,
             ..ContinuumTelemetryState::default()
         };
 
@@ -264,6 +395,11 @@ struct ContinuumTelemetryState {
     processes: HashMap<u32, ContinuumProcessSnapshot>,
     disks: HashMap<String, ContinuumDiskSnapshot>,
     gpus: HashMap<String, ContinuumGpuSnapshot>,
+    network_summary: ContinuumNetworkSummarySnapshot,
+    network_processes: HashMap<u32, ContinuumNetworkProcessSnapshot>,
+    network_flows: HashMap<String, ContinuumNetworkFlowSnapshot>,
+    network_listeners: HashMap<String, ContinuumNetworkListenerSnapshot>,
+    network_window_ms: u64,
     recent_actions: VecDeque<ContinuumActionRecord>,
     ecc_corrected_total: u64,
     ecc_uncorrected_total: u64,
@@ -307,6 +443,10 @@ impl ContinuumTelemetryState {
             .map(String::as_str)
             .unwrap_or("");
         let value = parse_attr_f64(event, "value");
+        if metric.starts_with("network_") {
+            self.ingest_network_event(event, metric, value);
+            return;
+        }
         match metric {
             "cpu_usage" => {
                 self.cpu_usage_pct = value.or(Some(event.signal.clamp(0.0, 1.0) * 100.0));
@@ -329,14 +469,14 @@ impl ContinuumTelemetryState {
             "thermal_temp" => {
                 let name = sensor_name(event, "zone", "thermal");
                 let label = sensor_label(event, "zone", "thermal");
-                let entry = self
-                    .thermals
-                    .entry(name.clone())
-                    .or_insert_with(|| ContinuumThermalSensor {
-                        name,
-                        label,
-                        ..ContinuumThermalSensor::default()
-                    });
+                let entry =
+                    self.thermals
+                        .entry(name.clone())
+                        .or_insert_with(|| ContinuumThermalSensor {
+                            name,
+                            label,
+                            ..ContinuumThermalSensor::default()
+                        });
                 entry.sensor_type = event.attributes.get("type").cloned();
                 entry.temp_c = value.unwrap_or_default();
                 entry.severity = severity_label(event.severity).to_string();
@@ -372,14 +512,14 @@ impl ContinuumTelemetryState {
             "sensor_power_w" => {
                 let name = sensor_name(event, "sensor", "power");
                 let label = sensor_label(event, "label", &name);
-                let entry = self
-                    .powers
-                    .entry(name.clone())
-                    .or_insert_with(|| ContinuumPowerSensor {
-                        name,
-                        label,
-                        ..ContinuumPowerSensor::default()
-                    });
+                let entry =
+                    self.powers
+                        .entry(name.clone())
+                        .or_insert_with(|| ContinuumPowerSensor {
+                            name,
+                            label,
+                            ..ContinuumPowerSensor::default()
+                        });
                 entry.power_w = value.unwrap_or_default();
                 entry.severity = severity_label(event.severity).to_string();
             }
@@ -396,13 +536,14 @@ impl ContinuumTelemetryState {
                         .get("process")
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
-                    let entry = self.processes.entry(pid).or_insert_with(|| {
-                        ContinuumProcessSnapshot {
-                            pid,
-                            name: name.clone(),
-                            ..ContinuumProcessSnapshot::default()
-                        }
-                    });
+                    let entry =
+                        self.processes
+                            .entry(pid)
+                            .or_insert_with(|| ContinuumProcessSnapshot {
+                                pid,
+                                name: name.clone(),
+                                ..ContinuumProcessSnapshot::default()
+                            });
                     entry.name = name;
                     match metric {
                         "process_cpu_percent" => entry.cpu_pct = value,
@@ -418,17 +559,18 @@ impl ContinuumTelemetryState {
                     .get("mount")
                     .cloned()
                     .unwrap_or_else(|| "/".to_string());
-                let entry = self
-                    .disks
-                    .entry(mount.clone())
-                    .or_insert_with(|| ContinuumDiskSnapshot {
-                        mount: mount.clone(),
-                        ..ContinuumDiskSnapshot::default()
-                    });
+                let entry =
+                    self.disks
+                        .entry(mount.clone())
+                        .or_insert_with(|| ContinuumDiskSnapshot {
+                            mount: mount.clone(),
+                            ..ContinuumDiskSnapshot::default()
+                        });
                 match metric {
                     "disk_used_bytes" => {
                         entry.used_bytes = value;
-                        entry.used_ratio = parse_attr_f64(event, "used_ratio").or(Some(event.signal));
+                        entry.used_ratio =
+                            parse_attr_f64(event, "used_ratio").or(Some(event.signal));
                     }
                     "disk_total_bytes" => entry.total_bytes = value,
                     "disk_read_bps" => entry.read_bps = value,
@@ -504,9 +646,7 @@ impl ContinuumTelemetryState {
             "gpu_decoder_util_percent" => entry.decoder_util_percent = value,
             _ if metric.contains("ecc") => {
                 let next = value.map(|v| v.max(0.0).round() as u64).unwrap_or(1);
-                entry.ecc_error_count = Some(
-                    entry.ecc_error_count.unwrap_or_default().max(next)
-                );
+                entry.ecc_error_count = Some(entry.ecc_error_count.unwrap_or_default().max(next));
             }
             _ => {}
         }
@@ -518,18 +658,261 @@ impl ContinuumTelemetryState {
         }
     }
 
+    fn ingest_network_event(&mut self, event: &Event, metric: &str, value: Option<f64>) {
+        let summary = &mut self.network_summary;
+        summary.updated_ms = event.ts_ms;
+        if let Some(backend) = event.attributes.get("collector_backend") {
+            summary.collector_backend = backend.clone();
+        }
+
+        match metric {
+            "network_active_flows" => {
+                summary.active_flows = value.unwrap_or_default().max(0.0).round() as usize;
+                if let Some(window_ms) = parse_attr_u64(event, "window_ms") {
+                    self.network_window_ms = window_ms.max(1_000);
+                    summary.window_ms = self.network_window_ms;
+                }
+            }
+            "network_established_flows" => {
+                summary.established_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_listeners" => {
+                summary.listeners = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_owner_misses" => {
+                summary.owner_misses = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_estimated_flows" => {
+                summary.estimated_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_remote_endpoints" => {
+                summary.remote_endpoints = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_cross_network_flows" => {
+                summary.cross_network_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_lan_flows" => {
+                summary.lan_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_local_host_flows" => {
+                summary.local_host_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_unknown_remote_mac_flows" => {
+                summary.unknown_remote_mac_flows =
+                    value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_udp_active_flows" => {
+                summary.udp_active_flows = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_udp_drop_delta" => {
+                summary.udp_drop_delta = value.unwrap_or_default().max(0.0).round() as u64;
+            }
+            "network_attributed_rx_bps" => {
+                summary.attributed_rx_bps = value;
+            }
+            "network_attributed_tx_bps" => {
+                summary.attributed_tx_bps = value;
+            }
+            "network_attributed_total_bps" => {
+                summary.attributed_total_bps = value;
+            }
+            "network_cross_network_bps" => {
+                summary.cross_network_bps = value;
+            }
+            "network_udp_estimated_total_bps" => {
+                summary.udp_estimated_total_bps = value;
+            }
+            "network_attribution_confidence" => {
+                summary.attribution_confidence = value.or(Some(event.signal.clamp(0.0, 1.0)));
+            }
+            "network_latency_pressure" => {
+                summary.latency_pressure = value.or(Some(event.signal.clamp(0.0, 1.0)));
+                summary.rtt_ms_max = parse_attr_f64(event, "rtt_ms_max");
+            }
+            "network_queue_pressure" => {
+                summary.queue_bytes = value;
+                summary.queue_pressure = Some(event.signal.clamp(0.0, 1.0));
+            }
+            "network_traffic_growth_pct_per_min" => {
+                summary.traffic_growth_pct_per_min = value.unwrap_or_default();
+            }
+            "network_cross_network_growth_pct_per_min" => {
+                summary.cross_network_growth_pct_per_min = value.unwrap_or_default();
+            }
+            "network_flow_growth_pct_per_min" => {
+                summary.flow_growth_pct_per_min = value.unwrap_or_default();
+            }
+            "network_process_flow_bps" => {
+                let mut flow = ContinuumNetworkFlowSnapshot {
+                    flow_id: event.attributes.get("flow_id").cloned().unwrap_or_default(),
+                    pid: parse_attr_u32(event, "pid").unwrap_or_default(),
+                    process: event
+                        .attributes
+                        .get("process")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    protocol: event
+                        .attributes
+                        .get("protocol")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    socket_state: event
+                        .attributes
+                        .get("socket_state")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    uid: parse_attr_u32(event, "uid").unwrap_or_default(),
+                    iface: event.attributes.get("iface").cloned(),
+                    local_ip: event
+                        .attributes
+                        .get("local_ip")
+                        .cloned()
+                        .unwrap_or_default(),
+                    local_port: parse_attr_u16(event, "local_port").unwrap_or_default(),
+                    local_mac: event.attributes.get("local_mac").cloned(),
+                    remote_ip: event.attributes.get("remote_ip").cloned(),
+                    remote_port: parse_attr_u16(event, "remote_port"),
+                    remote_mac: event.attributes.get("remote_mac").cloned(),
+                    exe_path: event.attributes.get("exe_path").cloned(),
+                    cmdline: event.attributes.get("cmdline").cloned(),
+                    cgroup: event.attributes.get("cgroup").cloned(),
+                    rx_bps: parse_attr_f64(event, "rx_bps"),
+                    tx_bps: parse_attr_f64(event, "tx_bps"),
+                    total_bps: value.unwrap_or_default().max(0.0),
+                    queue_bytes: parse_attr_f64(event, "queue_bytes"),
+                    collector_backend: event
+                        .attributes
+                        .get("collector_backend")
+                        .cloned()
+                        .unwrap_or_default(),
+                    attribution_confidence: parse_attr_f64(event, "attribution_confidence"),
+                    udp_drop_delta: parse_attr_u64(event, "udp_drop_delta"),
+                    rtt_ms: parse_attr_f64(event, "rtt_ms"),
+                    retransmits: parse_attr_u32(event, "retransmits"),
+                    cross_network: parse_attr_bool(event, "cross_network").unwrap_or(false),
+                    same_lan: parse_attr_bool(event, "same_lan").unwrap_or(false),
+                    local_host: parse_attr_bool(event, "local_host").unwrap_or(false),
+                    bytes_estimated: parse_attr_bool(event, "bytes_estimated").unwrap_or(false),
+                    anomaly: parse_attr_bool(event, "anomaly").unwrap_or(false),
+                    severity: severity_label(event.severity).to_string(),
+                    last_seen_ms: event.ts_ms,
+                };
+                if flow.flow_id.is_empty() {
+                    flow.flow_id = format!(
+                        "{}:{}:{}:{}:{}",
+                        flow.protocol,
+                        flow.pid,
+                        flow.local_ip,
+                        flow.local_port,
+                        flow.remote_port.unwrap_or_default()
+                    );
+                }
+                if flow.remote_ip.as_deref() == Some("0.0.0.0")
+                    || flow.remote_ip.as_deref() == Some("::")
+                {
+                    flow.remote_ip = None;
+                }
+                self.network_flows.insert(flow.flow_id.clone(), flow);
+            }
+            "network_process_total_bps" => {
+                let process = ContinuumNetworkProcessSnapshot {
+                    pid: parse_attr_u32(event, "pid").unwrap_or_default(),
+                    name: event
+                        .attributes
+                        .get("process")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    exe_path: event.attributes.get("exe_path").cloned(),
+                    cmdline: event.attributes.get("cmdline").cloned(),
+                    cgroup: event.attributes.get("cgroup").cloned(),
+                    flow_count: parse_attr_usize(event, "flow_count").unwrap_or_default(),
+                    listener_count: parse_attr_usize(event, "listener_count").unwrap_or_default(),
+                    cross_network_flows: parse_attr_usize(event, "cross_network_flows")
+                        .unwrap_or_default(),
+                    rx_bps: parse_attr_f64(event, "rx_bps"),
+                    tx_bps: parse_attr_f64(event, "tx_bps"),
+                    total_bps: value.unwrap_or_default().max(0.0),
+                    queue_bytes: parse_attr_f64(event, "queue_bytes"),
+                    collector_backend: event
+                        .attributes
+                        .get("collector_backend")
+                        .cloned()
+                        .unwrap_or_default(),
+                    attribution_confidence: parse_attr_f64(event, "attribution_confidence"),
+                    max_rtt_ms: parse_attr_f64(event, "max_rtt_ms"),
+                    dominant_remote_ip: event.attributes.get("dominant_remote_ip").cloned(),
+                    local_ports: parse_csv_u16_attr(event, "local_ports"),
+                    remote_ports: parse_csv_u16_attr(event, "remote_ports"),
+                    severity: severity_label(event.severity).to_string(),
+                    last_seen_ms: event.ts_ms,
+                };
+                self.network_processes.insert(process.pid, process);
+            }
+            "network_listener_socket" => {
+                let mut listener = ContinuumNetworkListenerSnapshot {
+                    listener_id: event
+                        .attributes
+                        .get("listener_id")
+                        .cloned()
+                        .unwrap_or_default(),
+                    pid: parse_attr_u32(event, "pid").unwrap_or_default(),
+                    process: event
+                        .attributes
+                        .get("process")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    protocol: event
+                        .attributes
+                        .get("protocol")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    socket_state: event
+                        .attributes
+                        .get("socket_state")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    uid: parse_attr_u32(event, "uid").unwrap_or_default(),
+                    iface: event.attributes.get("iface").cloned(),
+                    local_ip: event
+                        .attributes
+                        .get("local_ip")
+                        .cloned()
+                        .unwrap_or_default(),
+                    local_port: parse_attr_u16(event, "local_port").unwrap_or_default(),
+                    local_mac: event.attributes.get("local_mac").cloned(),
+                    queue_bytes: value,
+                    collector_backend: event
+                        .attributes
+                        .get("collector_backend")
+                        .cloned()
+                        .unwrap_or_default(),
+                    attribution_confidence: parse_attr_f64(event, "attribution_confidence"),
+                    severity: severity_label(event.severity).to_string(),
+                    last_seen_ms: event.ts_ms,
+                };
+                if listener.listener_id.is_empty() {
+                    listener.listener_id = format!(
+                        "{}:{}:{}:{}",
+                        listener.protocol, listener.pid, listener.local_ip, listener.local_port
+                    );
+                }
+                self.network_listeners
+                    .insert(listener.listener_id.clone(), listener);
+            }
+            _ => {}
+        }
+    }
+
     fn push_action(&mut self, action: ContinuumActionRecord) {
         if action.action.is_empty() && action.detail.is_empty() {
             return;
         }
-        if self
-            .recent_actions
-            .front()
-            .is_some_and(|existing| existing.ts_ms == action.ts_ms
+        if self.recent_actions.front().is_some_and(|existing| {
+            existing.ts_ms == action.ts_ms
                 && existing.category == action.category
                 && existing.action == action.action
-                && existing.detail == action.detail)
-        {
+                && existing.detail == action.detail
+        }) {
             return;
         }
         self.recent_actions.push_front(action);
@@ -538,7 +921,7 @@ impl ContinuumTelemetryState {
         }
     }
 
-    fn build_snapshot(&self) -> ContinuumTelemetrySnapshot {
+    fn build_snapshot(&mut self) -> ContinuumTelemetrySnapshot {
         let mut thermals: Vec<_> = self.thermals.values().cloned().collect();
         thermals.sort_by(|left, right| {
             right
@@ -591,6 +974,39 @@ impl ContinuumTelemetryState {
         });
         gpus.truncate(MAX_GPUS);
 
+        let network_retention_ms = network_retention_ms(self.network_window_ms);
+        self.prune_network_samples(now_ms(), network_retention_ms);
+
+        let mut network_processes: Vec<_> = self.network_processes.values().cloned().collect();
+        network_processes.sort_by(|left, right| {
+            right
+                .total_bps
+                .partial_cmp(&left.total_bps)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| cmp_opt_f64_desc(right.max_rtt_ms, left.max_rtt_ms))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        network_processes.truncate(MAX_NETWORK_PROCESSES);
+
+        let mut network_flows: Vec<_> = self.network_flows.values().cloned().collect();
+        network_flows.sort_by(|left, right| {
+            right
+                .total_bps
+                .partial_cmp(&left.total_bps)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| cmp_opt_f64_desc(right.rtt_ms, left.rtt_ms))
+                .then_with(|| left.flow_id.cmp(&right.flow_id))
+        });
+        network_flows.truncate(MAX_NETWORK_FLOWS);
+
+        let mut network_listeners: Vec<_> = self.network_listeners.values().cloned().collect();
+        network_listeners.sort_by(|left, right| {
+            cmp_opt_f64_desc(right.queue_bytes, left.queue_bytes)
+                .then_with(|| left.process.cmp(&right.process))
+                .then_with(|| left.listener_id.cmp(&right.listener_id))
+        });
+        network_listeners.truncate(MAX_NETWORK_LISTENERS);
+
         let mut gpu_util_sum = 0.0;
         let mut gpu_util_count = 0usize;
         let mut gpu_temp_max: Option<f64> = None;
@@ -602,7 +1018,11 @@ impl ContinuumTelemetryState {
                 gpu_util_count += 1;
             }
             if let Some(temp) = gpu.temp_c {
-                gpu_temp_max = Some(gpu_temp_max.map(|current| current.max(temp)).unwrap_or(temp));
+                gpu_temp_max = Some(
+                    gpu_temp_max
+                        .map(|current| current.max(temp))
+                        .unwrap_or(temp),
+                );
             }
             if let Some(power) = gpu.power_w {
                 gpu_power_total += power;
@@ -627,7 +1047,9 @@ impl ContinuumTelemetryState {
                 thermal_alerts: thermals.iter().filter(|entry| entry.temp_c >= 75.0).count(),
                 fan_alerts: fans
                     .iter()
-                    .filter(|entry| entry.rpm == Some(0) || entry.pwm_percent.is_some_and(|value| value >= 95.0))
+                    .filter(|entry| {
+                        entry.rpm == Some(0) || entry.pwm_percent.is_some_and(|value| value >= 95.0)
+                    })
                     .count(),
                 recent_action_count: self.recent_actions.len(),
                 autonomy_risk: self.last_decision_risk,
@@ -635,6 +1057,15 @@ impl ContinuumTelemetryState {
                 ecc: ContinuumEccSnapshot {
                     corrected_total: self.ecc_corrected_total,
                     uncorrected_total: self.ecc_uncorrected_total,
+                },
+                network: ContinuumNetworkSnapshot {
+                    summary: ContinuumNetworkSummarySnapshot {
+                        window_ms: self.network_summary.window_ms.max(self.network_window_ms),
+                        ..self.network_summary.clone()
+                    },
+                    top_processes: network_processes,
+                    top_flows: network_flows,
+                    top_listeners: network_listeners,
                 },
                 thermal_sensors: thermals,
                 fan_sensors: fans,
@@ -645,6 +1076,15 @@ impl ContinuumTelemetryState {
             gpus,
             recent_actions: self.recent_actions.iter().cloned().collect(),
         }
+    }
+
+    fn prune_network_samples(&mut self, now_ms: u64, retention_ms: u64) {
+        self.network_processes
+            .retain(|_, process| now_ms.saturating_sub(process.last_seen_ms) <= retention_ms);
+        self.network_flows
+            .retain(|_, flow| now_ms.saturating_sub(flow.last_seen_ms) <= retention_ms);
+        self.network_listeners
+            .retain(|_, listener| now_ms.saturating_sub(listener.last_seen_ms) <= retention_ms);
     }
 }
 
@@ -739,7 +1179,8 @@ fn truncate_text(value: &str, max_len: usize) -> String {
 }
 
 fn sensor_name(event: &Event, key: &str, fallback: &str) -> String {
-    event.attributes
+    event
+        .attributes
         .get(key)
         .cloned()
         .filter(|value| !value.trim().is_empty())
@@ -749,7 +1190,8 @@ fn sensor_name(event: &Event, key: &str, fallback: &str) -> String {
 }
 
 fn sensor_label(event: &Event, key: &str, fallback: &str) -> String {
-    event.attributes
+    event
+        .attributes
         .get(key)
         .cloned()
         .filter(|value| !value.trim().is_empty())
@@ -771,11 +1213,57 @@ fn parse_attr_f64(event: &Event, key: &str) -> Option<f64> {
         .and_then(|value| value.parse::<f64>().ok())
 }
 
+fn parse_attr_bool(event: &Event, key: &str) -> Option<bool> {
+    let value = event.attributes.get(key)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_attr_u16(event: &Event, key: &str) -> Option<u16> {
+    event
+        .attributes
+        .get(key)
+        .and_then(|value| value.parse::<u16>().ok())
+}
+
 fn parse_attr_u32(event: &Event, key: &str) -> Option<u32> {
     event
         .attributes
         .get(key)
         .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_attr_u64(event: &Event, key: &str) -> Option<u64> {
+    event
+        .attributes
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn parse_attr_usize(event: &Event, key: &str) -> Option<usize> {
+    event
+        .attributes
+        .get(key)
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn parse_csv_u16_attr(event: &Event, key: &str) -> Vec<u16> {
+    event
+        .attributes
+        .get(key)
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse::<u16>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn network_retention_ms(window_ms: u64) -> u64 {
+    (window_ms.saturating_mul(3)).clamp(MIN_NETWORK_RETENTION_MS, MAX_NETWORK_RETENTION_MS)
 }
 
 fn cmp_opt_f64_desc(left: Option<f64>, right: Option<f64>) -> Ordering {
@@ -797,7 +1285,10 @@ fn severity_label(severity: Severity) -> &'static str {
 }
 
 fn should_record_action(event: &Event) -> bool {
-    if matches!(event.kind, EventKind::AutomationAction | EventKind::UserAction) {
+    if matches!(
+        event.kind,
+        EventKind::AutomationAction | EventKind::UserAction
+    ) {
         return true;
     }
 
@@ -835,7 +1326,15 @@ fn action_from_event(event: &Event) -> ContinuumActionRecord {
         .unwrap_or_else(|| metric.clone());
 
     let mut detail_parts = Vec::new();
-    for key in ["reason", "state", "probe_type", "metric", "process", "mount", "iface"] {
+    for key in [
+        "reason",
+        "state",
+        "probe_type",
+        "metric",
+        "process",
+        "mount",
+        "iface",
+    ] {
         if let Some(value) = event.attributes.get(key) {
             detail_parts.push(format!("{key}={value}"));
         }
@@ -903,9 +1402,15 @@ mod tests {
 
     #[test]
     fn action_filter_keeps_operationally_relevant_events() {
-        let event = Event::new(1, "tracey_guard", EventKind::Observability, 0.7, Severity::High)
-            .with_attr("metric", "tracey_guard_fault")
-            .with_attr("gpu_id", "nvidia:0");
+        let event = Event::new(
+            1,
+            "tracey_guard",
+            EventKind::Observability,
+            0.7,
+            Severity::High,
+        )
+        .with_attr("metric", "tracey_guard_fault")
+        .with_attr("gpu_id", "nvidia:0");
         assert!(should_record_action(&event));
     }
 }

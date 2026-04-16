@@ -5,6 +5,7 @@ use crate::bus::EventBus;
 use crate::config::EmbeddedConfig;
 use crate::event::{Event, EventKind, Severity};
 use crate::gpu::{self, GpuBackendConfig};
+use crate::network_intel::NetworkAttributionCollector;
 use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
 use std::collections::HashMap;
@@ -38,8 +39,9 @@ async fn run_embedded_collectors(
         return;
     }
     if std::env::consts::OS != "linux" {
-        tracing::info!("embedded collectors only supported on linux");
-        return;
+        tracing::info!(
+            "embedded collectors running in best-effort mode outside linux; network attribution will fall back when possible"
+        );
     }
 
     let jetson = if config.jetson_enabled {
@@ -77,6 +79,7 @@ struct CollectorState {
     proc_prev_total: Option<u64>,
     proc_last: Instant,
     proc_io_max: HashMap<String, f64>,
+    network: NetworkAttributionCollector,
     jetson: Option<JetsonPaths>,
     last_sample: Instant,
 }
@@ -96,6 +99,7 @@ impl CollectorState {
             proc_prev_total: None,
             proc_last: Instant::now(),
             proc_io_max: HashMap::new(),
+            network: NetworkAttributionCollector::new(),
             jetson,
             last_sample: Instant::now(),
         }
@@ -271,7 +275,10 @@ impl CollectorState {
                 "watt",
                 (sensor.power_w / 1600.0).clamp(0.0, 1.0),
                 sensor.severity,
-                &[("sensor", sensor.name.clone()), ("label", sensor.label.clone())],
+                &[
+                    ("sensor", sensor.name.clone()),
+                    ("label", sensor.label.clone()),
+                ],
             )
             .await;
         }
@@ -404,6 +411,7 @@ impl CollectorState {
         self.collect_disk_usage(bus, storage).await;
         self.collect_battery(bus, storage).await;
         self.collect_processes(bus, storage).await;
+        self.network.collect(bus, storage, &self.config).await;
         self.collect_gpus(bus, storage).await;
 
         if let Some(jetson) = &self.jetson {
@@ -514,7 +522,9 @@ impl CollectorState {
                         &[("rail", sensor.label.clone())],
                     )
                     .await;
-                    if let Some(power_w) = convert_power_to_watts(power as f64, sensor.unit.as_str()) {
+                    if let Some(power_w) =
+                        convert_power_to_watts(power as f64, sensor.unit.as_str())
+                    {
                         emit_metric(
                             bus,
                             storage,

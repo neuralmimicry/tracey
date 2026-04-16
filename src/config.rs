@@ -222,6 +222,12 @@ pub struct EmbeddedConfig {
     pub process_top_n: usize,
     pub process_window_ms: u64,
     pub process_max: usize,
+    pub network_attribution_enabled: bool,
+    pub network_window_ms: u64,
+    pub network_top_flows: usize,
+    pub network_top_processes: usize,
+    pub network_top_listeners: usize,
+    pub network_owner_cache_ttl_ms: u64,
     pub gpu_enabled: bool,
     pub gpu_sysfs_enabled: bool,
     pub gpu_nvml_enabled: bool,
@@ -242,11 +248,65 @@ impl Default for EmbeddedConfig {
             process_top_n: 5,
             process_window_ms: 5000,
             process_max: 2048,
+            network_attribution_enabled: true,
+            network_window_ms: 5000,
+            network_top_flows: 10,
+            network_top_processes: 8,
+            network_top_listeners: 8,
+            network_owner_cache_ttl_ms: 30_000,
             gpu_enabled: true,
             gpu_sysfs_enabled: true,
             gpu_nvml_enabled: true,
             gpu_rocm_enabled: true,
             gpu_max_devices: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GailForecastConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub bearer_token: Option<String>,
+    pub request_interval_ms: u64,
+    pub timeout_ms: u64,
+    pub max_tokens: u32,
+    pub workflow: String,
+    pub role: String,
+}
+
+impl Default for GailForecastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            bearer_token: None,
+            request_interval_ms: 300_000,
+            timeout_ms: 8_000,
+            max_tokens: 180,
+            workflow: "assistant_requirements".to_string(),
+            role: "assistant".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceForecastConfig {
+    pub enabled: bool,
+    pub poll_interval_ms: u64,
+    pub history_points: usize,
+    pub gail: GailForecastConfig,
+}
+
+impl Default for ResourceForecastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 5_000,
+            history_points: 24,
+            gail: GailForecastConfig::default(),
         }
     }
 }
@@ -621,6 +681,7 @@ pub struct Config {
     pub coordination: CoordinationConfig,
     pub continuum_autoscaler: ContinuumAutoscalerConfig,
     pub continuum_assessment: ContinuumAssessmentConfig,
+    pub resource_forecast: ResourceForecastConfig,
     pub loader: LoaderConfig,
     pub status: StatusConfig,
     pub stimuli: StimuliConfig,
@@ -662,6 +723,7 @@ impl Default for Config {
             coordination: CoordinationConfig::default(),
             continuum_autoscaler: ContinuumAutoscalerConfig::default(),
             continuum_assessment: ContinuumAssessmentConfig::default(),
+            resource_forecast: ResourceForecastConfig::default(),
             loader: LoaderConfig::default(),
             status: StatusConfig::default(),
             stimuli: StimuliConfig::default(),
@@ -818,6 +880,14 @@ impl Config {
         self.embedded.process_top_n = self.embedded.process_top_n.clamp(1, 50);
         self.embedded.process_window_ms = self.embedded.process_window_ms.clamp(1000, 120_000);
         self.embedded.process_max = self.embedded.process_max.clamp(64, 65_535);
+        self.embedded.network_window_ms = self.embedded.network_window_ms.clamp(1_000, 120_000);
+        self.embedded.network_top_flows = self.embedded.network_top_flows.clamp(1, 64);
+        self.embedded.network_top_processes = self.embedded.network_top_processes.clamp(1, 64);
+        self.embedded.network_top_listeners = self.embedded.network_top_listeners.clamp(1, 64);
+        self.embedded.network_owner_cache_ttl_ms = self
+            .embedded
+            .network_owner_cache_ttl_ms
+            .clamp(1_000, 600_000);
         self.embedded.gpu_max_devices = self.embedded.gpu_max_devices.clamp(1, 32);
 
         self.tracey_guard.scheduler_poll_ms = self.tracey_guard.scheduler_poll_ms.clamp(50, 10_000);
@@ -1063,6 +1133,24 @@ impl Config {
             self.continuum_assessment.enabled = false;
         }
 
+        self.resource_forecast.poll_interval_ms = self
+            .resource_forecast
+            .poll_interval_ms
+            .clamp(1_000, 300_000);
+        self.resource_forecast.history_points = self.resource_forecast.history_points.clamp(4, 240);
+        self.resource_forecast.gail.request_interval_ms = self
+            .resource_forecast
+            .gail
+            .request_interval_ms
+            .clamp(30_000, 3_600_000);
+        self.resource_forecast.gail.timeout_ms =
+            self.resource_forecast.gail.timeout_ms.clamp(1_000, 60_000);
+        self.resource_forecast.gail.max_tokens =
+            self.resource_forecast.gail.max_tokens.clamp(64, 512);
+        if self.resource_forecast.gail.base_url.trim().is_empty() {
+            self.resource_forecast.gail.enabled = false;
+        }
+
         if self.status.listen_addr.trim().is_empty() {
             self.status.enabled = false;
         }
@@ -1268,7 +1356,9 @@ impl Config {
         if let Some(value) = env_any(&["TRACEY_AUTH_TOKEN", "NM_TRACEY_AUTH_TOKEN"]) {
             self.auth.token.static_token = Some(value);
         }
-        if let Some(value) = env_u64_any(&["TRACEY_AUTH_CACHE_TTL_MS", "NM_TRACEY_AUTH_CACHE_TTL_MS"]) {
+        if let Some(value) =
+            env_u64_any(&["TRACEY_AUTH_CACHE_TTL_MS", "NM_TRACEY_AUTH_CACHE_TTL_MS"])
+        {
             self.auth.token.cache_ttl_ms = value;
         }
         if let Some(value) = env_u64_any(&["TRACEY_AUTH_TIMEOUT_MS", "NM_TRACEY_AUTH_TIMEOUT_MS"]) {
@@ -1546,6 +1636,72 @@ impl Config {
         ]) {
             self.continuum_assessment.fuzzy.security_weight = value;
         }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_RESOURCE_FORECAST_ENABLED",
+            "NM_TRACEY_RESOURCE_FORECAST_ENABLED",
+        ]) {
+            self.resource_forecast.enabled = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_RESOURCE_FORECAST_POLL_INTERVAL_MS",
+            "NM_TRACEY_RESOURCE_FORECAST_POLL_INTERVAL_MS",
+        ]) {
+            self.resource_forecast.poll_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_RESOURCE_FORECAST_HISTORY_POINTS",
+            "NM_TRACEY_RESOURCE_FORECAST_HISTORY_POINTS",
+        ]) {
+            self.resource_forecast.history_points = value as usize;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_ENABLED",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_ENABLED",
+        ]) {
+            self.resource_forecast.gail.enabled = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_URL",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_URL",
+        ]) {
+            self.resource_forecast.gail.base_url = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_TOKEN",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_TOKEN",
+        ]) {
+            self.resource_forecast.gail.bearer_token = Some(value);
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_REQUEST_INTERVAL_MS",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_REQUEST_INTERVAL_MS",
+        ]) {
+            self.resource_forecast.gail.request_interval_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_TIMEOUT_MS",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_TIMEOUT_MS",
+        ]) {
+            self.resource_forecast.gail.timeout_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_MAX_TOKENS",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_MAX_TOKENS",
+        ]) {
+            self.resource_forecast.gail.max_tokens = value as u32;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_WORKFLOW",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_WORKFLOW",
+        ]) {
+            self.resource_forecast.gail.workflow = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_RESOURCE_FORECAST_GAIL_ROLE",
+            "NM_TRACEY_RESOURCE_FORECAST_GAIL_ROLE",
+        ]) {
+            self.resource_forecast.gail.role = value;
+        }
         if let Some(value) = env_any(&["TRACEY_REFINER_SOURCE", "NM_REFINER_SOURCE"]) {
             self.refiner.source = value;
         }
@@ -1619,6 +1775,42 @@ impl Config {
             env_u64_any(&["TRACEY_EMBEDDED_PROCESS_MAX", "NM_EMBEDDED_PROCESS_MAX"])
         {
             self.embedded.process_max = value as usize;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_EMBEDDED_NETWORK_ATTRIBUTION_ENABLED",
+            "NM_EMBEDDED_NETWORK_ATTRIBUTION_ENABLED",
+        ]) {
+            self.embedded.network_attribution_enabled = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_WINDOW_MS",
+            "NM_EMBEDDED_NETWORK_WINDOW_MS",
+        ]) {
+            self.embedded.network_window_ms = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_TOP_FLOWS",
+            "NM_EMBEDDED_NETWORK_TOP_FLOWS",
+        ]) {
+            self.embedded.network_top_flows = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_TOP_PROCESSES",
+            "NM_EMBEDDED_NETWORK_TOP_PROCESSES",
+        ]) {
+            self.embedded.network_top_processes = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_TOP_LISTENERS",
+            "NM_EMBEDDED_NETWORK_TOP_LISTENERS",
+        ]) {
+            self.embedded.network_top_listeners = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_OWNER_CACHE_TTL_MS",
+            "NM_EMBEDDED_NETWORK_OWNER_CACHE_TTL_MS",
+        ]) {
+            self.embedded.network_owner_cache_ttl_ms = value;
         }
         if let Some(value) =
             env_bool_any(&["TRACEY_EMBEDDED_GPU_ENABLED", "NM_EMBEDDED_GPU_ENABLED"])

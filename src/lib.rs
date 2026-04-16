@@ -22,9 +22,11 @@ pub mod inventory;
 pub mod loader;
 pub mod loader_threat;
 pub mod location;
+pub mod network_intel;
 mod peer_compat;
 pub mod prometheus_export;
 pub mod refiner_tracking;
+pub mod resource_forecast;
 pub mod security;
 pub mod sensors;
 pub mod shutdown;
@@ -221,6 +223,11 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         decision_tx.subscribe(),
         shutdown_listener.clone(),
     );
+    let resource_forecast = resource_forecast::spawn_resource_forecast(
+        config.resource_forecast.clone(),
+        continuum_telemetry.clone(),
+        shutdown_listener.clone(),
+    );
     let loader_threat_status = match loader_threat::LoaderThreatStatusHandle::from_config(
         &config.loader,
     ) {
@@ -330,6 +337,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     continuum_autoscaler: Some(continuum_autoscaler.clone()),
                     continuum_assessment: Some(continuum_assessment.clone()),
                     continuum_telemetry: Some(continuum_telemetry.clone()),
+                    resource_forecast: Some(resource_forecast.clone()),
                     loader_threats: loader_threat_status.clone(),
                 };
                 let status_shutdown = shutdown_listener.clone();
