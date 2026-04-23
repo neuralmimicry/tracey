@@ -336,7 +336,7 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 Current behavior:
 
 - every pull request and push to `main` runs the Rust verification job
-- the verification job also smoke-tests `tracey --tui --help` and shell-syntax checks the release scripts
+- the verification job runs `scripts/preflight.sh`, smoke-tests `tracey --tui --help`, and shell-syntax checks the release scripts
 - pushing a `v*` tag packages release artifacts for Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64, iOS arm64, and Android arm64, then publishes a GitHub release
 - manual `workflow_dispatch` runs can package artifacts from any ref
 - manual publishing is allowed only when the workflow is run against a `v*` tag ref and `publish_release` is enabled
@@ -372,6 +372,7 @@ Detailed guidance is in `[SECURITY.md](SECURITY.md)`. Compliance posture notes a
 Last locally verified on **8 April 2026**:
 
 ```bash
+bash scripts/preflight.sh
 cargo test
 cargo run --locked --bin tracey -- --help
 cargo run --locked --bin tracey -- tracey-ban actions

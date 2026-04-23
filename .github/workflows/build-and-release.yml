@@ -67,8 +67,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Run preflight checks
+        run: bash scripts/preflight.sh
 
       - name: Check build
         run: cargo check --locked --all-targets
@@ -79,8 +79,8 @@ jobs:
       - name: Smoke test TUI help
         run: cargo run --locked --bin tracey -- --tui --help
 
-      - name: Validate release scripts
-        run: bash -n scripts/install-service.sh scripts/package-release.sh
+      - name: Validate shell scripts
+        run: bash -n scripts/preflight.sh scripts/install-service.sh scripts/package-release.sh
 
   release-meta:
     name: release-meta
@@ -189,7 +189,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
           rustup target add "${{ matrix.rust_target }}"
 

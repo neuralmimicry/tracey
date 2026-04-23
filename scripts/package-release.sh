@@ -87,9 +87,25 @@ resolve_build_user() {
   fi
 }
 
+run_preflight_checks() {
+  local cmd
+  printf -v cmd 'cd %q && bash scripts/preflight.sh' "$REPO_ROOT"
+  if [[ -n "$BUILD_AS_USER" ]]; then
+    log "running preflight checks as ${BUILD_AS_USER}"
+    sudo -u "$BUILD_AS_USER" -H bash -lc "$cmd"
+  else
+    log "running preflight checks"
+    (
+      cd "$REPO_ROOT"
+      bash scripts/preflight.sh
+    )
+  fi
+}
+
 build_binaries() {
   local args
   local cmd
+  run_preflight_checks
   args=(cargo build --locked --release --bin tracey --bin tracey-loader)
   if [[ -n "$TARGET_TRIPLE" ]]; then
     args+=(--target "$TARGET_TRIPLE")

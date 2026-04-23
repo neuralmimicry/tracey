@@ -354,7 +354,7 @@ build_release_binaries() {
   log "building release Tracey binaries"
   RELEASE_BUILD_PLANNED=1
   local build_cmd
-  printf -v build_cmd 'cd %q && cargo build --release --bin tracey --bin tracey-loader' "$REPO_ROOT"
+  printf -v build_cmd 'cd %q && bash scripts/preflight.sh && cargo build --release --bin tracey --bin tracey-loader' "$REPO_ROOT"
   if ((DRY_RUN)); then
     if [[ -n "$BUILD_AS_USER" ]]; then
       printf '+ sudo -u %q -H bash -lc %q\n' "$BUILD_AS_USER" "$build_cmd"
@@ -368,6 +368,7 @@ build_release_binaries() {
   else
     (
       cd "$REPO_ROOT"
+      bash scripts/preflight.sh
       cargo build --release --bin tracey --bin tracey-loader
     )
   fi
