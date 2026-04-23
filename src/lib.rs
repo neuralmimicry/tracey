@@ -22,8 +22,10 @@ pub mod inventory;
 pub mod loader;
 pub mod loader_threat;
 pub mod location;
+pub mod network_ebpf;
 pub mod network_intel;
 mod peer_compat;
+pub mod probe_watch;
 pub mod prometheus_export;
 pub mod refiner_tracking;
 pub mod resource_forecast;
@@ -68,6 +70,13 @@ pub fn release_version() -> &'static str {
     version::release_version()
 }
 
+fn listen_port(addr: &str) -> Option<u16> {
+    addr.parse::<SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+        .or_else(|| addr.rsplit(':').next()?.parse::<u16>().ok())
+}
+
 pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if args.get(1).map(String::as_str) == Some("sign-update") {
         if let Err(msg) = update::run_sign_update(&args[2..]) {
@@ -105,7 +114,12 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         return Ok(());
     }
 
-    let config = Config::load();
+    let runtime_options = cli::parse_runtime_start_options(&args)?;
+    let mut config = Config::load();
+    if let Some(mode) = runtime_options.ebpf_mode {
+        tracing::info!(mode = %mode, "runtime eBPF mode override enabled");
+        config.embedded.network_ebpf_mode = mode;
+    }
     tracing::info!(?config, "tracey starting");
     if let Some(code) = tracey_ban::maybe_elevate_for_tracey_ban(&config.tracey_ban) {
         std::process::exit(code);
@@ -228,6 +242,12 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         continuum_telemetry.clone(),
         shutdown_listener.clone(),
     );
+    let status_probe_watch =
+        probe_watch::ProbeWatchHandle::enabled("status", bus.clone(), storage.clone());
+    let telemetry_http_probe_watch =
+        probe_watch::ProbeWatchHandle::enabled("telemetry_http", bus.clone(), storage.clone());
+    let telemetry_grpc_probe_watch =
+        probe_watch::ProbeWatchHandle::enabled("telemetry_grpc", bus.clone(), storage.clone());
     let loader_threat_status = match loader_threat::LoaderThreatStatusHandle::from_config(
         &config.loader,
     ) {
@@ -239,6 +259,20 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
             );
             None
         }
+    };
+    let loader_probe_watch_status = if config.loader.enabled {
+        match probe_watch::ProbeWatchSnapshotHandle::from_loader_config(&config.loader) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "loader probe-watch snapshot handle unavailable; status will omit loader probe intel"
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
     let mut continuum_assessment_config = config.continuum_assessment.clone();
     if continuum_assessment_config.inherit_global_fuzzy {
@@ -325,6 +359,24 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     client,
                     status_addr: status_public.clone(),
                     auth: auth_system.status_gate(),
+                    probe_watch: status_probe_watch.clone(),
+                    telemetry_http_probe_watch: if config.telemetry.enabled
+                        && config.telemetry.otlp.enabled
+                        && config.telemetry.otlp.enable_http
+                    {
+                        Some(telemetry_http_probe_watch.clone())
+                    } else {
+                        None
+                    },
+                    telemetry_grpc_probe_watch: if config.telemetry.enabled
+                        && config.telemetry.otlp.enabled
+                        && config.telemetry.otlp.enable_grpc
+                    {
+                        Some(telemetry_grpc_probe_watch.clone())
+                    } else {
+                        None
+                    },
+                    loader_probe_watch: loader_probe_watch_status.clone(),
                     ban_intel: if config.tracey_ban.enabled {
                         Some(ban_intel.clone())
                     } else {
@@ -359,12 +411,58 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         config.clone(),
         shutdown_listener.clone(),
     );
+    let mut embedded_targets = embedded::EmbeddedRuntimeTargets::default();
+    if config.status.enabled
+        && let Some(port) = listen_port(&config.status.listen_addr)
+    {
+        embedded_targets
+            .network_ebpf_targets
+            .push(network_ebpf::NetworkEbpfTarget {
+                surface: "status".to_string(),
+                port,
+            });
+    }
+    if config.loader.enabled
+        && let Some(port) = listen_port(&config.loader.transfer_listen_addr)
+    {
+        embedded_targets
+            .network_ebpf_targets
+            .push(network_ebpf::NetworkEbpfTarget {
+                surface: "loader_transfer".to_string(),
+                port,
+            });
+    }
+    if config.telemetry.enabled && config.telemetry.otlp.enabled {
+        if config.telemetry.otlp.enable_http
+            && let Some(port) = listen_port(&config.telemetry.otlp.http_addr)
+        {
+            embedded_targets
+                .network_ebpf_targets
+                .push(network_ebpf::NetworkEbpfTarget {
+                    surface: "telemetry_http".to_string(),
+                    port,
+                });
+        }
+        if config.telemetry.otlp.enable_grpc
+            && let Some(port) = listen_port(&config.telemetry.otlp.grpc_addr)
+        {
+            embedded_targets
+                .network_ebpf_targets
+                .push(network_ebpf::NetworkEbpfTarget {
+                    surface: "telemetry_grpc".to_string(),
+                    port,
+                });
+        }
+    }
     embedded::spawn_embedded_collectors(
         bus.clone(),
         storage.clone(),
         config.embedded.clone(),
+        embedded_targets,
         shutdown_listener.clone(),
-    );
+    )
+    .await
+    .map_err(std::io::Error::other)?;
 
     let stimuli_config = config.stimuli.clone();
     let stimuli_bus = bus.clone();
@@ -397,6 +495,8 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
             telemetry_shutdown,
             telemetry_governance,
             telemetry_auth,
+            telemetry_http_probe_watch,
+            telemetry_grpc_probe_watch,
         )
         .await;
     });

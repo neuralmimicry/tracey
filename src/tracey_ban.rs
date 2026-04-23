@@ -3998,8 +3998,7 @@ fn translate_tracey_ban_regex(input: &str) -> Result<String, String> {
 
     if format_macro_re().is_match(&output) {
         return Err(
-            "legacy jail interpolation macros are not supported in TraceyBan regexes"
-                .to_string(),
+            "legacy jail interpolation macros are not supported in TraceyBan regexes".to_string(),
         );
     }
     if let Some(tag) = find_unsupported_legacy_filter_tag(&output) {

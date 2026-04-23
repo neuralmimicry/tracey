@@ -150,6 +150,14 @@ pub struct ContinuumNetworkSummarySnapshot {
     pub window_ms: u64,
     pub updated_ms: u64,
     pub collector_backend: String,
+    pub ebpf_enabled: bool,
+    pub ebpf_active: bool,
+    pub ebpf_source: Option<String>,
+    pub ebpf_last_error: Option<String>,
+    pub ebpf_events: usize,
+    pub ebpf_established_events: usize,
+    pub ebpf_closing_events: usize,
+    pub ebpf_alerted_surfaces: usize,
     pub active_flows: usize,
     pub established_flows: usize,
     pub listeners: usize,
@@ -666,6 +674,39 @@ impl ContinuumTelemetryState {
         }
 
         match metric {
+            "network_ebpf_events" => {
+                summary.ebpf_events = value.unwrap_or_default().max(0.0).round() as usize;
+                if let Some(enabled) = parse_attr_bool(event, "ebpf_enabled") {
+                    summary.ebpf_enabled = enabled;
+                }
+                if let Some(active) = parse_attr_bool(event, "ebpf_active") {
+                    summary.ebpf_active = active;
+                }
+                summary.ebpf_source = event.attributes.get("ebpf_source").cloned();
+                let detail = event
+                    .attributes
+                    .get("ebpf_detail")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .trim();
+                summary.ebpf_last_error = (!detail.is_empty()).then(|| detail.to_string());
+                if summary.ebpf_active
+                    && !summary.collector_backend.is_empty()
+                    && !summary.collector_backend.contains("ebpf")
+                {
+                    summary.collector_backend = format!("{}+ebpf", summary.collector_backend);
+                }
+            }
+            "network_ebpf_established_events" => {
+                summary.ebpf_established_events =
+                    value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_ebpf_closing_events" => {
+                summary.ebpf_closing_events = value.unwrap_or_default().max(0.0).round() as usize;
+            }
+            "network_ebpf_alerted_surfaces" => {
+                summary.ebpf_alerted_surfaces = value.unwrap_or_default().max(0.0).round() as usize;
+            }
             "network_active_flows" => {
                 summary.active_flows = value.unwrap_or_default().max(0.0).round() as usize;
                 if let Some(window_ms) = parse_attr_u64(event, "window_ms") {

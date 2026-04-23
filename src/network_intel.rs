@@ -12,10 +12,11 @@
 use crate::bus::EventBus;
 use crate::config::EmbeddedConfig;
 use crate::event::{Event, EventKind, Severity, now_ms};
+use crate::network_ebpf::NetworkEbpfMonitor;
 use crate::storage::Storage;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(not(target_os = "linux"))]
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 #[cfg(not(target_os = "linux"))]
 use std::hash::{Hash, Hasher};
@@ -90,18 +91,24 @@ pub struct NetworkAttributionCollector {
     process_rate_peak: HashMap<String, f64>,
     queue_peak: HashMap<String, f64>,
     history: VecDeque<SummaryPoint>,
+    ebpf: Option<NetworkEbpfMonitor>,
 }
 
 impl NetworkAttributionCollector {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ebpf: Option<NetworkEbpfMonitor>) -> Self {
+        Self {
+            ebpf,
+            ..Self::default()
+        }
+    }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(monitor) = self.ebpf.as_mut() {
+            monitor.shutdown().await;
+        }
     }
 
     pub async fn collect(&mut self, bus: &EventBus, storage: &Storage, config: &EmbeddedConfig) {
-        if !config.network_attribution_enabled {
-            return;
-        }
-
         let elapsed = match self.last_sample.replace(Instant::now()) {
             Some(last) if last.elapsed() < Duration::from_millis(config.network_window_ms) => {
                 self.last_sample = Some(last);
@@ -111,6 +118,19 @@ impl NetworkAttributionCollector {
             None => return,
         };
 
+        let ebpf_snapshot = if let Some(monitor) = self.ebpf.as_mut() {
+            Some(monitor.sample().await)
+        } else {
+            None
+        };
+        if !config.network_attribution_enabled {
+            if ebpf_snapshot.is_none() {
+                return;
+            }
+            emit_ebpf_metrics(bus, storage, config, ebpf_snapshot.as_ref(), "ebpf").await;
+            return;
+        }
+
         let interfaces = collect_interface_inventory();
         let arp_cache = read_arp_cache().await;
         let BackendSnapshot {
@@ -118,6 +138,14 @@ impl NetworkAttributionCollector {
             sockets,
             owner_misses,
         } = self.collect_backend_snapshot(config).await;
+        let collector_backend = if ebpf_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.active)
+        {
+            format!("{}+ebpf", backend.as_str())
+        } else {
+            backend.as_str().to_string()
+        };
 
         let sampled_ms = now_ms();
         let mut top_flows = Vec::new();
@@ -565,7 +593,7 @@ impl NetworkAttributionCollector {
             } else {
                 Severity::Low
             },
-            &[("collector_backend", backend.as_str().to_string())],
+            &[("collector_backend", collector_backend.clone())],
         )
         .await;
         emit_summary_metric(
@@ -687,6 +715,14 @@ impl NetworkAttributionCollector {
             &[],
         )
         .await;
+        emit_ebpf_metrics(
+            bus,
+            storage,
+            config,
+            ebpf_snapshot.as_ref(),
+            &collector_backend,
+        )
+        .await;
 
         for flow in top_flows.into_iter().take(config.network_top_flows) {
             let signal = track_rate(
@@ -769,12 +805,15 @@ impl NetworkAttributionCollector {
             let sockets = sockets
                 .into_iter()
                 .filter_map(|socket| {
-                    owners.get(&socket.inode).cloned().map(|owner| AttributedSocket {
-                        socket,
-                        owner,
-                        backend: CollectorBackend::Procfs,
-                        base_confidence: CollectorBackend::Procfs.base_confidence(),
-                    })
+                    owners
+                        .get(&socket.inode)
+                        .cloned()
+                        .map(|owner| AttributedSocket {
+                            socket,
+                            owner,
+                            backend: CollectorBackend::Procfs,
+                            base_confidence: CollectorBackend::Procfs.base_confidence(),
+                        })
                 })
                 .collect();
             return BackendSnapshot {
@@ -861,7 +900,8 @@ impl NetworkAttributionCollector {
                 rx_bps: 0.0,
                 tx_bps: 0.0,
                 bytes_estimated: false,
-                attribution_confidence: if tcp_stats.is_some_and(|stats| stats.byte_counters_available)
+                attribution_confidence: if tcp_stats
+                    .is_some_and(|stats| stats.byte_counters_available)
                 {
                     (base_confidence * 0.82).clamp(0.0, 1.0)
                 } else {
@@ -895,21 +935,17 @@ impl NetworkAttributionCollector {
                 udp_drop_delta: 0,
             };
         }
-        let rx_queue_delta =
-            socket.rx_queue_bytes.max(prev.rx_queue_bytes) - socket.rx_queue_bytes.min(prev.rx_queue_bytes);
-        let tx_queue_delta =
-            socket.tx_queue_bytes.max(prev.tx_queue_bytes) - socket.tx_queue_bytes.min(prev.tx_queue_bytes);
+        let rx_queue_delta = socket.rx_queue_bytes.max(prev.rx_queue_bytes)
+            - socket.rx_queue_bytes.min(prev.rx_queue_bytes);
+        let tx_queue_delta = socket.tx_queue_bytes.max(prev.tx_queue_bytes)
+            - socket.tx_queue_bytes.min(prev.tx_queue_bytes);
         let udp_drop_delta = socket.drops.saturating_sub(prev.drops);
-        let rx_bps = (rx_queue_delta as f64 + udp_drop_delta as f64 * UDP_DROP_ESTIMATED_BYTES)
-            / elapsed;
+        let rx_bps =
+            (rx_queue_delta as f64 + udp_drop_delta as f64 * UDP_DROP_ESTIMATED_BYTES) / elapsed;
         let tx_bps = tx_queue_delta as f64 / elapsed;
         let bytes_estimated = rx_bps > 0.0 || tx_bps > 0.0;
         let confidence_multiplier = if socket.protocol == Protocol::Udp {
-            if bytes_estimated {
-                0.55
-            } else {
-                0.30
-            }
+            if bytes_estimated { 0.55 } else { 0.30 }
         } else if bytes_estimated {
             0.72
         } else {
@@ -1168,7 +1204,10 @@ impl FlowSample {
             ("same_lan", self.same_lan.to_string()),
             ("local_host", self.local_host.to_string()),
             ("bytes_estimated", self.bytes_estimated.to_string()),
-            ("collector_backend", self.collector_backend.as_str().to_string()),
+            (
+                "collector_backend",
+                self.collector_backend.as_str().to_string(),
+            ),
             (
                 "attribution_confidence",
                 format!("{:.3}", self.attribution_confidence),
@@ -1233,7 +1272,10 @@ impl ListenerSample {
             ("uid", self.uid.to_string()),
             ("local_ip", self.local_ip.to_string()),
             ("local_port", self.local_port.to_string()),
-            ("collector_backend", self.collector_backend.as_str().to_string()),
+            (
+                "collector_backend",
+                self.collector_backend.as_str().to_string(),
+            ),
             (
                 "attribution_confidence",
                 format!("{:.3}", self.attribution_confidence),
@@ -1535,14 +1577,16 @@ async fn collect_lsof_sockets() -> Vec<AttributedSocket> {
         let owner = if let Some(owner) = metadata_by_pid.get(&record.pid) {
             owner.clone()
         } else {
-            let owner = read_process_owner(record.pid).await.unwrap_or_else(|| SocketOwner {
-                pid: record.pid,
-                fd: record.fd,
-                process: record.process.clone(),
-                exe_path: None,
-                cmdline: None,
-                cgroup: None,
-            });
+            let owner = read_process_owner(record.pid)
+                .await
+                .unwrap_or_else(|| SocketOwner {
+                    pid: record.pid,
+                    fd: record.fd,
+                    process: record.process.clone(),
+                    exe_path: None,
+                    cmdline: None,
+                    cgroup: None,
+                });
             metadata_by_pid.insert(record.pid, owner.clone());
             owner
         };
@@ -1589,9 +1633,10 @@ impl LsofFileRecord {
         let protocol = self.protocol?;
         let (local_ip, local_port, remote_ip, remote_port) =
             parse_lsof_endpoint(&self.endpoint, &self.address_family)?;
-        let state = self.state.clone().unwrap_or_else(|| {
-            socket_state_label(protocol, "", remote_ip, remote_port)
-        });
+        let state = self
+            .state
+            .clone()
+            .unwrap_or_else(|| socket_state_label(protocol, "", remote_ip, remote_port));
         Some((
             SocketEntry {
                 protocol,
@@ -2264,6 +2309,175 @@ fn listener_key(socket: &SocketEntry) -> String {
         socket.local_port,
         socket.inode
     )
+}
+
+async fn emit_ebpf_metrics(
+    bus: &EventBus,
+    storage: &Storage,
+    config: &EmbeddedConfig,
+    snapshot: Option<&crate::network_ebpf::NetworkEbpfSnapshot>,
+    collector_backend: &str,
+) {
+    let enabled = !matches!(
+        config
+            .network_ebpf_mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "disabled" | ""
+    );
+    let active = snapshot.is_some_and(|snapshot| snapshot.active);
+    let total_events = snapshot
+        .map(|snapshot| snapshot.total_events)
+        .unwrap_or_default();
+    let established_events = snapshot
+        .map(|snapshot| snapshot.established_events)
+        .unwrap_or_default();
+    let closing_events = snapshot
+        .map(|snapshot| snapshot.closing_events)
+        .unwrap_or_default();
+    let alerted_surfaces = snapshot
+        .map(|snapshot| snapshot.alerted_surfaces)
+        .unwrap_or_default();
+    let source = snapshot
+        .map(|snapshot| snapshot.source.clone())
+        .unwrap_or_else(|| config.network_ebpf_program.clone());
+    let detail = snapshot
+        .and_then(|snapshot| snapshot.detail.clone())
+        .unwrap_or_default();
+    let signal = ebpf_signal(total_events as usize, config.network_ebpf_burst_threshold);
+    let severity = ebpf_severity(
+        enabled,
+        active,
+        total_events as usize,
+        alerted_surfaces,
+        config.network_ebpf_burst_threshold,
+    );
+    let common_attrs = vec![
+        ("collector_backend", collector_backend.to_string()),
+        ("ebpf_enabled", enabled.to_string()),
+        ("ebpf_active", active.to_string()),
+        ("ebpf_source", source.clone()),
+        ("ebpf_detail", truncate_text(&detail, 160)),
+    ];
+
+    emit_summary_metric(
+        bus,
+        storage,
+        "network_ebpf_events",
+        total_events as f64,
+        "count",
+        signal,
+        severity,
+        &common_attrs,
+    )
+    .await;
+    emit_summary_metric(
+        bus,
+        storage,
+        "network_ebpf_established_events",
+        established_events as f64,
+        "count",
+        ebpf_signal(
+            established_events as usize,
+            config.network_ebpf_burst_threshold,
+        ),
+        if active && established_events > 0 {
+            Severity::Low
+        } else {
+            severity
+        },
+        &common_attrs,
+    )
+    .await;
+    emit_summary_metric(
+        bus,
+        storage,
+        "network_ebpf_closing_events",
+        closing_events as f64,
+        "count",
+        ebpf_signal(closing_events as usize, config.network_ebpf_burst_threshold),
+        if closing_events > 0 {
+            Severity::Medium
+        } else {
+            Severity::Low
+        },
+        &common_attrs,
+    )
+    .await;
+    emit_summary_metric(
+        bus,
+        storage,
+        "network_ebpf_alerted_surfaces",
+        alerted_surfaces as f64,
+        "count",
+        ratio_from_count(alerted_surfaces),
+        if alerted_surfaces > 1 {
+            Severity::High
+        } else if alerted_surfaces > 0 {
+            Severity::Medium
+        } else {
+            Severity::Low
+        },
+        &common_attrs,
+    )
+    .await;
+
+    if let Some(snapshot) = snapshot {
+        for surface in snapshot
+            .surfaces
+            .iter()
+            .filter(|surface| surface.events > 0)
+        {
+            let signal = ebpf_signal(surface.events as usize, config.network_ebpf_burst_threshold);
+            emit_network_metric(
+                bus,
+                storage,
+                "network_ebpf_surface_events",
+                surface.events as f64,
+                "count",
+                signal,
+                ebpf_severity(
+                    enabled,
+                    active,
+                    surface.events as usize,
+                    usize::from(surface.events > 0),
+                    config.network_ebpf_burst_threshold,
+                ),
+                &[
+                    ("collector_backend", collector_backend.to_string()),
+                    ("surface", surface.surface.clone()),
+                    ("local_port", surface.local_port.to_string()),
+                    ("established_events", surface.established_events.to_string()),
+                    ("closing_events", surface.closing_events.to_string()),
+                    ("ebpf_source", source.clone()),
+                ],
+            )
+            .await;
+        }
+    }
+}
+
+fn ebpf_signal(total_events: usize, burst_threshold: usize) -> f64 {
+    (total_events as f64 / burst_threshold.max(1) as f64).clamp(0.0, 1.0)
+}
+
+fn ebpf_severity(
+    enabled: bool,
+    active: bool,
+    total_events: usize,
+    alerted_surfaces: usize,
+    burst_threshold: usize,
+) -> Severity {
+    if enabled && !active {
+        Severity::Medium
+    } else if alerted_surfaces > 1 || total_events >= burst_threshold.saturating_mul(2) {
+        Severity::High
+    } else if total_events >= burst_threshold || alerted_surfaces > 0 {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
 }
 
 async fn emit_summary_metric(

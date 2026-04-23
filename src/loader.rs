@@ -2,11 +2,12 @@ use crate::config::{Config, LoaderConfig};
 use crate::event::now_ms;
 use crate::loader_threat::{self, LocalThreatIncident};
 use crate::peer_compat::{self, SchemaField};
+use crate::probe_watch::{ProbeObservation, ProbeWatchHandle, ProbeWatchSurfaceSnapshot};
 use crate::shutdown::{Shutdown, ShutdownListener};
 use crate::supervisor::{self, ManagedChild, SupervisorRequest};
 use crate::update::{self, UpdateChannel, UpdateMetadata};
-use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ const LOADER_SIGNATURE_ROUTE: &str = "/loader/core/signature";
 const LOADER_BUNDLE_ROUTE: &str = "/loader/core/bundle";
 const LOADER_REQUEST_POLL_MS: u64 = 500;
 const MAX_FUTURE_SKEW_MS: u64 = 30_000;
+const LOADER_PROBE_WATCH_SNAPSHOT: &str = "tracey-loader.probe_watch.snapshot.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LoaderIntegrityManifest {
@@ -105,6 +107,7 @@ struct LoaderSharedState {
     current: Arc<RwLock<Option<ActiveCore>>>,
     rollback: Arc<RwLock<Option<PendingRollback>>>,
     threats: loader_threat::LoaderThreatHub,
+    probe_watch: ProbeWatchHandle,
 }
 
 impl LoaderSharedState {
@@ -140,6 +143,8 @@ struct LoaderStatusSnapshot {
     rollback_previous_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     loader_threats: Option<loader_threat::LoaderThreatSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_watch: Option<ProbeWatchSurfaceSnapshot>,
 }
 
 #[derive(Debug)]
@@ -235,6 +240,10 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     )
     .await?;
     let threat_hub = loader_threat::LoaderThreatHub::from_config(&config.loader).await?;
+    let probe_watch = ProbeWatchHandle::persisted(
+        "loader_transfer",
+        loader_probe_watch_snapshot_path(&loader_root),
+    );
 
     let shared_state = LoaderSharedState {
         agent_id: config.agent_id.clone(),
@@ -243,6 +252,7 @@ pub async fn run_loader(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         current: Arc::new(RwLock::new(Some(initial_core.clone()))),
         rollback: Arc::new(RwLock::new(pending_rollback.clone())),
         threats: threat_hub.clone(),
+        probe_watch,
     };
     let shared_state = Arc::new(shared_state);
 
@@ -637,6 +647,10 @@ fn staging_dir_path(root: &Path) -> PathBuf {
 
 fn manifest_path(root: &Path) -> PathBuf {
     root.join(LOADER_MANIFEST)
+}
+
+fn loader_probe_watch_snapshot_path(root: &Path) -> PathBuf {
+    root.join(LOADER_PROBE_WATCH_SNAPSHOT)
 }
 
 async fn verify_loader_integrity(config: &LoaderConfig, root: &Path) -> Result<(), Box<dyn Error>> {
@@ -1087,6 +1101,7 @@ async fn spawn_transfer_server(
         .route(LOADER_METADATA_ROUTE, get(loader_metadata_handler))
         .route(LOADER_SIGNATURE_ROUTE, get(loader_signature_handler))
         .route(LOADER_BUNDLE_ROUTE, get(loader_bundle_handler))
+        .fallback(loader_fallback_handler)
         .with_state(shared);
 
     let listener = match tokio::net::TcpListener::bind(listen_addr).await {
@@ -1097,29 +1112,64 @@ async fn spawn_transfer_server(
         }
     };
 
-    if let Err(err) = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.wait().await })
-        .await
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.wait().await })
+    .await
     {
         tracing::warn!(error = %err, "loader transfer server failed");
     }
 }
 
-async fn loader_health_handler(State(shared): State<Arc<LoaderSharedState>>) -> StatusCode {
-    if shared.current.read().await.is_some() {
+async fn loader_health_handler(
+    State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> StatusCode {
+    let remote_addr = remote.map(|value| value.0);
+    let status = if shared.current.read().await.is_some() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
+    };
+    observe_loader_request(
+        &shared,
+        remote_addr,
+        "GET",
+        uri.path(),
+        &headers,
+        status,
+        true,
+    )
+    .await;
+    status
 }
 
 async fn loader_status_handler(
     State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Json<LoaderStatusSnapshot> {
+    let remote_addr = remote.map(|value| value.0);
     let current = shared.current.read().await.clone();
     let pending = shared.rollback.read().await.clone();
     let distributable = shared.distributable_core().await.is_some();
     let loader_threats = Some(shared.threats.snapshot(8).await);
+    let probe_watch = shared.probe_watch.surface_snapshot().await;
+    observe_loader_request(
+        &shared,
+        remote_addr,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+    )
+    .await;
     Json(LoaderStatusSnapshot {
         ts_ms: now_ms(),
         agent_id: shared.agent_id.clone(),
@@ -1138,15 +1188,40 @@ async fn loader_status_handler(
         pending_rollback: pending.is_some(),
         rollback_previous_version: pending.map(|state| state.marker.previous_version),
         loader_threats,
+        probe_watch,
     })
 }
 
 async fn loader_metadata_handler(
     State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let remote_addr = remote.map(|value| value.0);
     let Some(active) = shared.distributable_core().await else {
+        observe_loader_request(
+            &shared,
+            remote_addr,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_loader_request(
+        &shared,
+        remote_addr,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+    )
+    .await;
     Ok((
         [(header::CONTENT_TYPE, "application/json")],
         active.metadata_bytes,
@@ -1155,10 +1230,34 @@ async fn loader_metadata_handler(
 
 async fn loader_signature_handler(
     State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let remote_addr = remote.map(|value| value.0);
     let Some(active) = shared.distributable_core().await else {
+        observe_loader_request(
+            &shared,
+            remote_addr,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_loader_request(
+        &shared,
+        remote_addr,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+    )
+    .await;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         active.signature,
@@ -1167,14 +1266,95 @@ async fn loader_signature_handler(
 
 async fn loader_bundle_handler(
     State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let remote_addr = remote.map(|value| value.0);
     let Some(active) = shared.distributable_core().await else {
+        observe_loader_request(
+            &shared,
+            remote_addr,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
-    let bytes = fs::read(&active.binary_path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let bytes = match fs::read(&active.binary_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            observe_loader_request(
+                &shared,
+                remote_addr,
+                "GET",
+                uri.path(),
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                true,
+            )
+            .await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    observe_loader_request(
+        &shared,
+        remote_addr,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+    )
+    .await;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+async fn loader_fallback_handler(
+    State(shared): State<Arc<LoaderSharedState>>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> StatusCode {
+    observe_loader_request(
+        &shared,
+        remote.map(|value| value.0),
+        method.as_str(),
+        uri.path(),
+        &headers,
+        StatusCode::NOT_FOUND,
+        false,
+    )
+    .await;
+    StatusCode::NOT_FOUND
+}
+
+async fn observe_loader_request(
+    shared: &Arc<LoaderSharedState>,
+    remote_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    status_code: StatusCode,
+    known_route: bool,
+) {
+    shared
+        .probe_watch
+        .observe_http(ProbeObservation {
+            remote_addr,
+            method,
+            path,
+            status_code,
+            headers,
+            known_route,
+            control_route: false,
+            authorized: None,
+        })
+        .await;
 }
 
 async fn build_loader_announcement(
@@ -2187,6 +2367,7 @@ mod tests {
             })
             .await
             .expect("loader threat hub should initialize"),
+            probe_watch: ProbeWatchHandle::memory_only("loader_transfer"),
         });
 
         let restored = rollback_after_crash(&loader_root, key, shared.clone(), 60_000)
@@ -2287,6 +2468,7 @@ mod tests {
                 marker: marker.clone(),
             }))),
             threats: threats.clone(),
+            probe_watch: ProbeWatchHandle::memory_only("loader_transfer"),
         });
 
         let restored = rollback_after_crash(&loader_root, key, shared.clone(), 60_000)
@@ -2348,6 +2530,7 @@ mod tests {
             current: Arc::new(RwLock::new(Some(current.clone()))),
             rollback: Arc::new(RwLock::new(None)),
             threats: threats.clone(),
+            probe_watch: ProbeWatchHandle::memory_only("loader_transfer"),
         });
 
         let mut peers = HashMap::new();

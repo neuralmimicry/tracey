@@ -11,8 +11,8 @@ use crate::governance::GovernanceState;
 use crate::location::AgentLocationSnapshot;
 use crate::peer_compat::{self, SchemaField};
 use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -42,6 +42,10 @@ pub struct StatusService {
     pub client: reqwest::Client,
     pub status_addr: Option<String>,
     pub auth: AuthGate,
+    pub probe_watch: crate::probe_watch::ProbeWatchHandle,
+    pub telemetry_http_probe_watch: Option<crate::probe_watch::ProbeWatchHandle>,
+    pub telemetry_grpc_probe_watch: Option<crate::probe_watch::ProbeWatchHandle>,
+    pub loader_probe_watch: Option<crate::probe_watch::ProbeWatchSnapshotHandle>,
     pub ban_intel: Option<crate::tracey_ban::BanIntelHub>,
     pub tracey_ban: Option<crate::tracey_ban::TraceyBanRuntimeHandle>,
     pub tracey_guard: Option<crate::tracey_guard::TraceyGuardRuntimeHandle>,
@@ -115,6 +119,8 @@ struct StatusSnapshot {
     #[serde(default)]
     loader_threats: Option<crate::loader_threat::LoaderThreatSnapshot>,
     #[serde(default)]
+    probe_watch: Option<crate::probe_watch::ProbeWatchSnapshot>,
+    #[serde(default)]
     location: AgentLocationSnapshot,
     #[serde(default)]
     peer_locations: Vec<AgentLocationSnapshot>,
@@ -133,9 +139,12 @@ pub async fn spawn_status(
             return;
         }
     };
-    if let Err(err) = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.wait().await })
-        .await
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.wait().await })
+    .await
     {
         tracing::warn!("status server failed: {}", err);
     }
@@ -151,16 +160,47 @@ fn status_router(service: StatusService) -> Router {
         .route("/tracey_guard", get(tracey_guard_handler))
         .route("/tracey_guard/deepdive", get(tracey_guard_handler))
         .route("/control/tracey_guard", post(tracey_guard_control_handler))
+        .route("/probe_watch", get(probe_watch_handler))
         .route("/metrics", get(metrics_handler))
         .route("/prometheus/ingest", post(prometheus_ingest_handler))
+        .fallback(fallback_handler)
         .with_state(service)
 }
 
 async fn status_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<StatusSnapshot>, StatusCode> {
-    service.auth.authorize_http(&headers).await?;
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            false,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
+    observe_status_request(
+        &service,
+        remote,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        false,
+        Some(true),
+    )
+    .await;
     let hop_raw = headers
         .get("x-tracey-proxy-hop")
         .and_then(|val| val.to_str().ok())
@@ -194,24 +234,106 @@ async fn status_handler(
 
 async fn tracey_ban_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<crate::tracey_ban::TraceyBanStatusSnapshot>, StatusCode> {
-    service.auth.authorize_http(&headers).await?;
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            false,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
     let Some(runtime) = &service.tracey_ban else {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            false,
+            Some(true),
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_status_request(
+        &service,
+        remote,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        false,
+        Some(true),
+    )
+    .await;
     Ok(Json(runtime.snapshot().await))
 }
 
 async fn tracey_ban_control_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<crate::tracey_ban::TraceyBanControlRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    service.auth.authorize_http(&headers).await?;
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "POST",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            true,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
     let Some(runtime) = &service.tracey_ban else {
+        observe_status_request(
+            &service,
+            remote,
+            "POST",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            true,
+            Some(true),
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_status_request(
+        &service,
+        remote,
+        "POST",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        true,
+        Some(true),
+    )
+    .await;
     let control = runtime.apply_control(request).await;
     let snapshot = runtime.snapshot().await;
     Ok(Json(serde_json::json!({
@@ -223,24 +345,106 @@ async fn tracey_ban_control_handler(
 
 async fn tracey_guard_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<crate::tracey_guard::TraceyGuardStatusSnapshot>, StatusCode> {
-    service.auth.authorize_http(&headers).await?;
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            false,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
     let Some(runtime) = &service.tracey_guard else {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            false,
+            Some(true),
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_status_request(
+        &service,
+        remote,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        false,
+        Some(true),
+    )
+    .await;
     Ok(Json(runtime.snapshot().await))
 }
 
 async fn tracey_guard_control_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<crate::tracey_guard::TraceyGuardControlRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    service.auth.authorize_http(&headers).await?;
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "POST",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            true,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
     let Some(runtime) = &service.tracey_guard else {
+        observe_status_request(
+            &service,
+            remote,
+            "POST",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            true,
+            Some(true),
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
+    observe_status_request(
+        &service,
+        remote,
+        "POST",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        true,
+        Some(true),
+    )
+    .await;
     let control = runtime.apply_control(request).await;
     let snapshot = runtime.snapshot().await;
     Ok(Json(serde_json::json!({
@@ -250,13 +454,93 @@ async fn tracey_guard_control_handler(
     })))
 }
 
+async fn probe_watch_handler(
+    State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<crate::probe_watch::ProbeWatchSnapshot>, StatusCode> {
+    let remote = remote.map(|value| value.0);
+    if let Err(code) = service.auth.authorize_http(&headers).await {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            code,
+            true,
+            false,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
+    let Some(snapshot) = aggregate_probe_watch_snapshot(&service).await else {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            false,
+            Some(true),
+        )
+        .await;
+        return Err(StatusCode::NOT_FOUND);
+    };
+    observe_status_request(
+        &service,
+        remote,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        false,
+        Some(true),
+    )
+    .await;
+    Ok(Json(snapshot))
+}
+
 async fn metrics_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let remote = remote.map(|value| value.0);
     let Some(export) = &service.prometheus_export else {
+        observe_status_request(
+            &service,
+            remote,
+            "GET",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            false,
+            None,
+        )
+        .await;
         return Err(StatusCode::NOT_FOUND);
     };
     let body = export.render_metrics().await;
+    observe_status_request(
+        &service,
+        remote,
+        "GET",
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        false,
+        None,
+    )
+    .await;
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -268,16 +552,117 @@ async fn metrics_handler(
 
 async fn prometheus_ingest_handler(
     State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    let remote = remote.map(|value| value.0);
     let Some(export) = &service.prometheus_export else {
+        observe_status_request(
+            &service,
+            remote,
+            "POST",
+            uri.path(),
+            &headers,
+            StatusCode::NOT_FOUND,
+            true,
+            false,
+            None,
+        )
+        .await;
         return StatusCode::NOT_FOUND;
     };
-    match export.ingest_http(&headers, &body).await {
+    let status = match export.ingest_http(&headers, &body).await {
         Ok(()) => StatusCode::ACCEPTED,
         Err(code) => code,
+    };
+    observe_status_request(
+        &service,
+        remote,
+        "POST",
+        uri.path(),
+        &headers,
+        status,
+        true,
+        false,
+        None,
+    )
+    .await;
+    status
+}
+
+async fn fallback_handler(
+    State(service): State<StatusService>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> StatusCode {
+    observe_status_request(
+        &service,
+        remote.map(|value| value.0),
+        method.as_str(),
+        uri.path(),
+        &headers,
+        StatusCode::NOT_FOUND,
+        false,
+        uri.path().starts_with("/control/"),
+        None,
+    )
+    .await;
+    StatusCode::NOT_FOUND
+}
+
+async fn observe_status_request(
+    service: &StatusService,
+    remote_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    status_code: StatusCode,
+    known_route: bool,
+    control_route: bool,
+    authorized: Option<bool>,
+) {
+    service
+        .probe_watch
+        .observe_http(crate::probe_watch::ProbeObservation {
+            remote_addr,
+            method,
+            path,
+            status_code,
+            headers,
+            known_route,
+            control_route,
+            authorized,
+        })
+        .await;
+}
+
+async fn aggregate_probe_watch_snapshot(
+    service: &StatusService,
+) -> Option<crate::probe_watch::ProbeWatchSnapshot> {
+    let mut surfaces = Vec::new();
+    if let Some(snapshot) = service.probe_watch.surface_snapshot().await {
+        surfaces.push(snapshot);
     }
+    if let Some(handle) = &service.telemetry_http_probe_watch
+        && let Some(snapshot) = handle.surface_snapshot().await
+    {
+        surfaces.push(snapshot);
+    }
+    if let Some(handle) = &service.telemetry_grpc_probe_watch
+        && let Some(snapshot) = handle.surface_snapshot().await
+    {
+        surfaces.push(snapshot);
+    }
+    if let Some(handle) = &service.loader_probe_watch
+        && let Some(snapshot) = handle.snapshot().await
+    {
+        surfaces.push(snapshot);
+    }
+    crate::probe_watch::aggregate_snapshots(surfaces)
 }
 
 async fn forward_to_proxy(
@@ -384,6 +769,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         None
     };
+    let probe_watch = aggregate_probe_watch_snapshot(service).await;
     let continuum_loop = Some(derive_continuum_loop_snapshot(
         continuum_autoscaler.as_ref(),
         continuum_assessment.as_ref(),
@@ -454,6 +840,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         resource_forecast,
         continuum_loop,
         loader_threats,
+        probe_watch,
         location,
         peer_locations,
     }
@@ -863,6 +1250,7 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
                     "loaderSecurity",
                 ],
             ),
+            probe_watch: parse_object_field(map, &["probe_watch", "probeWatch"]),
             location: parse_object_field(map, &["location", "agent_location"]).unwrap_or_default(),
             peer_locations: parse_array_field(map, &["peer_locations", "peerLocations", "peers"]),
         },
@@ -967,6 +1355,7 @@ mod tests {
         let storage = Storage::new(storage_cfg, shutdown_listener.clone())
             .await
             .expect("storage should start");
+        let bus = EventBus::new(64);
         let runtime = crate::tracey_guard::spawn_tracey_guard(
             cfg.tracey_guard.clone(),
             GpuBackendConfig {
@@ -975,8 +1364,8 @@ mod tests {
                 rocm_enabled: false,
                 max_devices: 1,
             },
-            EventBus::new(64),
-            storage,
+            bus.clone(),
+            storage.clone(),
             shutdown_listener,
         );
 
@@ -990,6 +1379,10 @@ mod tests {
                 client: reqwest::Client::new(),
                 status_addr: Some("http://127.0.0.1:48000".to_string()),
                 auth,
+                probe_watch: crate::probe_watch::ProbeWatchHandle::enabled("status", bus, storage),
+                telemetry_http_probe_watch: None,
+                telemetry_grpc_probe_watch: None,
+                loader_probe_watch: None,
                 ban_intel: None,
                 tracey_ban: None,
                 tracey_guard: Some(runtime.clone()),
@@ -1151,6 +1544,43 @@ mod tests {
         assert_eq!(
             reflected["control"]["overhead_budget_pct"].as_f64(),
             Some(7.5)
+        );
+
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_surfaces_probe_watch_alerts() {
+        let harness = tracey_guard_harness().await;
+        wait_for_runtime_snapshot(&harness.runtime).await;
+
+        let (status, body) = request_json(
+            &harness.app,
+            Request::builder()
+                .uri("/status")
+                .header("x-neuralmimicry-redteam", "live-probe")
+                .header("x-neuralmimicry-run-id", "test-run")
+                .header("user-agent", "NeuralMimicry-RedTeam/0.1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["probe_watch"]["recent_alerts"]
+                .as_array()
+                .is_some_and(|alerts| !alerts.is_empty())
+        );
+        assert!(
+            body["probe_watch"]["recent_alerts"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|alert| {
+                    alert["classification"].as_str() == Some("cooperative_probe")
+                        || alert["classification"].as_str() == Some("path_scan")
+                })
         );
 
         harness.cleanup().await;

@@ -61,13 +61,8 @@ const SUSPICIOUS_MODULE_KEYWORDS: &[&str] = &[
     "phide",
     "kbeast",
 ];
-const SUSPICIOUS_EXEC_PREFIXES: &[&str] = &[
-    "/tmp/",
-    "/var/tmp/",
-    "/dev/shm/",
-    "/run/shm/",
-    "/run/user/",
-];
+const SUSPICIOUS_EXEC_PREFIXES: &[&str] =
+    &["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/run/user/"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -560,7 +555,11 @@ pub fn spawn_continuum_assessment(
         runtime.token = runtime.config.bearer_token.clone();
         runtime.update_snapshot(None, None, None).await;
 
-        let tick_ms = runtime.config.plan_poll_interval_ms.min(DEFAULT_TICK_MS).max(1_000);
+        let tick_ms = runtime
+            .config
+            .plan_poll_interval_ms
+            .min(DEFAULT_TICK_MS)
+            .max(1_000);
         let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -574,14 +573,11 @@ pub fn spawn_continuum_assessment(
             }
 
             let now = now_ms();
-            let plan_refresh_due = runtime
-                .plan
-                .as_ref()
-                .is_none_or(|plan| {
-                    now > plan.cycle_deadline_ms
-                        || now.saturating_sub(runtime.last_plan_fetch_ms)
-                            >= runtime.config.plan_poll_interval_ms
-                });
+            let plan_refresh_due = runtime.plan.as_ref().is_none_or(|plan| {
+                now > plan.cycle_deadline_ms
+                    || now.saturating_sub(runtime.last_plan_fetch_ms)
+                        >= runtime.config.plan_poll_interval_ms
+            });
             if plan_refresh_due && now >= runtime.next_plan_attempt_ms {
                 if let Err(err) = runtime.fetch_plan().await {
                     runtime.last_error = err;
@@ -775,7 +771,8 @@ impl AssessmentRuntime {
         self.last_summary = summary.clone();
         self.last_signals = signals.clone();
         self.emit_assessment_event(&summary, &signals, &fuzzy).await;
-        self.update_snapshot(Some(summary), Some(signals), Some(fuzzy)).await;
+        self.update_snapshot(Some(summary), Some(signals), Some(fuzzy))
+            .await;
         Ok(())
     }
 
@@ -797,16 +794,13 @@ impl AssessmentRuntime {
         if let Some(body) = body {
             request = request.header(CONTENT_TYPE, "application/json").json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|err| {
-                RequestError::new(
-                    RequestErrorKind::Transport,
-                    None,
-                    format!("continuum assessment request failed: {err}"),
-                )
-            })?;
+        let response = request.send().await.map_err(|err| {
+            RequestError::new(
+                RequestErrorKind::Transport,
+                None,
+                format!("continuum assessment request failed: {err}"),
+            )
+        })?;
         let status = response.status();
         let body = response.bytes().await.map_err(|err| {
             RequestError::new(
@@ -858,13 +852,10 @@ impl AssessmentRuntime {
         if plan.completed_slice_count > plan.slice_count {
             return Err("continuum returned inconsistent completed slice counts.".to_string());
         }
-        if plan.slot_end_ms <= plan.slot_start_ms
-            || plan.cycle_deadline_ms <= plan.cycle_start_ms
-        {
+        if plan.slot_end_ms <= plan.slot_start_ms || plan.cycle_deadline_ms <= plan.cycle_start_ms {
             return Err("continuum returned an invalid scheduling window.".to_string());
         }
-        if plan.protocol_version >= ASSESSMENT_PROTOCOL_VERSION
-            && plan.plan_token.trim().is_empty()
+        if plan.protocol_version >= ASSESSMENT_PROTOCOL_VERSION && plan.plan_token.trim().is_empty()
         {
             return Err("continuum omitted the required plan token.".to_string());
         }
@@ -872,7 +863,10 @@ impl AssessmentRuntime {
         let mut seen = BTreeSet::new();
         for slice in &plan.slices {
             if slice.slice_index >= plan.slice_count {
-                return Err("continuum returned a slice_index outside the declared slice_count.".to_string());
+                return Err(
+                    "continuum returned a slice_index outside the declared slice_count."
+                        .to_string(),
+                );
             }
             if !seen.insert(slice.slice_index) {
                 return Err("continuum returned duplicate slice indexes.".to_string());
@@ -881,7 +875,9 @@ impl AssessmentRuntime {
                 return Err("continuum returned a slice with a non-positive duration.".to_string());
             }
             if slice.start_ms < plan.slot_start_ms || slice.end_ms > plan.slot_end_ms {
-                return Err("continuum returned a slice outside the assigned slot window.".to_string());
+                return Err(
+                    "continuum returned a slice outside the assigned slot window.".to_string(),
+                );
             }
             if slice.start_ms < previous_end_ms {
                 return Err("continuum returned overlapping slice timing.".to_string());
@@ -1016,7 +1012,9 @@ impl AssessmentRuntime {
             MIN_RETRY_BACKOFF_MS.saturating_mul(2)
         };
         let shift = streak.saturating_sub(1).min(5);
-        let scaled = base.saturating_mul(1_u64 << shift).min(MAX_RETRY_BACKOFF_MS);
+        let scaled = base
+            .saturating_mul(1_u64 << shift)
+            .min(MAX_RETRY_BACKOFF_MS);
         let mut hasher = DefaultHasher::new();
         self.agent_id.hash(&mut hasher);
         phase.hash(&mut hasher);
@@ -1025,12 +1023,7 @@ impl AssessmentRuntime {
         scaled.saturating_add(jitter)
     }
 
-    fn record_success(
-        &mut self,
-        operation: &str,
-        request_id: Option<&str>,
-        disposition: &str,
-    ) {
+    fn record_success(&mut self, operation: &str, request_id: Option<&str>, disposition: &str) {
         let now = now_ms();
         self.communication.protocol_version = ASSESSMENT_PROTOCOL_VERSION;
         self.communication.last_operation = operation.to_string();
@@ -1142,7 +1135,12 @@ impl AssessmentRuntime {
     }
 
     fn select_slice_inventory(&self, slice_index: usize) -> SelectedInventory {
-        let slice_count = self.plan.as_ref().map(|plan| plan.slice_count).unwrap_or(1).max(1);
+        let slice_count = self
+            .plan
+            .as_ref()
+            .map(|plan| plan.slice_count)
+            .unwrap_or(1)
+            .max(1);
         let packages = self
             .cache
             .packages
@@ -1297,8 +1295,7 @@ impl AssessmentRuntime {
             + suspicious_modules as f64 * 1.1
             + usize::from(loader_signal > 0.0) as f64 * 2.0
             + usize::from(guard_signal > 0.0) as f64 * 2.0;
-        let direct_confidence = (evidence_points
-            / self.config.min_samples.max(1) as f64)
+        let direct_confidence = (evidence_points / self.config.min_samples.max(1) as f64)
             .clamp(0.0, 1.0)
             .max(if server.kev > 0 { 0.62 } else { 0.0 })
             .max(if loader_signal >= 0.70 || guard_signal >= 0.75 {
@@ -1340,11 +1337,9 @@ impl AssessmentRuntime {
         let compromise_risk = (direct_risk * 0.68 + score.risk * 0.32)
             .max(if server.kev > 0 { 0.84 } else { 0.0 })
             .clamp(0.0, 1.0);
-        let compromise_confidence = (direct_confidence * 0.62 + score.confidence * 0.38)
-            .clamp(0.0, 1.0);
-        let recommended_action = self
-            .policy
-            .decide(compromise_risk, compromise_confidence);
+        let compromise_confidence =
+            (direct_confidence * 0.62 + score.confidence * 0.38).clamp(0.0, 1.0);
+        let recommended_action = self.policy.decide(compromise_risk, compromise_confidence);
         let completion_pct = if slice_count == 0 {
             0.0
         } else {
@@ -1434,9 +1429,13 @@ impl AssessmentRuntime {
         });
         signals.truncate(MAX_SIGNALS);
 
-        let status = if !self.last_error.trim().is_empty() && compromise_risk < self.policy.alert_threshold {
+        let status = if !self.last_error.trim().is_empty()
+            && compromise_risk < self.policy.alert_threshold
+        {
             "degraded"
-        } else if compromise_risk >= self.policy.isolate_threshold && compromise_confidence >= self.policy.min_confidence {
+        } else if compromise_risk >= self.policy.isolate_threshold
+            && compromise_confidence >= self.policy.min_confidence
+        {
             "compromised"
         } else if compromise_risk >= self.policy.alert_threshold {
             "elevated"
@@ -1497,7 +1496,9 @@ impl AssessmentRuntime {
         summary.last_error = self.last_error.clone();
         if self.current_slice_index.is_some() {
             summary.status = "assessing".to_string();
-        } else if !self.last_error.trim().is_empty() && summary.compromise_risk < self.policy.alert_threshold {
+        } else if !self.last_error.trim().is_empty()
+            && summary.compromise_risk < self.policy.alert_threshold
+        {
             summary.status = "degraded".to_string();
         } else if summary.status.trim().is_empty() {
             summary.status = "scheduled".to_string();
@@ -1831,7 +1832,12 @@ fn collect_processes(max: usize) -> Vec<ProcessRecord> {
             .suspicious_reason
             .is_some()
             .cmp(&left.suspicious_reason.is_some())
-            .then_with(|| right.mem_bytes.unwrap_or_default().cmp(&left.mem_bytes.unwrap_or_default()))
+            .then_with(|| {
+                right
+                    .mem_bytes
+                    .unwrap_or_default()
+                    .cmp(&left.mem_bytes.unwrap_or_default())
+            })
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.pid.cmp(&right.pid))
     });
@@ -1883,7 +1889,11 @@ fn build_package_url(manager: &str, name: &str, version: &str) -> String {
     }
 }
 
-fn suspicious_process_reason(name: &str, exe: Option<&str>, command: Option<&str>) -> Option<String> {
+fn suspicious_process_reason(
+    name: &str,
+    exe: Option<&str>,
+    command: Option<&str>,
+) -> Option<String> {
     let lowered_name = name.to_ascii_lowercase();
     if let Some(keyword) = SUSPICIOUS_PROCESS_KEYWORDS
         .iter()
@@ -1897,7 +1907,10 @@ fn suspicious_process_reason(name: &str, exe: Option<&str>, command: Option<&str
             .iter()
             .find(|prefix| lowered.starts_with(**prefix))
         {
-            return Some(format!("executable launched from writable path '{}'", prefix));
+            return Some(format!(
+                "executable launched from writable path '{}'",
+                prefix
+            ));
         }
         if lowered.contains("(deleted)") || lowered.contains("memfd:") {
             return Some("executable path looks transient or deleted".to_string());
@@ -1906,7 +1919,9 @@ fn suspicious_process_reason(name: &str, exe: Option<&str>, command: Option<&str
     if let Some(command) = command {
         let lowered = command.to_ascii_lowercase();
         if (lowered.contains("curl") || lowered.contains("wget"))
-            && (lowered.contains("| sh") || lowered.contains("| bash") || lowered.contains("-o /tmp/"))
+            && (lowered.contains("| sh")
+                || lowered.contains("| bash")
+                || lowered.contains("-o /tmp/"))
         {
             return Some("shell downloader pattern detected".to_string());
         }
@@ -1925,9 +1940,10 @@ fn suspicious_service_reason(
 ) -> Option<String> {
     let lowered_name = name.to_ascii_lowercase();
     let lowered_description = description.to_ascii_lowercase();
-    if let Some(keyword) = SUSPICIOUS_SERVICE_KEYWORDS.iter().find(|keyword| {
-        lowered_name.contains(**keyword) || lowered_description.contains(**keyword)
-    }) {
+    if let Some(keyword) = SUSPICIOUS_SERVICE_KEYWORDS
+        .iter()
+        .find(|keyword| lowered_name.contains(**keyword) || lowered_description.contains(**keyword))
+    {
         return Some(format!("matched suspicious service keyword '{}'", keyword));
     }
     if state.eq_ignore_ascii_case("failed") && substate.eq_ignore_ascii_case("failed") {
@@ -1963,7 +1979,8 @@ fn derive_guard_signal(guard: &TraceyGuardStatusSnapshot) -> f64 {
         .iter()
         .map(|gpu| gpu.last_risk)
         .fold(0.0_f64, f64::max);
-    let quarantine_ratio = guard.summary.quarantined_devices as f64 / guard.summary.total_devices as f64;
+    let quarantine_ratio =
+        guard.summary.quarantined_devices as f64 / guard.summary.total_devices as f64;
     let suspect_ratio = guard.summary.suspect_devices as f64 / guard.summary.total_devices as f64;
     let recent_failure_ratio = if guard.recent_executions.is_empty() {
         0.0
@@ -1998,9 +2015,21 @@ fn derive_loader_signal(loader: Option<&LoaderThreatSnapshot>) -> f64 {
 }
 
 fn derive_telemetry_signal(telemetry: &ContinuumTelemetrySnapshot) -> f64 {
-    let autonomy = telemetry.server.autonomy_risk.unwrap_or_default().clamp(0.0, 1.0);
-    let thermal = if telemetry.server.thermal_alerts > 0 { 0.35 } else { 0.0 };
-    let fan = if telemetry.server.fan_alerts > 0 { 0.22 } else { 0.0 };
+    let autonomy = telemetry
+        .server
+        .autonomy_risk
+        .unwrap_or_default()
+        .clamp(0.0, 1.0);
+    let thermal = if telemetry.server.thermal_alerts > 0 {
+        0.35
+    } else {
+        0.0
+    };
+    let fan = if telemetry.server.fan_alerts > 0 {
+        0.22
+    } else {
+        0.0
+    };
     autonomy.max((autonomy * 0.7 + thermal + fan).clamp(0.0, 1.0))
 }
 
@@ -2099,20 +2128,34 @@ fn loader_label(loader: &LoaderThreatSnapshot) -> String {
 fn loader_detail(loader: &LoaderThreatSnapshot) -> String {
     format!(
         "provider_risk={:.2} artifact_risk={:.2}",
-        loader.summary.highest_provider_risk,
-        loader.summary.highest_artifact_risk
+        loader.summary.highest_provider_risk, loader.summary.highest_artifact_risk
     )
 }
 
 fn build_local_finding_detail(cache: &InventoryCache) -> String {
     let mut details = Vec::new();
-    for record in cache.processes.iter().filter(|record| record.suspicious_reason.is_some()).take(2) {
+    for record in cache
+        .processes
+        .iter()
+        .filter(|record| record.suspicious_reason.is_some())
+        .take(2)
+    {
         details.push(format!("proc {}", record.name));
     }
-    for record in cache.services.iter().filter(|record| record.suspicious_reason.is_some()).take(1) {
+    for record in cache
+        .services
+        .iter()
+        .filter(|record| record.suspicious_reason.is_some())
+        .take(1)
+    {
         details.push(format!("svc {}", record.name));
     }
-    for record in cache.modules.iter().filter(|record| record.suspicious_reason.is_some()).take(1) {
+    for record in cache
+        .modules
+        .iter()
+        .filter(|record| record.suspicious_reason.is_some())
+        .take(1)
+    {
         details.push(format!("mod {}", record.name));
     }
     if details.is_empty() {

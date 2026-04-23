@@ -8,11 +8,12 @@ use crate::bus::EventBus;
 use crate::config::{OtlpReceiverConfig, TelemetryConfig};
 use crate::event::{Event, EventKind, Severity};
 use crate::governance::GovernanceState;
+use crate::probe_watch::{ProbeObservation, ProbeWatchHandle};
 use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::post;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::routing::any;
 use axum::{Router, body::Bytes};
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
     MetricsService, MetricsServiceServer,
@@ -30,10 +31,12 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tonic::metadata::{KeyAndValueRef, MetadataMap};
 
 static TELEMETRY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -88,6 +91,8 @@ pub async fn spawn_telemetry(
     shutdown: ShutdownListener,
     governance_state: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
     auth: AuthSystem,
+    otlp_http_probe_watch: ProbeWatchHandle,
+    otlp_grpc_probe_watch: ProbeWatchHandle,
 ) {
     if !config.enabled {
         tracing::info!("telemetry integration disabled");
@@ -134,6 +139,8 @@ pub async fn spawn_telemetry(
                 shutdown,
                 governance_state,
                 auth,
+                otlp_http_probe_watch,
+                otlp_grpc_probe_watch,
             )
             .await;
         });
@@ -226,6 +233,8 @@ async fn run_otlp_receivers(
     mut shutdown: ShutdownListener,
     governance_state: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
     auth: AuthSystem,
+    otlp_http_probe_watch: ProbeWatchHandle,
+    otlp_grpc_probe_watch: ProbeWatchHandle,
 ) {
     let mut tasks = Vec::new();
 
@@ -239,6 +248,7 @@ async fn run_otlp_receivers(
                 router.clone(),
                 governance_state.clone(),
                 auth.otlp_grpc_gate(),
+                otlp_grpc_probe_watch.clone(),
             );
             let mut shutdown = shutdown.clone();
             let task = tokio::spawn(async move {
@@ -263,10 +273,12 @@ async fn run_otlp_receivers(
                 router.clone(),
                 governance_state.clone(),
                 auth.otlp_http_gate(),
+                otlp_http_probe_watch.clone(),
             );
             let mut shutdown = shutdown.clone();
             let app = Router::new()
-                .route("/v1/metrics", post(otlp_http_handler))
+                .route("/v1/metrics", any(otlp_http_handler))
+                .fallback(otlp_http_fallback_handler)
                 .with_state(state);
             let task = tokio::spawn(async move {
                 let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -276,7 +288,10 @@ async fn run_otlp_receivers(
                         return;
                     }
                 };
-                let server = axum::serve(listener, app);
+                let server = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                );
                 let _ = server
                     .with_graceful_shutdown(async move { shutdown.wait().await })
                     .await;
@@ -893,6 +908,7 @@ struct OtlpService {
     router: Arc<MetricRouter>,
     governance: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
     auth: AuthGate,
+    probe_watch: ProbeWatchHandle,
 }
 
 impl OtlpService {
@@ -903,6 +919,7 @@ impl OtlpService {
         router: Arc<MetricRouter>,
         governance: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
         auth: AuthGate,
+        probe_watch: ProbeWatchHandle,
     ) -> Self {
         Self {
             bus,
@@ -911,6 +928,7 @@ impl OtlpService {
             router,
             governance,
             auth,
+            probe_watch,
         }
     }
 }
@@ -921,13 +939,27 @@ impl MetricsService for OtlpService {
         &self,
         request: tonic::Request<ExportMetricsServiceRequest>,
     ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
-        self.auth.authorize_grpc(request.metadata()).await?;
+        let headers = metadata_to_header_map(request.metadata());
+        if let Err(status) = self.auth.authorize_grpc(request.metadata()).await {
+            observe_otlp_grpc_request(
+                &self.probe_watch,
+                &headers,
+                grpc_status_to_http(status.code()),
+                Some(false),
+            )
+            .await;
+            return Err(status);
+        }
         let state = self.governance.read().await;
         if !state.telemetry_enabled || !state.otlp_enabled {
+            drop(state);
+            observe_otlp_grpc_request(&self.probe_watch, &headers, StatusCode::OK, Some(true))
+                .await;
             return Ok(tonic::Response::new(ExportMetricsServiceResponse {
                 partial_success: None,
             }));
         }
+        drop(state);
         let payload = request.into_inner();
         ingest_otlp_request(
             payload,
@@ -939,6 +971,7 @@ impl MetricsService for OtlpService {
             "otlp_grpc",
         )
         .await;
+        observe_otlp_grpc_request(&self.probe_watch, &headers, StatusCode::OK, Some(true)).await;
         Ok(tonic::Response::new(ExportMetricsServiceResponse {
             partial_success: None,
         }))
@@ -953,6 +986,7 @@ struct OtlpHttpState {
     router: Arc<MetricRouter>,
     governance: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
     auth: AuthGate,
+    probe_watch: ProbeWatchHandle,
 }
 
 impl OtlpHttpState {
@@ -963,6 +997,7 @@ impl OtlpHttpState {
         router: Arc<MetricRouter>,
         governance: std::sync::Arc<tokio::sync::RwLock<GovernanceState>>,
         auth: AuthGate,
+        probe_watch: ProbeWatchHandle,
     ) -> Self {
         Self {
             bus,
@@ -971,22 +1006,82 @@ impl OtlpHttpState {
             router,
             governance,
             auth,
+            probe_watch,
         }
     }
 }
 
 async fn otlp_http_handler(
     State(state): State<OtlpHttpState>,
-    headers: axum::http::HeaderMap,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    state.auth.authorize_http(&headers).await?;
+    let remote_addr = remote.map(|value| value.0);
+    if method != Method::POST {
+        observe_otlp_http_request(
+            &state.probe_watch,
+            remote_addr,
+            method.as_str(),
+            uri.path(),
+            &headers,
+            StatusCode::METHOD_NOT_ALLOWED,
+            true,
+            None,
+        )
+        .await;
+        return Ok(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    if let Err(code) = state.auth.authorize_http(&headers).await {
+        observe_otlp_http_request(
+            &state.probe_watch,
+            remote_addr,
+            method.as_str(),
+            uri.path(),
+            &headers,
+            code,
+            true,
+            Some(false),
+        )
+        .await;
+        return Err(code);
+    }
     let guard = state.governance.read().await;
     if !guard.telemetry_enabled || !guard.otlp_enabled {
+        drop(guard);
+        observe_otlp_http_request(
+            &state.probe_watch,
+            remote_addr,
+            method.as_str(),
+            uri.path(),
+            &headers,
+            StatusCode::OK,
+            true,
+            Some(true),
+        )
+        .await;
         return Ok(StatusCode::OK);
     }
-    let request =
-        ExportMetricsServiceRequest::decode(body.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    drop(guard);
+    let request = match ExportMetricsServiceRequest::decode(body.as_ref()) {
+        Ok(request) => request,
+        Err(_) => {
+            observe_otlp_http_request(
+                &state.probe_watch,
+                remote_addr,
+                method.as_str(),
+                uri.path(),
+                &headers,
+                StatusCode::BAD_REQUEST,
+                true,
+                Some(true),
+            )
+            .await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
     ingest_otlp_request(
         request,
         &state.config,
@@ -997,7 +1092,110 @@ async fn otlp_http_handler(
         "otlp_http",
     )
     .await;
+    observe_otlp_http_request(
+        &state.probe_watch,
+        remote_addr,
+        method.as_str(),
+        uri.path(),
+        &headers,
+        StatusCode::OK,
+        true,
+        Some(true),
+    )
+    .await;
     Ok(StatusCode::OK)
+}
+
+async fn otlp_http_fallback_handler(
+    State(state): State<OtlpHttpState>,
+    remote: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> StatusCode {
+    observe_otlp_http_request(
+        &state.probe_watch,
+        remote.map(|value| value.0),
+        method.as_str(),
+        uri.path(),
+        &headers,
+        StatusCode::NOT_FOUND,
+        false,
+        None,
+    )
+    .await;
+    StatusCode::NOT_FOUND
+}
+
+async fn observe_otlp_http_request(
+    probe_watch: &ProbeWatchHandle,
+    remote_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    status_code: StatusCode,
+    known_route: bool,
+    authorized: Option<bool>,
+) {
+    probe_watch
+        .observe_http(ProbeObservation {
+            remote_addr,
+            method,
+            path,
+            status_code,
+            headers,
+            known_route,
+            control_route: false,
+            authorized,
+        })
+        .await;
+}
+
+async fn observe_otlp_grpc_request(
+    probe_watch: &ProbeWatchHandle,
+    headers: &HeaderMap,
+    status_code: StatusCode,
+    authorized: Option<bool>,
+) {
+    probe_watch
+        .observe_http(ProbeObservation {
+            remote_addr: None,
+            method: "EXPORT",
+            path: "/v1/metrics",
+            status_code,
+            headers,
+            known_route: true,
+            control_route: false,
+            authorized,
+        })
+        .await;
+}
+
+fn metadata_to_header_map(metadata: &MetadataMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for entry in metadata.iter() {
+        if let KeyAndValueRef::Ascii(key, value) = entry
+            && let Ok(header_name) = axum::http::HeaderName::from_bytes(key.as_str().as_bytes())
+            && let Ok(header_value) = axum::http::HeaderValue::from_bytes(value.as_bytes())
+        {
+            headers.append(header_name, header_value);
+        }
+    }
+    headers
+}
+
+fn grpc_status_to_http(code: tonic::Code) -> StatusCode {
+    match code {
+        tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
+        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::AlreadyExists => StatusCode::CONFLICT,
+        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::BAD_REQUEST,
+    }
 }
 
 #[cfg(test)]

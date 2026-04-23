@@ -335,8 +335,7 @@ impl TokenValidator {
             .map_err(|_| TokenError::ServiceUnavailable)?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Ok(Some(false));
         }
         if status.is_server_error() || !status.is_success() {

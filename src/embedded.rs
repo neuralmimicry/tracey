@@ -5,6 +5,7 @@ use crate::bus::EventBus;
 use crate::config::EmbeddedConfig;
 use crate::event::{Event, EventKind, Severity};
 use crate::gpu::{self, GpuBackendConfig};
+use crate::network_ebpf::{NetworkEbpfMonitor, NetworkEbpfTarget};
 use crate::network_intel::NetworkAttributionCollector;
 use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
@@ -17,26 +18,25 @@ use tokio::fs;
 
 static EMBEDDED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub fn spawn_embedded_collectors(
-    bus: EventBus,
-    storage: Storage,
-    config: EmbeddedConfig,
-    shutdown: ShutdownListener,
-) {
-    tokio::spawn(async move {
-        run_embedded_collectors(bus, storage, config, shutdown).await;
-    });
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedRuntimeTargets {
+    pub network_ebpf_targets: Vec<NetworkEbpfTarget>,
 }
 
-async fn run_embedded_collectors(
+pub async fn spawn_embedded_collectors(
     bus: EventBus,
     storage: Storage,
     config: EmbeddedConfig,
-    mut shutdown: ShutdownListener,
-) {
-    if !config.enabled {
+    targets: EmbeddedRuntimeTargets,
+    shutdown: ShutdownListener,
+) -> Result<(), String> {
+    let ebpf_requested = embedded_network_ebpf_requested(&config);
+    if !config.enabled && !ebpf_requested {
         tracing::info!("embedded collectors disabled");
-        return;
+        return Ok(());
+    }
+    if !config.enabled && ebpf_requested {
+        tracing::info!("embedded collectors running in network eBPF-only mode");
     }
     if std::env::consts::OS != "linux" {
         tracing::info!(
@@ -44,13 +44,24 @@ async fn run_embedded_collectors(
         );
     }
 
-    let jetson = if config.jetson_enabled {
+    let jetson = if config.enabled && config.jetson_enabled {
         discover_jetson_paths().await
     } else {
         None
     };
+    let state = CollectorState::new(config, jetson, targets).await?;
+    tokio::spawn(async move {
+        run_embedded_collectors(bus, storage, state, shutdown).await;
+    });
+    Ok(())
+}
 
-    let mut state = CollectorState::new(config, jetson);
+async fn run_embedded_collectors(
+    bus: EventBus,
+    storage: Storage,
+    mut state: CollectorState,
+    mut shutdown: ShutdownListener,
+) {
     let mut interval = tokio::time::interval(Duration::from_millis(state.config.interval_ms));
 
     loop {
@@ -64,6 +75,7 @@ async fn run_embedded_collectors(
             }
         }
     }
+    state.shutdown().await;
 }
 
 struct CollectorState {
@@ -85,8 +97,13 @@ struct CollectorState {
 }
 
 impl CollectorState {
-    fn new(config: EmbeddedConfig, jetson: Option<JetsonPaths>) -> Self {
-        Self {
+    async fn new(
+        config: EmbeddedConfig,
+        jetson: Option<JetsonPaths>,
+        targets: EmbeddedRuntimeTargets,
+    ) -> Result<Self, String> {
+        let ebpf = NetworkEbpfMonitor::start(&config, &targets.network_ebpf_targets).await?;
+        Ok(Self {
             config,
             prev_cpu: None,
             mem_total_bytes: None,
@@ -99,13 +116,22 @@ impl CollectorState {
             proc_prev_total: None,
             proc_last: Instant::now(),
             proc_io_max: HashMap::new(),
-            network: NetworkAttributionCollector::new(),
+            network: NetworkAttributionCollector::new(ebpf),
             jetson,
             last_sample: Instant::now(),
-        }
+        })
+    }
+
+    async fn shutdown(&mut self) {
+        self.network.shutdown().await;
     }
 
     async fn collect(&mut self, bus: &EventBus, storage: &Storage) {
+        if !self.config.enabled {
+            self.network.collect(bus, storage, &self.config).await;
+            return;
+        }
+
         let elapsed = self.last_sample.elapsed().as_secs_f64().max(0.001);
         self.last_sample = Instant::now();
 
@@ -1851,6 +1877,17 @@ fn severity_from_ratio(ratio: f64) -> Severity {
     } else {
         Severity::Low
     }
+}
+
+fn embedded_network_ebpf_requested(config: &EmbeddedConfig) -> bool {
+    !matches!(
+        config
+            .network_ebpf_mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "disabled" | ""
+    )
 }
 
 async fn emit_metric(

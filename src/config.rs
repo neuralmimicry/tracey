@@ -228,6 +228,10 @@ pub struct EmbeddedConfig {
     pub network_top_processes: usize,
     pub network_top_listeners: usize,
     pub network_owner_cache_ttl_ms: u64,
+    pub network_ebpf_mode: String,
+    pub network_ebpf_program: String,
+    pub network_ebpf_max_events: usize,
+    pub network_ebpf_burst_threshold: usize,
     pub gpu_enabled: bool,
     pub gpu_sysfs_enabled: bool,
     pub gpu_nvml_enabled: bool,
@@ -254,6 +258,10 @@ impl Default for EmbeddedConfig {
             network_top_processes: 8,
             network_top_listeners: 8,
             network_owner_cache_ttl_ms: 30_000,
+            network_ebpf_mode: "auto".to_string(),
+            network_ebpf_program: "bpftrace".to_string(),
+            network_ebpf_max_events: 128,
+            network_ebpf_burst_threshold: 8,
             gpu_enabled: true,
             gpu_sysfs_enabled: true,
             gpu_nvml_enabled: true,
@@ -888,6 +896,24 @@ impl Config {
             .embedded
             .network_owner_cache_ttl_ms
             .clamp(1_000, 600_000);
+        self.embedded.network_ebpf_mode = match self
+            .embedded
+            .network_ebpf_mode
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "disabled" | "auto" | "required" => {
+                self.embedded.network_ebpf_mode.to_ascii_lowercase()
+            }
+            _ => "auto".to_string(),
+        };
+        if self.embedded.network_ebpf_program.trim().is_empty() {
+            self.embedded.network_ebpf_program = "bpftrace".to_string();
+        }
+        self.embedded.network_ebpf_max_events =
+            self.embedded.network_ebpf_max_events.clamp(16, 2048);
+        self.embedded.network_ebpf_burst_threshold =
+            self.embedded.network_ebpf_burst_threshold.clamp(1, 512);
         self.embedded.gpu_max_devices = self.embedded.gpu_max_devices.clamp(1, 32);
 
         self.tracey_guard.scheduler_poll_ms = self.tracey_guard.scheduler_poll_ms.clamp(50, 10_000);
@@ -1812,6 +1838,30 @@ impl Config {
         ]) {
             self.embedded.network_owner_cache_ttl_ms = value;
         }
+        if let Some(value) = env_any(&[
+            "TRACEY_EMBEDDED_NETWORK_EBPF_MODE",
+            "NM_EMBEDDED_NETWORK_EBPF_MODE",
+        ]) {
+            self.embedded.network_ebpf_mode = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_EMBEDDED_NETWORK_EBPF_PROGRAM",
+            "NM_EMBEDDED_NETWORK_EBPF_PROGRAM",
+        ]) {
+            self.embedded.network_ebpf_program = value;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_EBPF_MAX_EVENTS",
+            "NM_EMBEDDED_NETWORK_EBPF_MAX_EVENTS",
+        ]) {
+            self.embedded.network_ebpf_max_events = value as usize;
+        }
+        if let Some(value) = env_u64_any(&[
+            "TRACEY_EMBEDDED_NETWORK_EBPF_BURST_THRESHOLD",
+            "NM_EMBEDDED_NETWORK_EBPF_BURST_THRESHOLD",
+        ]) {
+            self.embedded.network_ebpf_burst_threshold = value as usize;
+        }
         if let Some(value) =
             env_bool_any(&["TRACEY_EMBEDDED_GPU_ENABLED", "NM_EMBEDDED_GPU_ENABLED"])
         {
@@ -2393,5 +2443,21 @@ mod tests {
         assert_eq!(cfg.event_rate_ms, 50);
         assert!(!cfg.discovery.enabled);
         assert!(!cfg.update.enabled);
+    }
+
+    #[test]
+    fn embedded_config_defaults_network_ebpf_mode_to_auto() {
+        let cfg = EmbeddedConfig::default();
+        assert_eq!(cfg.network_ebpf_mode, "auto");
+    }
+
+    #[test]
+    fn config_sanitize_falls_back_to_auto_for_invalid_network_ebpf_mode() {
+        let mut cfg = Config::default();
+        cfg.embedded.network_ebpf_mode = "aggressive".to_string();
+
+        cfg.sanitize();
+
+        assert_eq!(cfg.embedded.network_ebpf_mode, "auto");
     }
 }

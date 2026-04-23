@@ -274,7 +274,8 @@ fn build_forecast(
         .clamp(0.0, 1.0);
     let udp_drop_delta = telemetry.server.network.summary.udp_drop_delta;
     let uncertainty_boost = ((1.0 - attribution_confidence) * 0.35
-        + ((udp_drop_delta as f64 / telemetry.server.network.summary.udp_active_flows.max(1) as f64)
+        + ((udp_drop_delta as f64
+            / telemetry.server.network.summary.udp_active_flows.max(1) as f64)
             / 8.0)
             .clamp(0.0, 1.0)
             * 0.15)
@@ -307,7 +308,7 @@ fn build_forecast(
         + latency_pressure * 0.25
         + queue_pressure * 0.15
         + uncertainty_boost * 0.12)
-            .clamp(1.0, 4.0);
+        .clamp(1.0, 4.0);
     let memory_scale_factor = (1.0
         + (growth_multiplier - 1.0) * 0.35
         + queue_pressure * 0.20

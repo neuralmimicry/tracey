@@ -14,6 +14,11 @@ struct CliHttpOptions {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeStartOptions {
+    pub ebpf_mode: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 enum ParsedCliCommand {
     Help,
@@ -95,6 +100,23 @@ pub async fn maybe_run_cli(args: &[String]) -> Result<bool, Box<dyn Error>> {
     };
     run_cli_command(command).await?;
     Ok(true)
+}
+
+pub(crate) fn parse_runtime_start_options(
+    args: &[String],
+) -> Result<RuntimeStartOptions, Box<dyn Error>> {
+    let mut cursor = CliArgCursor::new(args.get(1..).unwrap_or(&[]));
+    let mut options = RuntimeStartOptions::default();
+    while let Some(flag) = cursor.next() {
+        if let Some(value) = flag.strip_prefix("--ebpf=") {
+            options.ebpf_mode = Some(parse_ebpf_mode(value)?);
+            continue;
+        }
+        if flag == "--ebpf" {
+            options.ebpf_mode = Some(parse_ebpf_mode(&cursor.value(flag)?)?);
+        }
+    }
+    Ok(options)
 }
 
 fn parse_cli_command(args: &[String]) -> Result<Option<ParsedCliCommand>, Box<dyn Error>> {
@@ -373,6 +395,17 @@ fn parse_json_flag(args: &[String]) -> Result<bool, Box<dyn Error>> {
         }
     }
     Ok(json)
+}
+
+fn parse_ebpf_mode(value: &str) -> Result<String, Box<dyn Error>> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "disabled" | "auto" | "required" => Ok(normalized),
+        _ => Err(invalid_cli_usage(format!(
+            "invalid value for --ebpf: {} (expected disabled, auto, or required)",
+            value
+        ))),
+    }
 }
 
 fn consume_http_option(
@@ -1276,6 +1309,7 @@ fn help_text() -> String {
         "Tracey {}\n\n\
 Usage:\n\
   tracey\n\
+  tracey --ebpf disabled|auto|required\n\
   tracey status [--addr ADDR] [--token TOKEN] [--timeout-ms MS] [--json]\n\
   tracey tracey-ban status [--addr ADDR] [--token TOKEN] [--timeout-ms MS] [--json]\n\
   tracey tracey-ban ban --jail NAME --ip IP [--reason TEXT] [--source TEXT] [--ban-time-ms MS] [--addr ADDR] [--token TOKEN] [--timeout-ms MS] [--json]\n\
@@ -1294,6 +1328,8 @@ Usage:\n\
   tracey sign-update ...\n\
   tracey --tui\n\
   tracey --supervisor\n\n\
+Runtime Overrides:\n\
+  --ebpf MODE      Override embedded network eBPF mode. Default is `auto`; `auto` attempts kernel capture and degrades cleanly, while `required` aborts startup when eBPF is unavailable.\n\n\
 Environment:\n\
   TRACEY_CONFIG       Path to Tracey JSON config\n\
   TRACEY_STATUS_ADDR  Override status API address for CLI commands\n\
@@ -1424,5 +1460,34 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_runtime_start_options_collects_ebpf_mode() {
+        let args = vec![
+            "tracey".to_string(),
+            "--ebpf".to_string(),
+            "required".to_string(),
+        ];
+        let parsed = parse_runtime_start_options(&args).expect("runtime options");
+        assert_eq!(parsed.ebpf_mode.as_deref(), Some("required"));
+    }
+
+    #[test]
+    fn parse_runtime_start_options_supports_equals_syntax() {
+        let args = vec!["tracey".to_string(), "--ebpf=auto".to_string()];
+        let parsed = parse_runtime_start_options(&args).expect("runtime options");
+        assert_eq!(parsed.ebpf_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn parse_runtime_start_options_rejects_invalid_ebpf_mode() {
+        let args = vec![
+            "tracey".to_string(),
+            "--ebpf".to_string(),
+            "aggressive".to_string(),
+        ];
+        let err = parse_runtime_start_options(&args).expect_err("invalid mode");
+        assert!(err.to_string().contains("invalid value for --ebpf"));
     }
 }

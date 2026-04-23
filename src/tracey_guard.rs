@@ -2948,15 +2948,9 @@ mod tests {
     #[test]
     fn host_level_ecc_metrics_do_not_create_gpu_context() {
         let mut telemetry = HashMap::new();
-        let event = Event::new(
-            6,
-            "embedded",
-            EventKind::SystemMetric,
-            0.2,
-            Severity::Low,
-        )
-        .with_attr("metric", "ecc_corrected_total")
-        .with_attr("value", "12");
+        let event = Event::new(6, "embedded", EventKind::SystemMetric, 0.2, Severity::Low)
+            .with_attr("metric", "ecc_corrected_total")
+            .with_attr("value", "12");
 
         ingest_telemetry_context(&event, &mut telemetry);
         assert!(telemetry.is_empty());
