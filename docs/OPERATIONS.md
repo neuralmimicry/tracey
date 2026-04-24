@@ -423,19 +423,25 @@ Operational limitation: the repository expects PEM material on disk and does not
 
 ### Binary selection
 
-Unless explicit binary paths are supplied, the script tries in this order:
+In system scope, unless explicit binary paths are supplied, the script installs the Tracey `.deb` package:
+
+- from `--deb-file` when provided
+- from a matching local `tracey_<version>_<arch>.deb` under the script directory or `dist/`
+- from the matching GitHub release asset for the selected release version
+
+In user scope, or when explicit binaries are supplied, the script keeps the older binary-resolution flow:
 
 - repository `target/release/`
 - repository `target/debug/`
 - binaries found on `PATH`
 
-If a required release binary is missing and Cargo is available, the script may build `tracey` and `tracey-loader` automatically.
+If a required release binary is missing and Cargo is available, the script may build `tracey` and `tracey-loader` automatically in that explicit-binary path.
 
 ### Default paths
 
 System scope defaults:
 
-- loader binary: `/usr/local/bin/tracey-loader`
+- loader binary: `/usr/bin/tracey-loader`
 - config: `/etc/tracey/tracey.json`
 - state directory: `/var/lib/tracey`
 - unit file: `/etc/systemd/system/tracey.service`

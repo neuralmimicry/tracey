@@ -10,16 +10,19 @@ The service entrypoint is `tracey-loader`, which supervises and updates the
 mutable `tracey` core from the service state directory.
 By default, `--scope auto` prefers a boot-time system service and will use
 `sudo` for privileged install steps when needed.
+System-scope installs use the packaged Tracey `.deb` by default.
 
 Options:
   --scope auto|system|user     `auto` prefers a system service; `user` is opt-in.
   --service-name NAME          Base service name. Default: tracey
+  --deb-file PATH              Local Tracey .deb to install for system scope.
+  --release-version VERSION    Tracey release version to fetch when no local .deb is found.
   --binary PATH                Alias for --core-binary PATH.
-  --core-binary PATH           Source Tracey core binary to install.
-  --loader-binary PATH         Source Tracey loader binary to install.
+  --core-binary PATH           Source Tracey core binary to install instead of using the .deb package.
+  --loader-binary PATH         Source Tracey loader binary to install instead of using the .deb package.
   --cli-install-path PATH      Destination path for the user-invocable `tracey` command.
   --install-path PATH          Alias for --loader-install-path PATH.
-  --loader-install-path PATH   Destination path for the installed loader binary.
+  --loader-install-path PATH   Service entrypoint path. Defaults to packaged tracey-loader in system scope.
   --core-install-path PATH     Destination path for the installed core binary.
   --config PATH                Config file path to reference from the service.
   --state-dir PATH             Working/state directory for Tracey runtime files.
@@ -28,7 +31,7 @@ Options:
   --agent-id ID                Stable Tracey agent_id to write when creating config.
   --core-channel MODE          production or development. Auto-detected by default.
   --bootstrap-version VERSION  Optional fallback version for first loader bootstrap.
-  --skip-build                 Do not build release binaries when missing or older than source version.
+  --skip-build                 Do not build release binaries when using explicit-binary installation mode.
   --skip-start                 Install/enable the service but do not start it.
   --no-supervisor              Deprecated; ignored because tracey-loader always supervises the core.
   --force-config               Overwrite an existing config file.
@@ -38,6 +41,8 @@ Options:
 Examples:
   ./scripts/install-service.sh
   sudo ./scripts/install-service.sh
+  sudo ./scripts/install-service.sh --deb-file ./dist/tracey_0.2.2_amd64.deb
+  sudo ./scripts/install-service.sh --release-version 0.2.2
   ./scripts/install-service.sh --scope user --core-channel development --dry-run
 USAGE
 }
@@ -388,6 +393,240 @@ read_source_release_version() {
     | head -n 1
 }
 
+normalize_github_repo_slug() {
+  local remote="$1"
+  remote=${remote%.git}
+  case "$remote" in
+    git@github.com:*)
+      remote=${remote#git@github.com:}
+      ;;
+    ssh://git@github.com/*)
+      remote=${remote#ssh://git@github.com/}
+      ;;
+    https://github.com/*)
+      remote=${remote#https://github.com/}
+      ;;
+    http://github.com/*)
+      remote=${remote#http://github.com/}
+      ;;
+  esac
+
+  [[ "$remote" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s\n' "$remote"
+}
+
+resolve_release_repo() {
+  local remote slug
+  if slug=$(env_first TRACEY_RELEASE_REPO); then
+    printf '%s\n' "$slug"
+    return 0
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    remote=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)
+    if [[ -n "$remote" ]] && slug=$(normalize_github_repo_slug "$remote"); then
+      printf '%s\n' "$slug"
+      return 0
+    fi
+  fi
+
+  printf 'neuralmimicry/tracey\n'
+}
+
+detect_deb_arch() {
+  local arch=
+  if command -v dpkg >/dev/null 2>&1; then
+    arch=$(dpkg --print-architecture 2>/dev/null || true)
+  fi
+
+  if [[ -z "$arch" ]]; then
+    case "$(uname -m)" in
+      x86_64)
+        arch=amd64
+        ;;
+      aarch64|arm64)
+        arch=arm64
+        ;;
+    esac
+  fi
+
+  case "$arch" in
+    amd64|arm64)
+      printf '%s\n' "$arch"
+      ;;
+    *)
+      die "unsupported Debian architecture '$arch'; pass explicit binaries or use a Debian/Ubuntu host"
+      ;;
+  esac
+}
+
+debian_package_version() {
+  local version sanitized
+  version="$1"
+  [[ -n "$version" ]] || die "Debian package version is empty"
+  sanitized=$(
+    printf '%s' "$version" \
+      | tr '-' '~' \
+      | sed -E 's/[^A-Za-z0-9.+:~]+/./g; s/^[^A-Za-z0-9]+//; s/[^A-Za-z0-9]+$//'
+  )
+  [[ -n "$sanitized" ]] || die "unable to derive Debian package version from '$version'"
+  printf '%s\n' "$sanitized"
+}
+
+read_deb_package_version() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+
+  if command -v dpkg-deb >/dev/null 2>&1; then
+    dpkg-deb -f "$path" Version 2>/dev/null | head -n 1
+    return 0
+  fi
+
+  local base version
+  base=$(basename "$path")
+  version=$(printf '%s\n' "$base" | sed -En 's/^tracey_(.*)_[^_]+\.deb$/\1/p')
+  [[ -n "$version" ]] || return 1
+  printf '%s\n' "$version"
+}
+
+find_local_deb_for_version() {
+  local release_version="$1"
+  local arch="$2"
+  local deb_version filename dir candidate
+
+  deb_version=$(debian_package_version "$release_version")
+  filename="tracey_${deb_version}_${arch}.deb"
+
+  for dir in "$SCRIPT_DIR" "$SCRIPT_DIR/dist" "$REPO_ROOT" "$REPO_ROOT/dist" "$PWD"; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    candidate="$dir/$filename"
+    if [[ -f "$candidate" ]]; then
+      (
+        cd "$dir"
+        printf '%s/%s\n' "$PWD" "$filename"
+      )
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_latest_release_version() {
+  local repo="$1"
+  local latest_url
+
+  if command -v curl >/dev/null 2>&1; then
+    latest_url=$(
+      curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${repo}/releases/latest"
+    ) || die "could not resolve the latest Tracey release from GitHub"
+  elif command -v wget >/dev/null 2>&1; then
+    latest_url=$(
+      wget -qO /dev/null --max-redirect=20 --server-response \
+        "https://github.com/${repo}/releases/latest" 2>&1 \
+        | sed -n 's/^  Location: //p' \
+        | tail -n 1
+    ) || die "could not resolve the latest Tracey release from GitHub"
+  else
+    die "curl or wget is required to resolve the latest Tracey release"
+  fi
+
+  case "$latest_url" in
+    */releases/tag/v*)
+      printf '%s\n' "${latest_url##*/v}"
+      ;;
+    *)
+      die "unexpected latest release URL from GitHub: $latest_url"
+      ;;
+  esac
+}
+
+download_to_path() {
+  local url="$1"
+  local out="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$out" "$url"
+  else
+    die "curl or wget is required to download Tracey release packages"
+  fi
+}
+
+resolve_package_install_plan() {
+  local local_deb
+
+  USE_DEB_PACKAGE=0
+  DEB_ARCH=
+  DEB_PACKAGE_VERSION=
+  DEB_SOURCE_PATH=
+  DEB_DOWNLOAD_URL=
+  DEB_SOURCE_DESCRIPTION=
+  DEB_INSTALL_STATUS=
+  RELEASE_REPO=
+  PACKAGE_RELEASE_VERSION=
+  PACKAGE_RELEASE_TAG=
+
+  if [[ "$SCOPE" != "system" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$CORE_BINARY_SOURCE" || -n "$LOADER_BINARY_SOURCE" ]]; then
+    return 0
+  fi
+
+  command -v apt-get >/dev/null 2>&1 \
+    || die "automatic system installation requires apt-get; pass explicit binaries or use --scope user"
+
+  USE_DEB_PACKAGE=1
+  RELEASE_REPO=$(resolve_release_repo)
+  DEB_ARCH=$(detect_deb_arch)
+  CORE_BINARY_SOURCE="$PACKAGED_CORE_PATH"
+  LOADER_BINARY_SOURCE="$PACKAGED_LOADER_PATH"
+
+  if [[ -n "$DEB_FILE" ]]; then
+    [[ -f "$DEB_FILE" ]] || die "Debian package was not found: $DEB_FILE"
+    DEB_SOURCE_PATH=$(
+      cd -- "$(dirname -- "$DEB_FILE")"
+      printf '%s/%s\n' "$PWD" "$(basename -- "$DEB_FILE")"
+    )
+    DEB_PACKAGE_VERSION=$(read_deb_package_version "$DEB_SOURCE_PATH" || true)
+    DEB_SOURCE_DESCRIPTION="$DEB_SOURCE_PATH"
+    DEB_INSTALL_STATUS="install Tracey Debian package from local file"
+    return 0
+  fi
+
+  if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
+    PACKAGE_RELEASE_VERSION="${RELEASE_VERSION:-}"
+  fi
+  if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
+    PACKAGE_RELEASE_VERSION=$(env_first TRACEY_RELEASE_VERSION || true)
+  fi
+  if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
+    PACKAGE_RELEASE_VERSION=$(read_source_release_version || true)
+  fi
+  if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
+    PACKAGE_RELEASE_VERSION=$(resolve_latest_release_version "$RELEASE_REPO")
+  fi
+
+  PACKAGE_RELEASE_TAG="v${PACKAGE_RELEASE_VERSION}"
+  DEB_PACKAGE_VERSION=$(debian_package_version "$PACKAGE_RELEASE_VERSION")
+
+  local_deb=$(find_local_deb_for_version "$PACKAGE_RELEASE_VERSION" "$DEB_ARCH" || true)
+  if [[ -n "$local_deb" ]]; then
+    DEB_SOURCE_PATH="$local_deb"
+    DEB_SOURCE_DESCRIPTION="$DEB_SOURCE_PATH"
+    DEB_INSTALL_STATUS="install Tracey Debian package from local file"
+    return 0
+  fi
+
+  DEB_DOWNLOAD_URL="https://github.com/${RELEASE_REPO}/releases/download/${PACKAGE_RELEASE_TAG}/tracey_${DEB_PACKAGE_VERSION}_${DEB_ARCH}.deb"
+  DEB_SOURCE_DESCRIPTION="$DEB_DOWNLOAD_URL"
+  DEB_INSTALL_STATUS="download and install Tracey Debian package"
+}
+
 version_component_or_default() {
   local value="$1"
   local fallback="$2"
@@ -535,6 +774,12 @@ ensure_binary_sources() {
   local release_core="$REPO_ROOT/target/release/tracey"
   local release_loader="$REPO_ROOT/target/release/tracey-loader"
   local rebuild_reason=
+
+  if (( USE_DEB_PACKAGE )); then
+    CORE_BINARY_SOURCE="${CORE_BINARY_SOURCE:-$PACKAGED_CORE_PATH}"
+    LOADER_BINARY_SOURCE="${LOADER_BINARY_SOURCE:-$PACKAGED_LOADER_PATH}"
+    return 0
+  fi
 
   if [[ -n "$CORE_BINARY_SOURCE" ]]; then
     [[ -x "$CORE_BINARY_SOURCE" ]] || die "core binary is not executable: $CORE_BINARY_SOURCE"
@@ -762,7 +1007,20 @@ resolve_core_channel() {
 }
 
 maybe_detect_bootstrap_version() {
-  if [[ -n "$BOOTSTRAP_VERSION" ]] || ((DRY_RUN)); then
+  if [[ -n "$BOOTSTRAP_VERSION" ]]; then
+    return 0
+  fi
+  if (( USE_DEB_PACKAGE )); then
+    if [[ -n "$PACKAGE_RELEASE_VERSION" ]]; then
+      BOOTSTRAP_VERSION="$PACKAGE_RELEASE_VERSION"
+      return 0
+    fi
+    if [[ -n "$DEB_PACKAGE_VERSION" ]]; then
+      BOOTSTRAP_VERSION="${DEB_PACKAGE_VERSION//\~/-}"
+      return 0
+    fi
+  fi
+  if ((DRY_RUN)); then
     return 0
   fi
   local version
@@ -780,7 +1038,11 @@ resolve_paths() {
   case "$SCOPE" in
     system)
       CLI_INSTALL_PATH="${CLI_INSTALL_PATH:-/usr/local/bin/tracey}"
-      LOADER_INSTALL_PATH="${LOADER_INSTALL_PATH:-/usr/local/bin/tracey-loader}"
+      if (( USE_DEB_PACKAGE )); then
+        LOADER_INSTALL_PATH="${LOADER_INSTALL_PATH:-$PACKAGED_LOADER_PATH}"
+      else
+        LOADER_INSTALL_PATH="${LOADER_INSTALL_PATH:-/usr/local/bin/tracey-loader}"
+      fi
       CONFIG_PATH="${CONFIG_PATH:-/etc/tracey/tracey.json}"
       STATE_DIR="${STATE_DIR:-/var/lib/tracey}"
       UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/${UNIT_NAME}}"
@@ -809,6 +1071,15 @@ resolve_paths() {
   validate_path "state dir" "$STATE_DIR"
   validate_path "unit path" "$UNIT_PATH"
   validate_path "env file" "$ENV_FILE"
+
+  if (( USE_DEB_PACKAGE )) && [[ "$SCOPE" == "system" ]]; then
+    [[ "$LOADER_INSTALL_PATH" == "$PACKAGED_LOADER_PATH" ]] \
+      || die "--loader-install-path is incompatible with Debian package installation; pass explicit binaries to override it"
+    [[ "$CLI_INSTALL_PATH" != "$PACKAGED_CORE_PATH" ]] \
+      || die "--cli-install-path must not overwrite the packaged Tracey binary at $PACKAGED_CORE_PATH"
+    [[ "$CORE_INSTALL_PATH" != "$PACKAGED_CORE_PATH" ]] \
+      || die "--core-install-path must differ from the packaged Tracey binary at $PACKAGED_CORE_PATH"
+  fi
 
   [[ "$CLI_INSTALL_PATH" != "$LOADER_INSTALL_PATH" ]] || die "cli install path must differ from loader install path"
   [[ "$CLI_INSTALL_PATH" != "$CORE_INSTALL_PATH" ]] || die "cli install path must differ from core install path"
@@ -923,7 +1194,69 @@ exec ${core_q} "\$@"
 CFG
 }
 
+install_debian_package() {
+  local desired_version current_version deb_path download_dir=
+
+  (( USE_DEB_PACKAGE )) || return 0
+
+  desired_version="$DEB_PACKAGE_VERSION"
+  if [[ -z "$desired_version" && -n "$DEB_SOURCE_PATH" ]]; then
+    desired_version=$(read_deb_package_version "$DEB_SOURCE_PATH" || true)
+  fi
+
+  if (( ! DRY_RUN )); then
+    current_version=$(dpkg-query -W -f='${Version}\n' tracey 2>/dev/null || true)
+    if [[ -n "$desired_version" && "$current_version" == "$desired_version" \
+          && -x "$PACKAGED_CORE_PATH" && -x "$PACKAGED_LOADER_PATH" ]]; then
+      DEB_INSTALL_STATUS="reusing installed Tracey package $current_version"
+      return 0
+    fi
+  fi
+
+  if [[ -n "$DEB_SOURCE_PATH" ]]; then
+    deb_path="$DEB_SOURCE_PATH"
+  else
+    download_dir=$(mktemp -d)
+    deb_path="$download_dir/tracey_${DEB_PACKAGE_VERSION}_${DEB_ARCH}.deb"
+    if (( DRY_RUN )); then
+      log "planned package download: $DEB_DOWNLOAD_URL -> $deb_path"
+    else
+      log "downloading Tracey Debian package: $DEB_DOWNLOAD_URL"
+      download_to_path "$DEB_DOWNLOAD_URL" "$deb_path" \
+        || {
+          rm -rf "$download_dir"
+          die "failed to download Tracey Debian package from $DEB_DOWNLOAD_URL"
+        }
+    fi
+  fi
+
+  if (( DRY_RUN )); then
+    run apt-get update
+    run apt-get install -y "$deb_path"
+    DEB_INSTALL_STATUS="dry-run Debian package install"
+    [[ -n "$download_dir" ]] && rm -rf "$download_dir"
+    return 0
+  fi
+
+  run apt-get update
+  run apt-get install -y "$deb_path"
+  DEB_INSTALL_STATUS="installed Tracey Debian package"
+
+  [[ -x "$PACKAGED_CORE_PATH" ]] || die "packaged Tracey binary was not installed at $PACKAGED_CORE_PATH"
+  [[ -x "$PACKAGED_LOADER_PATH" ]] || die "packaged Tracey loader was not installed at $PACKAGED_LOADER_PATH"
+
+  [[ -n "$download_dir" ]] && rm -rf "$download_dir"
+}
+
 install_loader_binary() {
+  if (( USE_DEB_PACKAGE )); then
+    if (( ! DRY_RUN )) && [[ ! -x "$LOADER_INSTALL_PATH" ]]; then
+      die "packaged Tracey loader is not executable: $LOADER_INSTALL_PATH"
+    fi
+    log "using packaged loader binary at $LOADER_INSTALL_PATH"
+    return
+  fi
+
   run mkdir -p "$(dirname "$LOADER_INSTALL_PATH")"
   if [[ "$LOADER_BINARY_SOURCE" == "$LOADER_INSTALL_PATH" ]]; then
     log "loader binary already installed at $LOADER_INSTALL_PATH"
@@ -1009,15 +1342,25 @@ print_summary() {
   log "Tracey service installation plan:"
   log "  scope:          $SCOPE"
   log "  service:        $UNIT_NAME"
+  if (( USE_DEB_PACKAGE )); then
+    if [[ -n "$PACKAGE_RELEASE_TAG" ]]; then
+      log "  release:        $PACKAGE_RELEASE_TAG"
+    fi
+    log "  package arch:   $DEB_ARCH"
+    log "  package source: $DEB_SOURCE_DESCRIPTION"
+    if [[ -n "$DEB_INSTALL_STATUS" ]]; then
+      log "  package action: $DEB_INSTALL_STATUS"
+    fi
+  fi
   log "  loader source:  $LOADER_BINARY_SOURCE"
   log "  core source:    $CORE_BINARY_SOURCE"
-  if [[ -n "$BUILD_AS_USER" ]]; then
+  if [[ -n "$BUILD_AS_USER" ]] && (( ! USE_DEB_PACKAGE )); then
     log "  build user:     $BUILD_AS_USER"
   fi
-  if [[ -n "$SOURCE_VERSION" ]]; then
+  if [[ -n "$SOURCE_VERSION" ]] && (( ! USE_DEB_PACKAGE )); then
     log "  source version: $SOURCE_VERSION"
   fi
-  if [[ -n "$RELEASE_BUILD_STATUS" ]]; then
+  if [[ -n "$RELEASE_BUILD_STATUS" ]] && (( ! USE_DEB_PACKAGE )); then
     log "  build action:   $RELEASE_BUILD_STATUS"
   fi
   log "  cli path:       $CLI_INSTALL_PATH"
@@ -1046,6 +1389,20 @@ REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 
 SCOPE=auto
 SERVICE_NAME=tracey
+DEB_FILE=
+RELEASE_VERSION=
+RELEASE_REPO=
+PACKAGE_RELEASE_VERSION=
+PACKAGE_RELEASE_TAG=
+USE_DEB_PACKAGE=0
+DEB_ARCH=
+DEB_PACKAGE_VERSION=
+DEB_SOURCE_PATH=
+DEB_DOWNLOAD_URL=
+DEB_SOURCE_DESCRIPTION=
+DEB_INSTALL_STATUS=
+PACKAGED_CORE_PATH=/usr/bin/tracey
+PACKAGED_LOADER_PATH=/usr/bin/tracey-loader
 CORE_BINARY_SOURCE=
 LOADER_BINARY_SOURCE=
 CLI_INSTALL_PATH=
@@ -1090,6 +1447,16 @@ while (($#)); do
       shift
       (($#)) || die "--service-name requires a value"
       SERVICE_NAME="$1"
+      ;;
+    --deb-file)
+      shift
+      (($#)) || die "--deb-file requires a value"
+      DEB_FILE="$1"
+      ;;
+    --release-version)
+      shift
+      (($#)) || die "--release-version requires a value"
+      RELEASE_VERSION="$1"
       ;;
     --binary|--core-binary)
       shift
@@ -1189,6 +1556,7 @@ UNIT_NAME="${UNIT_BASE}.service"
 validate_name
 require_linux_systemd
 resolve_scope
+resolve_package_install_plan
 
 if [[ -z "$AGENT_ID" ]]; then
   AGENT_ID=$(default_agent_id)
@@ -1198,15 +1566,16 @@ BUILD_AS_USER=$(resolve_build_user || true)
 
 ensure_binary_sources
 resolve_core_channel
-maybe_detect_bootstrap_version
 resolve_paths
 resolve_loader_paths
+maybe_detect_bootstrap_version
 resolve_status_firewall_target
 print_summary
 ensure_privileged_access
 resolve_scope_conflicts
 
 run mkdir -p "$STATE_DIR"
+install_debian_package
 install_loader_binary
 install_core_binary
 install_cli_wrapper
