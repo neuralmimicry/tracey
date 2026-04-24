@@ -38,6 +38,10 @@ Options:
   --dry-run                    Show planned actions without changing the system.
   -h, --help                   Show this help text.
 
+Environment:
+  TRACEY_GITHUB_TOKEN          Optional GitHub token used when downloading from a private release.
+  GH_TOKEN, GITHUB_TOKEN       Alternative GitHub token variable names.
+
 Examples:
   ./scripts/install-service.sh
   sudo ./scripts/install-service.sh
@@ -555,12 +559,132 @@ download_to_path() {
   fi
 }
 
+run_as_build_user() {
+  if [[ -n "$BUILD_AS_USER" && $(id -u) -eq 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo -u "$BUILD_AS_USER" -H "$@"
+      return
+    fi
+
+    if command -v runuser >/dev/null 2>&1; then
+      local user_home=
+      user_home=$(getent passwd "$BUILD_AS_USER" | cut -d: -f6)
+      env HOME="${user_home:-/home/$BUILD_AS_USER}" runuser -u "$BUILD_AS_USER" -- "$@"
+      return
+    fi
+  fi
+
+  "$@"
+}
+
+gh_authenticated() {
+  command -v gh >/dev/null 2>&1 || return 1
+  run_as_build_user gh auth status >/dev/null 2>&1
+}
+
+github_token() {
+  env_first TRACEY_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+}
+
+download_release_asset_via_gh() {
+  local repo="$1"
+  local tag="$2"
+  local asset_name="$3"
+  local out="$4"
+
+  run_as_build_user gh release download "$tag" \
+    --repo "$repo" \
+    --pattern "$asset_name" \
+    --output "$out" \
+    --clobber
+}
+
+download_release_asset_via_api() {
+  local repo="$1"
+  local tag="$2"
+  local asset_name="$3"
+  local token="$4"
+  local out="$5"
+
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is required for token-authenticated GitHub downloads"
+
+  python3 - "$repo" "$tag" "$asset_name" "$token" "$out" <<'PY'
+import json
+import sys
+import urllib.request
+
+repo, tag, asset_name, token, out = sys.argv[1:]
+
+release_req = urllib.request.Request(
+    f"https://api.github.com/repos/{repo}/releases/tags/{tag}",
+    headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    },
+)
+
+with urllib.request.urlopen(release_req, timeout=30) as response:
+    release = json.load(response)
+
+asset = next(
+    (item for item in release.get("assets", []) if item.get("name") == asset_name),
+    None,
+)
+if asset is None:
+    raise SystemExit(f"asset not found in release {tag}: {asset_name}")
+
+asset_req = urllib.request.Request(
+    asset["url"],
+    headers={
+        "Accept": "application/octet-stream",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    },
+)
+
+with urllib.request.urlopen(asset_req, timeout=60) as response, open(out, "wb") as handle:
+    while True:
+        chunk = response.read(1024 * 1024)
+        if not chunk:
+            break
+        handle.write(chunk)
+PY
+}
+
+download_release_asset() {
+  local repo="$1"
+  local tag="$2"
+  local asset_name="$3"
+  local browser_url="$4"
+  local out="$5"
+  local token=
+
+  if gh_authenticated; then
+    download_release_asset_via_gh "$repo" "$tag" "$asset_name" "$out" && return 0
+    warn "authenticated gh download failed for $asset_name; falling back"
+  fi
+
+  if token=$(github_token); then
+    download_release_asset_via_api "$repo" "$tag" "$asset_name" "$token" "$out" && return 0
+    warn "token-authenticated GitHub API download failed for $asset_name; falling back"
+  fi
+
+  if download_to_path "$browser_url" "$out"; then
+    return 0
+  fi
+
+  die "failed to download Tracey release asset ${asset_name}; authenticate gh or set TRACEY_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN when using private releases"
+}
+
 resolve_package_install_plan() {
   local local_deb
 
   USE_DEB_PACKAGE=0
   DEB_ARCH=
   DEB_PACKAGE_VERSION=
+  DEB_ASSET_NAME=
   DEB_SOURCE_PATH=
   DEB_DOWNLOAD_URL=
   DEB_SOURCE_DESCRIPTION=
@@ -613,6 +737,7 @@ resolve_package_install_plan() {
 
   PACKAGE_RELEASE_TAG="v${PACKAGE_RELEASE_VERSION}"
   DEB_PACKAGE_VERSION=$(debian_package_version "$PACKAGE_RELEASE_VERSION")
+  DEB_ASSET_NAME="tracey_${DEB_PACKAGE_VERSION}_${DEB_ARCH}.deb"
 
   local_deb=$(find_local_deb_for_version "$PACKAGE_RELEASE_VERSION" "$DEB_ARCH" || true)
   if [[ -n "$local_deb" ]]; then
@@ -622,8 +747,8 @@ resolve_package_install_plan() {
     return 0
   fi
 
-  DEB_DOWNLOAD_URL="https://github.com/${RELEASE_REPO}/releases/download/${PACKAGE_RELEASE_TAG}/tracey_${DEB_PACKAGE_VERSION}_${DEB_ARCH}.deb"
-  DEB_SOURCE_DESCRIPTION="$DEB_DOWNLOAD_URL"
+  DEB_DOWNLOAD_URL="https://github.com/${RELEASE_REPO}/releases/download/${PACKAGE_RELEASE_TAG}/${DEB_ASSET_NAME}"
+  DEB_SOURCE_DESCRIPTION="GitHub release ${PACKAGE_RELEASE_TAG} asset ${DEB_ASSET_NAME}"
   DEB_INSTALL_STATUS="download and install Tracey Debian package"
 }
 
@@ -1196,6 +1321,7 @@ CFG
 
 install_debian_package() {
   local desired_version current_version deb_path download_dir=
+  local build_group=
 
   (( USE_DEB_PACKAGE )) || return 0
 
@@ -1217,15 +1343,24 @@ install_debian_package() {
     deb_path="$DEB_SOURCE_PATH"
   else
     download_dir=$(mktemp -d)
-    deb_path="$download_dir/tracey_${DEB_PACKAGE_VERSION}_${DEB_ARCH}.deb"
+    if [[ -n "$BUILD_AS_USER" && $(id -u) -eq 0 ]]; then
+      build_group=$(id -gn "$BUILD_AS_USER")
+      chown "$BUILD_AS_USER:$build_group" "$download_dir"
+    fi
+    deb_path="$download_dir/$DEB_ASSET_NAME"
     if (( DRY_RUN )); then
       log "planned package download: $DEB_DOWNLOAD_URL -> $deb_path"
     else
-      log "downloading Tracey Debian package: $DEB_DOWNLOAD_URL"
-      download_to_path "$DEB_DOWNLOAD_URL" "$deb_path" \
+      log "downloading Tracey Debian package: $DEB_SOURCE_DESCRIPTION"
+      download_release_asset \
+        "$RELEASE_REPO" \
+        "$PACKAGE_RELEASE_TAG" \
+        "$DEB_ASSET_NAME" \
+        "$DEB_DOWNLOAD_URL" \
+        "$deb_path" \
         || {
           rm -rf "$download_dir"
-          die "failed to download Tracey Debian package from $DEB_DOWNLOAD_URL"
+          die "failed to download Tracey Debian package ${DEB_ASSET_NAME}"
         }
     fi
   fi
@@ -1397,6 +1532,7 @@ PACKAGE_RELEASE_TAG=
 USE_DEB_PACKAGE=0
 DEB_ARCH=
 DEB_PACKAGE_VERSION=
+DEB_ASSET_NAME=
 DEB_SOURCE_PATH=
 DEB_DOWNLOAD_URL=
 DEB_SOURCE_DESCRIPTION=
