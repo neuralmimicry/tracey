@@ -14,6 +14,7 @@ Options:
   --platform NAME             Platform suffix in output names. Default: derived from host.
   --archive-format FORMAT     Archive format: tar.gz or zip.
   --binary-suffix SUFFIX      Binary suffix in packaged filenames (for example .exe).
+  --deb-arch ARCH             Also build a Debian package for linux using ARCH (amd64 or arm64).
   --skip-build                Reuse existing release binaries instead of building them.
   --sign-update               Generate tracey.update(.meta.json/.sig) with TRACEY_UPDATE_KEY.
   -h, --help                  Show this help text.
@@ -21,6 +22,7 @@ Options:
 Examples:
   ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist
   ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --platform windows-x86_64 --archive-format zip --binary-suffix .exe
+  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --platform linux-x86_64 --deb-arch amd64
   TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --sign-update
 USAGE
 }
@@ -180,12 +182,97 @@ should_include_install_service() {
   esac
 }
 
+validate_deb_arch() {
+  case "$1" in
+    amd64|arm64)
+      ;;
+    *)
+      die "unsupported Debian architecture: $1"
+      ;;
+  esac
+}
+
+debian_package_version() {
+  local version sanitized
+  version="$1"
+  [[ -n "$version" ]] || die "Debian package version is empty"
+  sanitized=$(
+    printf '%s' "$version" \
+      | tr '-' '~' \
+      | sed -E 's/[^A-Za-z0-9.+:~]+/./g; s/^[^A-Za-z0-9]+//; s/[^A-Za-z0-9]+$//'
+  )
+  [[ -n "$sanitized" ]] || die "unable to derive Debian package version from '$version'"
+  printf '%s\n' "$sanitized"
+}
+
+compute_deb_depends() {
+  if ! command -v dpkg-shlibdeps >/dev/null 2>&1; then
+    printf '\n'
+    return
+  fi
+
+  local work_dir output depends
+  work_dir=$(mktemp -d)
+  output=$(
+    cd "$work_dir"
+    dpkg-shlibdeps -O "$1" "$2" 2>/dev/null || true
+  )
+  rm -rf "$work_dir"
+  depends=$(printf '%s\n' "$output" | sed -n 's/^shlibs:Depends=//p' | tail -n 1)
+  printf '%s\n' "$depends"
+}
+
+create_debian_package() {
+  local deb_version deb_stage_root deb_root deb_path depends
+
+  validate_deb_arch "$DEB_ARCH"
+  command -v dpkg-deb >/dev/null 2>&1 || die "dpkg-deb is required when --deb-arch is used"
+
+  deb_version=$(debian_package_version "$VERSION")
+  deb_stage_root="$OUTPUT_DIR/.deb-stage"
+  deb_root="$deb_stage_root/root"
+  deb_path="$OUTPUT_DIR/tracey_${deb_version}_${DEB_ARCH}.deb"
+
+  rm -rf "$deb_stage_root"
+  install -d -m 0755 \
+    "$deb_root/DEBIAN" \
+    "$deb_root/usr/bin" \
+    "$deb_root/usr/share/doc/tracey"
+
+  install -m 0755 "$TRACEY_BIN" "$deb_root/usr/bin/tracey"
+  install -m 0755 "$LOADER_BIN" "$deb_root/usr/bin/tracey-loader"
+  install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/tracey/README.md"
+  install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/tracey/OPERATIONS.md"
+
+  depends=$(compute_deb_depends "$deb_root/usr/bin/tracey" "$deb_root/usr/bin/tracey-loader")
+
+  {
+    printf 'Package: tracey\n'
+    printf 'Version: %s\n' "$deb_version"
+    printf 'Section: admin\n'
+    printf 'Priority: optional\n'
+    printf 'Architecture: %s\n' "$DEB_ARCH"
+    if [[ -n "$depends" ]]; then
+      printf 'Depends: %s\n' "$depends"
+    fi
+    printf 'Maintainer: NeuralMimicry <opensource@neuralmimicry.ai>\n'
+    printf 'Homepage: https://github.com/neuralmimicry/tracey\n'
+    printf 'Description: Tracey loader and anomaly detection runtime\n'
+    printf ' Tracey packages the core agent and tracey-loader for Linux hosts.\n'
+  } >"$deb_root/DEBIAN/control"
+
+  dpkg-deb --build --root-owner-group "$deb_root" "$deb_path" >/dev/null
+  artifacts+=("$deb_path")
+  rm -rf "$deb_stage_root"
+}
+
 VERSION=
 OUTPUT_DIR=
 TARGET_TRIPLE=
 PLATFORM=
 ARCHIVE_FORMAT=
 BINARY_SUFFIX=
+DEB_ARCH=
 SKIP_BUILD=0
 SIGN_UPDATE=0
 BUILD_AS_USER=
@@ -221,6 +308,11 @@ while (($#)); do
       shift
       (($#)) || die "--binary-suffix requires a value"
       BINARY_SUFFIX="$1"
+      ;;
+    --deb-arch)
+      shift
+      (($#)) || die "--deb-arch requires a value"
+      DEB_ARCH="$1"
       ;;
     --skip-build)
       SKIP_BUILD=1
@@ -288,6 +380,11 @@ install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$PAYLOAD_DIR/docs/OPERATIONS.md
 create_archive
 
 artifacts=("$ARCHIVE_PATH")
+
+if [[ -n "$DEB_ARCH" ]]; then
+  [[ "$PLATFORM" == linux* ]] || die "--deb-arch is only supported for linux platforms"
+  create_debian_package
+fi
 
 if (( SIGN_UPDATE )); then
   SIGN_DIR="$OUTPUT_DIR/.sign"

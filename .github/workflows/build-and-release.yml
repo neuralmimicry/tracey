@@ -86,12 +86,11 @@ jobs:
     name: release-meta
     needs: verify
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/v')
     outputs:
       artifact_version: ${{ steps.meta.outputs.artifact_version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
+      publish_release: ${{ steps.meta.outputs.publish_release }}
+      create_release_tag: ${{ steps.meta.outputs.create_release_tag }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -99,17 +98,41 @@ jobs:
       - name: Compute artifact metadata
         id: meta
         shell: bash
+        env:
+          MANUAL_PUBLISH_REQUEST: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.publish_release || false }}
         run: |
           set -euo pipefail
           cargo_version=$(
             sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1
           )
+          candidate_tag="v${cargo_version}"
           short_sha="${GITHUB_SHA::0:7}"
           release_tag=""
+          publish_release="false"
+          create_release_tag="false"
 
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             release_tag="${GITHUB_REF#refs/tags/}"
             artifact_version="${release_tag#v}"
+            if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              publish_release="true"
+            elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && \
+                    "${MANUAL_PUBLISH_REQUEST}" == "true" ]]; then
+              publish_release="true"
+            fi
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" && \
+                  "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            if git ls-remote --exit-code --tags --refs origin \
+              "refs/tags/${candidate_tag}" >/dev/null 2>&1; then
+              artifact_version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}.${short_sha}"
+            else
+              release_tag="${candidate_tag}"
+              artifact_version="${cargo_version}"
+              publish_release="true"
+              create_release_tag="true"
+            fi
           else
             artifact_version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}.${short_sha}"
           fi
@@ -123,16 +146,15 @@ jobs:
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "artifact_version=$artifact_version" >> "$GITHUB_OUTPUT"
+          echo "publish_release=$publish_release" >> "$GITHUB_OUTPUT"
+          echo "create_release_tag=$create_release_tag" >> "$GITHUB_OUTPUT"
 
-  package-release:
-    name: package-release (${{ matrix.platform }})
+  package-linux:
+    name: package-linux (${{ matrix.platform }})
     needs:
       - verify
       - release-meta
     runs-on: ${{ matrix.runner }}
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -142,13 +164,128 @@ jobs:
             platform: linux-x86_64
             archive_format: tar.gz
             binary_suffix: ""
+            deb_arch: amd64
             supports_update_bundle: true
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
             archive_format: tar.gz
             binary_suffix: ""
+            deb_arch: arm64
             supports_update_bundle: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Package Linux release artifacts
+        env:
+          TRACEY_UPDATE_KEY: ${{ secrets.TRACEY_UPDATE_KEY }}
+          MANUAL_SIGN_REQUEST: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.sign_update_bundle }}
+        run: |
+          set -euo pipefail
+          args=(
+            --version "${{ needs.release-meta.outputs.artifact_version }}"
+            --output-dir "./dist"
+            --target-triple "${{ matrix.rust_target }}"
+            --platform "${{ matrix.platform }}"
+            --archive-format "${{ matrix.archive_format }}"
+            --binary-suffix "${{ matrix.binary_suffix }}"
+            --deb-arch "${{ matrix.deb_arch }}"
+          )
+
+          if [[ "${{ matrix.supports_update_bundle }}" == "true" ]]; then
+            if [[ -n "${{ needs.release-meta.outputs.release_tag }}" && \
+                  -n "${TRACEY_UPDATE_KEY:-}" ]]; then
+              args+=(--sign-update)
+            elif [[ "${MANUAL_SIGN_REQUEST}" == "true" ]]; then
+              if [[ -z "${TRACEY_UPDATE_KEY:-}" ]]; then
+                echo "::error::TRACEY_UPDATE_KEY secret is required"
+                echo "::error::when sign_update_bundle is enabled"
+                exit 1
+              fi
+              args+=(--sign-update)
+            fi
+          fi
+
+          chmod +x scripts/package-release.sh
+          ./scripts/package-release.sh "${args[@]}"
+
+      - name: Validate Debian package metadata
+        run: |
+          set -euo pipefail
+          deb_path="$(find dist -maxdepth 1 -type f -name 'tracey_*.deb' | head -n 1)"
+          if [[ -z "$deb_path" ]]; then
+            echo "::error::Expected a Debian package under dist/"
+            exit 1
+          fi
+
+          expected_version="$(basename "$deb_path" | sed -E 's/^tracey_(.*)_[^_]+\.deb$/\1/')"
+          actual_package="$(dpkg-deb -f "$deb_path" Package)"
+          actual_version="$(dpkg-deb -f "$deb_path" Version)"
+          actual_arch="$(dpkg-deb -f "$deb_path" Architecture)"
+
+          [[ "$actual_package" == "tracey" ]]
+          [[ "$actual_version" == "$expected_version" ]]
+          [[ "$actual_arch" == "${{ matrix.deb_arch }}" ]]
+
+      - name: Smoke install Debian package
+        run: |
+          set -euo pipefail
+          deb_path="$(find dist -maxdepth 1 -type f -name 'tracey_*.deb' | head -n 1)"
+          deb_path="$(readlink -f "$deb_path")"
+
+          sudo apt-get update
+          sudo apt-get install -y "$deb_path"
+
+          tracey --version
+          tracey-loader --version
+          dpkg-query -W -f='${Version}\n' tracey
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-assets-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  package-release:
+    name: package-release (${{ matrix.platform }})
+    needs:
+      - verify
+      - release-meta
+    runs-on: ${{ matrix.runner }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      needs.release-meta.outputs.publish_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - runner: macos-15-intel
             rust_target: x86_64-apple-darwin
             platform: macos-x86_64
@@ -302,13 +439,10 @@ jobs:
     name: publish-release
     needs:
       - release-meta
+      - package-linux
       - package-release
     runs-on: ubuntu-latest
-    if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      inputs.publish_release)
+    if: ${{ needs.release-meta.outputs.publish_release == 'true' }}
     permissions:
       contents: write
     steps:
@@ -317,9 +451,27 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${{ needs.release-meta.outputs.release_tag }}" ]]; then
-            echo "::error::Publishing requires a v* tag ref"
+            echo "::error::Publishing requires a resolved release tag"
             exit 1
           fi
+
+      - name: Ensure release tag exists on GitHub
+        if: ${{ needs.release-meta.outputs.create_release_tag == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          gh api "repos/${GH_REPO}/git/refs" \
+            --method POST \
+            -f ref="refs/tags/${RELEASE_TAG}" \
+            -f sha="${GITHUB_SHA}"
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v7
