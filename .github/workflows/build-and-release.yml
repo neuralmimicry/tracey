@@ -47,7 +47,7 @@ concurrency:
 jobs:
   verify:
     name: verify
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ubuntu-latest]
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -85,7 +85,7 @@ jobs:
   release-meta:
     name: release-meta
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ubuntu-latest]
     outputs:
       artifact_version: ${{ steps.meta.outputs.artifact_version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
@@ -154,7 +154,7 @@ jobs:
     needs:
       - verify
       - release-meta
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, Linux, "${{ matrix.runner }}"]
     strategy:
       fail-fast: false
       matrix:
@@ -277,7 +277,7 @@ jobs:
     needs:
       - verify
       - release-meta
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, Linux, "${{ matrix.runner }}"]
     if: >-
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.ref, 'refs/tags/v')
@@ -440,7 +440,7 @@ jobs:
       - release-meta
       - package-linux
       - package-release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ubuntu-latest]
     if: >-
       always() &&
       needs.release-meta.outputs.publish_release == 'true' &&
