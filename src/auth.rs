@@ -48,13 +48,14 @@ fn normalize_service_access_level(value: &str, fallback: &str) -> String {
 }
 
 fn access_at_least(current: &str, required: &str) -> bool {
-    let rank = |value: &str| match normalize_service_access_level(value, SERVICE_ACCESS_NONE).as_str() {
-        SERVICE_ACCESS_REQUEST => 1,
-        SERVICE_ACCESS_OBSERVE => 2,
-        SERVICE_ACCESS_USE => 3,
-        SERVICE_ACCESS_CONTROL => 4,
-        _ => 0,
-    };
+    let rank =
+        |value: &str| match normalize_service_access_level(value, SERVICE_ACCESS_NONE).as_str() {
+            SERVICE_ACCESS_REQUEST => 1,
+            SERVICE_ACCESS_OBSERVE => 2,
+            SERVICE_ACCESS_USE => 3,
+            SERVICE_ACCESS_CONTROL => 4,
+            _ => 0,
+        };
     rank(current) >= rank(required)
 }
 
@@ -157,25 +158,55 @@ impl ResolvedServiceAccess {
                 .unwrap_or(visible_access_level != SERVICE_ACCESS_NONE),
             can_request: entry
                 .and_then(|item| item.get("can_request"))
-                .map(|value| json_bool(Some(value), access_at_least(&visible_access_level, SERVICE_ACCESS_REQUEST)))
-                .unwrap_or(access_at_least(&visible_access_level, SERVICE_ACCESS_REQUEST)),
+                .map(|value| {
+                    json_bool(
+                        Some(value),
+                        access_at_least(&visible_access_level, SERVICE_ACCESS_REQUEST),
+                    )
+                })
+                .unwrap_or(access_at_least(
+                    &visible_access_level,
+                    SERVICE_ACCESS_REQUEST,
+                )),
             can_observe: entry
                 .and_then(|item| item.get("can_observe"))
-                .map(|value| json_bool(Some(value), access_at_least(&visible_access_level, SERVICE_ACCESS_OBSERVE)))
-                .unwrap_or(access_at_least(&visible_access_level, SERVICE_ACCESS_OBSERVE)),
+                .map(|value| {
+                    json_bool(
+                        Some(value),
+                        access_at_least(&visible_access_level, SERVICE_ACCESS_OBSERVE),
+                    )
+                })
+                .unwrap_or(access_at_least(
+                    &visible_access_level,
+                    SERVICE_ACCESS_OBSERVE,
+                )),
             can_use: entry
                 .and_then(|item| item.get("can_use"))
-                .map(|value| json_bool(Some(value), access_at_least(&access_level, SERVICE_ACCESS_USE)))
+                .map(|value| {
+                    json_bool(
+                        Some(value),
+                        access_at_least(&access_level, SERVICE_ACCESS_USE),
+                    )
+                })
                 .unwrap_or(access_at_least(&access_level, SERVICE_ACCESS_USE)),
             can_control: entry
                 .and_then(|item| item.get("can_control"))
-                .map(|value| json_bool(Some(value), access_at_least(&access_level, SERVICE_ACCESS_CONTROL)))
+                .map(|value| {
+                    json_bool(
+                        Some(value),
+                        access_at_least(&access_level, SERVICE_ACCESS_CONTROL),
+                    )
+                })
                 .unwrap_or(access_at_least(&access_level, SERVICE_ACCESS_CONTROL)),
         }
     }
 }
 
-fn default_service_access(authenticated: bool, role: &str, groups: &[String]) -> HashMap<String, ResolvedServiceAccess> {
+fn default_service_access(
+    authenticated: bool,
+    role: &str,
+    groups: &[String],
+) -> HashMap<String, ResolvedServiceAccess> {
     let is_admin = role == "admin" || groups.iter().any(|group| group == "admin");
     let access_level = if is_admin {
         SERVICE_ACCESS_CONTROL
@@ -190,7 +221,12 @@ fn default_service_access(authenticated: bool, role: &str, groups: &[String]) ->
     )])
 }
 
-fn resolve_service_access(payload: &Value, authenticated: bool, role: &str, groups: &[String]) -> HashMap<String, ResolvedServiceAccess> {
+fn resolve_service_access(
+    payload: &Value,
+    authenticated: bool,
+    role: &str,
+    groups: &[String],
+) -> HashMap<String, ResolvedServiceAccess> {
     let mut resolved = default_service_access(authenticated, role, groups);
     let raw_service_access = payload.get("service_access");
     let mut apply_entry = |service_key: &str, raw_entry: Option<&Value>| {
@@ -252,10 +288,7 @@ impl ResolvedIdentity {
         if requirement.service_key.is_empty() {
             return true;
         }
-        let Some(entry) = self
-            .service_access
-            .get(requirement.service_key)
-        else {
+        let Some(entry) = self.service_access.get(requirement.service_key) else {
             return false;
         };
         match requirement.access_level {
@@ -272,7 +305,11 @@ fn resolve_identity(payload: &Value, default_authenticated: bool) -> Option<Reso
     let authenticated = payload
         .get("authenticated")
         .map(|value| json_bool(Some(value), default_authenticated))
-        .or_else(|| payload.get("active").map(|value| json_bool(Some(value), default_authenticated)))
+        .or_else(|| {
+            payload
+                .get("active")
+                .map(|value| json_bool(Some(value), default_authenticated))
+        })
         .unwrap_or(default_authenticated);
     let user = payload
         .get("user")
