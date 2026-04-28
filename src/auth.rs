@@ -6,7 +6,6 @@ use crate::config::{AuthConfig, OidcAuthConfig, TokenAuthConfig};
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +26,329 @@ impl AuthMode {
             "oidc" => AuthMode::Oidc,
             _ => AuthMode::Off,
         }
+    }
+}
+
+const SERVICE_ACCESS_NONE: &str = "none";
+const SERVICE_ACCESS_REQUEST: &str = "request";
+const SERVICE_ACCESS_OBSERVE: &str = "observe";
+const SERVICE_ACCESS_USE: &str = "use";
+const SERVICE_ACCESS_CONTROL: &str = "control";
+
+fn normalize_service_access_level(value: &str, fallback: &str) -> String {
+    let cleaned = value.trim().to_lowercase();
+    match cleaned.as_str() {
+        SERVICE_ACCESS_NONE
+        | SERVICE_ACCESS_REQUEST
+        | SERVICE_ACCESS_OBSERVE
+        | SERVICE_ACCESS_USE
+        | SERVICE_ACCESS_CONTROL => cleaned,
+        _ => fallback.to_string(),
+    }
+}
+
+fn access_at_least(current: &str, required: &str) -> bool {
+    let rank = |value: &str| match normalize_service_access_level(value, SERVICE_ACCESS_NONE).as_str() {
+        SERVICE_ACCESS_REQUEST => 1,
+        SERVICE_ACCESS_OBSERVE => 2,
+        SERVICE_ACCESS_USE => 3,
+        SERVICE_ACCESS_CONTROL => 4,
+        _ => 0,
+    };
+    rank(current) >= rank(required)
+}
+
+fn max_access_level(left: &str, right: &str) -> String {
+    if access_at_least(left, right) {
+        normalize_service_access_level(left, SERVICE_ACCESS_NONE)
+    } else {
+        normalize_service_access_level(right, SERVICE_ACCESS_NONE)
+    }
+}
+
+fn json_bool(value: Option<&Value>, fallback: bool) -> bool {
+    match value {
+        Some(Value::Bool(inner)) => *inner,
+        Some(Value::Number(inner)) => inner.as_i64().unwrap_or_default() != 0,
+        Some(Value::String(inner)) => matches!(
+            inner.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => fallback,
+    }
+}
+
+fn coerce_groups(value: Option<&Value>) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_group = |candidate: &str| {
+        let cleaned = candidate.trim().to_lowercase();
+        if cleaned.is_empty() || seen.contains(&cleaned) {
+            return;
+        }
+        seen.insert(cleaned.clone());
+        groups.push(cleaned);
+    };
+
+    match value {
+        Some(Value::String(inner)) => {
+            for item in inner.split(',') {
+                push_group(item);
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(group) = item.as_str() {
+                    push_group(group);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    groups
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedServiceAccess {
+    access_level: String,
+    public_access_level: String,
+    visible_access_level: String,
+    visible: bool,
+    can_request: bool,
+    can_observe: bool,
+    can_use: bool,
+    can_control: bool,
+}
+
+impl ResolvedServiceAccess {
+    fn from_value(raw: Option<&Value>, default_public: &str, default_access: &str) -> Self {
+        let entry = raw.and_then(Value::as_object);
+        let direct_access = raw.and_then(Value::as_str);
+        let access_level = normalize_service_access_level(
+            entry
+                .and_then(|item| item.get("access_level").or_else(|| item.get("level")))
+                .and_then(Value::as_str)
+                .or(direct_access)
+                .unwrap_or(default_access),
+            default_access,
+        );
+        let public_access_level = normalize_service_access_level(
+            entry
+                .and_then(|item| item.get("public_access_level"))
+                .and_then(Value::as_str)
+                .unwrap_or(default_public),
+            default_public,
+        );
+        let visible_access_level = normalize_service_access_level(
+            entry
+                .and_then(|item| item.get("visible_access_level"))
+                .and_then(Value::as_str)
+                .unwrap_or(&max_access_level(&access_level, &public_access_level)),
+            &max_access_level(&access_level, &public_access_level),
+        );
+        Self {
+            access_level: access_level.clone(),
+            public_access_level: public_access_level.clone(),
+            visible_access_level: visible_access_level.clone(),
+            visible: entry
+                .and_then(|item| item.get("visible"))
+                .map(|value| json_bool(Some(value), visible_access_level != SERVICE_ACCESS_NONE))
+                .unwrap_or(visible_access_level != SERVICE_ACCESS_NONE),
+            can_request: entry
+                .and_then(|item| item.get("can_request"))
+                .map(|value| json_bool(Some(value), access_at_least(&visible_access_level, SERVICE_ACCESS_REQUEST)))
+                .unwrap_or(access_at_least(&visible_access_level, SERVICE_ACCESS_REQUEST)),
+            can_observe: entry
+                .and_then(|item| item.get("can_observe"))
+                .map(|value| json_bool(Some(value), access_at_least(&visible_access_level, SERVICE_ACCESS_OBSERVE)))
+                .unwrap_or(access_at_least(&visible_access_level, SERVICE_ACCESS_OBSERVE)),
+            can_use: entry
+                .and_then(|item| item.get("can_use"))
+                .map(|value| json_bool(Some(value), access_at_least(&access_level, SERVICE_ACCESS_USE)))
+                .unwrap_or(access_at_least(&access_level, SERVICE_ACCESS_USE)),
+            can_control: entry
+                .and_then(|item| item.get("can_control"))
+                .map(|value| json_bool(Some(value), access_at_least(&access_level, SERVICE_ACCESS_CONTROL)))
+                .unwrap_or(access_at_least(&access_level, SERVICE_ACCESS_CONTROL)),
+        }
+    }
+}
+
+fn default_service_access(authenticated: bool, role: &str, groups: &[String]) -> HashMap<String, ResolvedServiceAccess> {
+    let is_admin = role == "admin" || groups.iter().any(|group| group == "admin");
+    let access_level = if is_admin {
+        SERVICE_ACCESS_CONTROL
+    } else if authenticated {
+        SERVICE_ACCESS_NONE
+    } else {
+        SERVICE_ACCESS_NONE
+    };
+    HashMap::from([(
+        "tracey".to_string(),
+        ResolvedServiceAccess::from_value(None, SERVICE_ACCESS_OBSERVE, access_level),
+    )])
+}
+
+fn resolve_service_access(payload: &Value, authenticated: bool, role: &str, groups: &[String]) -> HashMap<String, ResolvedServiceAccess> {
+    let mut resolved = default_service_access(authenticated, role, groups);
+    let raw_service_access = payload.get("service_access");
+    let mut apply_entry = |service_key: &str, raw_entry: Option<&Value>| {
+        let cleaned_service_key = service_key.trim().to_lowercase();
+        if cleaned_service_key.is_empty() {
+            return;
+        }
+        let default_entry = resolved.get(&cleaned_service_key);
+        let normalized = ResolvedServiceAccess::from_value(
+            raw_entry,
+            default_entry
+                .map(|entry| entry.public_access_level.as_str())
+                .unwrap_or(SERVICE_ACCESS_NONE),
+            default_entry
+                .map(|entry| entry.access_level.as_str())
+                .unwrap_or(SERVICE_ACCESS_NONE),
+        );
+        resolved.insert(cleaned_service_key, normalized);
+    };
+
+    match raw_service_access {
+        Some(Value::Object(entries)) => {
+            for (service_key, raw_entry) in entries {
+                apply_entry(service_key, Some(raw_entry));
+            }
+        }
+        Some(Value::Array(entries)) => {
+            for raw_entry in entries {
+                let Some(service_key) = raw_entry
+                    .get("service_key")
+                    .or_else(|| raw_entry.get("key"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                apply_entry(service_key, Some(raw_entry));
+            }
+        }
+        _ => {}
+    }
+
+    resolved
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedIdentity {
+    authenticated: bool,
+    user: String,
+    role: String,
+    groups: Vec<String>,
+    service_access: HashMap<String, ResolvedServiceAccess>,
+}
+
+impl ResolvedIdentity {
+    fn can_access(&self, requirement: AccessRequirement) -> bool {
+        if !self.authenticated {
+            return false;
+        }
+        if requirement.service_key.is_empty() {
+            return true;
+        }
+        let Some(entry) = self
+            .service_access
+            .get(requirement.service_key)
+        else {
+            return false;
+        };
+        match requirement.access_level {
+            SERVICE_ACCESS_REQUEST => entry.can_request,
+            SERVICE_ACCESS_OBSERVE => entry.can_observe,
+            SERVICE_ACCESS_USE => entry.can_use,
+            SERVICE_ACCESS_CONTROL => entry.can_control,
+            _ => false,
+        }
+    }
+}
+
+fn resolve_identity(payload: &Value, default_authenticated: bool) -> Option<ResolvedIdentity> {
+    let authenticated = payload
+        .get("authenticated")
+        .map(|value| json_bool(Some(value), default_authenticated))
+        .or_else(|| payload.get("active").map(|value| json_bool(Some(value), default_authenticated)))
+        .unwrap_or(default_authenticated);
+    let user = payload
+        .get("user")
+        .or_else(|| payload.get("preferred_username"))
+        .or_else(|| payload.get("username"))
+        .or_else(|| payload.get("email"))
+        .or_else(|| payload.get("sub"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let identity_type = payload
+        .get("identity_type")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| match identity_type.as_deref() {
+            Some("service_account") => "service_account".to_string(),
+            _ => "user".to_string(),
+        });
+    let mut groups = coerce_groups(payload.get("groups"));
+    if role != "service_account" && !groups.iter().any(|group| group == &role) {
+        groups.insert(0, role.clone());
+    }
+    let service_access = resolve_service_access(payload, authenticated, &role, &groups);
+    Some(ResolvedIdentity {
+        authenticated: authenticated && !user.is_empty(),
+        user,
+        role,
+        groups,
+        service_access,
+    })
+}
+
+fn static_token_identity() -> ResolvedIdentity {
+    resolve_identity(
+        &serde_json::json!({
+            "authenticated": true,
+            "user": "service-token",
+            "role": "admin",
+            "groups": ["admin"]
+        }),
+        true,
+    )
+    .expect("static token identity should always resolve")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessRequirement {
+    pub service_key: &'static str,
+    pub access_level: &'static str,
+}
+
+impl AccessRequirement {
+    pub const fn new(service_key: &'static str, access_level: &'static str) -> Self {
+        Self {
+            service_key,
+            access_level,
+        }
+    }
+
+    pub const fn tracey_observe() -> Self {
+        Self::new("tracey", SERVICE_ACCESS_OBSERVE)
+    }
+
+    pub const fn tracey_use() -> Self {
+        Self::new("tracey", SERVICE_ACCESS_USE)
+    }
+
+    pub const fn tracey_control() -> Self {
+        Self::new("tracey", SERVICE_ACCESS_CONTROL)
     }
 }
 
@@ -118,7 +440,11 @@ impl AuthGate {
         }
     }
 
-    pub async fn authorize_http(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+    pub async fn authorize_http(
+        &self,
+        headers: &HeaderMap,
+        requirement: AccessRequirement,
+    ) -> Result<(), StatusCode> {
         if !self.enabled || self.mode == AuthMode::Off {
             return Ok(());
         }
@@ -129,23 +455,37 @@ impl AuthGate {
         match self.mode {
             AuthMode::Off => Ok(()),
             AuthMode::Token => match token {
-                Some(token) => self
-                    .token_validator
-                    .as_ref()
-                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
-                    .validate(token)
-                    .await
-                    .map_err(|err| err.to_status_code()),
+                Some(token) => {
+                    let identity = self
+                        .token_validator
+                        .as_ref()
+                        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                        .validate(token)
+                        .await
+                        .map_err(|err| err.to_status_code())?;
+                    if identity.can_access(requirement) {
+                        Ok(())
+                    } else {
+                        Err(StatusCode::FORBIDDEN)
+                    }
+                }
                 None => Err(StatusCode::UNAUTHORIZED),
             },
             AuthMode::Oidc => match token {
-                Some(token) => self
-                    .oidc_validator
-                    .as_ref()
-                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
-                    .validate(token)
-                    .await
-                    .map_err(|err| err.to_status_code()),
+                Some(token) => {
+                    let identity = self
+                        .oidc_validator
+                        .as_ref()
+                        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                        .validate(token)
+                        .await
+                        .map_err(|err| err.to_status_code())?;
+                    if identity.can_access(requirement) {
+                        Ok(())
+                    } else {
+                        Err(StatusCode::FORBIDDEN)
+                    }
+                }
                 None => Err(StatusCode::UNAUTHORIZED),
             },
         }
@@ -154,6 +494,7 @@ impl AuthGate {
     pub async fn authorize_grpc(
         &self,
         metadata: &tonic::metadata::MetadataMap,
+        requirement: AccessRequirement,
     ) -> Result<(), tonic::Status> {
         if !self.enabled || self.mode == AuthMode::Off {
             return Ok(());
@@ -170,10 +511,19 @@ impl AuthGate {
                     .as_ref()
                     .ok_or_else(|| tonic::Status::unavailable("token auth not configured"))?;
                 match token {
-                    Some(token) => validator
-                        .validate(token)
-                        .await
-                        .map_err(|err| err.to_tonic_status()),
+                    Some(token) => {
+                        let identity = validator
+                            .validate(token)
+                            .await
+                            .map_err(|err| err.to_tonic_status())?;
+                        if identity.can_access(requirement) {
+                            Ok(())
+                        } else {
+                            Err(tonic::Status::permission_denied(
+                                "insufficient service access",
+                            ))
+                        }
+                    }
                     None => Err(tonic::Status::unauthenticated("missing authorization")),
                 }
             }
@@ -183,10 +533,19 @@ impl AuthGate {
                     .as_ref()
                     .ok_or_else(|| tonic::Status::unavailable("oidc not configured"))?;
                 match token {
-                    Some(token) => validator
-                        .validate(token)
-                        .await
-                        .map_err(|err| err.to_tonic_status()),
+                    Some(token) => {
+                        let identity = validator
+                            .validate(token)
+                            .await
+                            .map_err(|err| err.to_tonic_status())?;
+                        if identity.can_access(requirement) {
+                            Ok(())
+                        } else {
+                            Err(tonic::Status::permission_denied(
+                                "insufficient service access",
+                            ))
+                        }
+                    }
                     None => Err(tonic::Status::unauthenticated("missing authorization")),
                 }
             }
@@ -214,14 +573,8 @@ pub struct TokenValidator {
 
 #[derive(Debug, Clone)]
 struct TokenCacheEntry {
-    authenticated: bool,
+    identity: Option<ResolvedIdentity>,
     expires_at: Instant,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenSessionResponse {
-    authenticated: bool,
-    user: Option<String>,
 }
 
 #[derive(Debug)]
@@ -269,7 +622,7 @@ impl TokenValidator {
     }
 
     /// Validates a bearer token via the central session endpoint, with static-token fallback.
-    pub async fn validate(&self, token: &str) -> Result<(), TokenError> {
+    async fn validate(&self, token: &str) -> Result<ResolvedIdentity, TokenError> {
         let token = token.trim();
         if token.is_empty() {
             return Err(TokenError::MissingToken);
@@ -279,34 +632,35 @@ impl TokenValidator {
         }
 
         if let Some(entry) = self.cached(token).await {
-            return if entry.authenticated {
-                Ok(())
-            } else {
-                Err(TokenError::InvalidToken)
-            };
+            return entry.identity.ok_or(TokenError::InvalidToken);
         }
 
         match self.validate_central_session(token).await {
-            Ok(Some(true)) => {
-                self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
-                Ok(())
+            Ok(Some(identity)) => {
+                self.cache_result(token, Some(identity.clone()), self.cfg.cache_ttl_ms)
+                    .await;
+                Ok(identity)
             }
-            Ok(Some(false)) | Ok(None) => {
+            Ok(None) => {
                 if self.matches_static_token(token) {
-                    self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
-                    Ok(())
+                    let identity = static_token_identity();
+                    self.cache_result(token, Some(identity.clone()), self.cfg.cache_ttl_ms)
+                        .await;
+                    Ok(identity)
                 } else {
-                    self.cache_result(token, false, self.negative_cache_ttl_ms())
+                    self.cache_result(token, None, self.negative_cache_ttl_ms())
                         .await;
                     Err(TokenError::InvalidToken)
                 }
             }
             Err(err) => {
                 if self.matches_static_token(token) {
-                    self.cache_result(token, true, self.cfg.cache_ttl_ms).await;
-                    Ok(())
+                    let identity = static_token_identity();
+                    self.cache_result(token, Some(identity.clone()), self.cfg.cache_ttl_ms)
+                        .await;
+                    Ok(identity)
                 } else {
-                    self.cache_result(token, false, self.negative_cache_ttl_ms())
+                    self.cache_result(token, None, self.negative_cache_ttl_ms())
                         .await;
                     Err(err)
                 }
@@ -314,7 +668,10 @@ impl TokenValidator {
         }
     }
 
-    async fn validate_central_session(&self, token: &str) -> Result<Option<bool>, TokenError> {
+    async fn validate_central_session(
+        &self,
+        token: &str,
+    ) -> Result<Option<ResolvedIdentity>, TokenError> {
         let Some(session_url) = self
             .cfg
             .session_url
@@ -336,25 +693,17 @@ impl TokenValidator {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Ok(Some(false));
+            return Ok(None);
         }
         if status.is_server_error() || !status.is_success() {
             return Err(TokenError::ServiceUnavailable);
         }
 
         let payload = response
-            .json::<TokenSessionResponse>()
+            .json::<Value>()
             .await
             .map_err(|_| TokenError::ServiceUnavailable)?;
-        Ok(Some(
-            payload.authenticated
-                && payload
-                    .user
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_some(),
-        ))
+        Ok(resolve_identity(&payload, true).filter(|identity| identity.authenticated))
     }
 
     fn matches_static_token(&self, token: &str) -> bool {
@@ -389,7 +738,7 @@ impl TokenValidator {
         cache.remove(token)
     }
 
-    async fn cache_result(&self, token: &str, authenticated: bool, ttl_ms: u64) {
+    async fn cache_result(&self, token: &str, identity: Option<ResolvedIdentity>, ttl_ms: u64) {
         const MAX_CACHE_ENTRIES: usize = 1024;
 
         let now = Instant::now();
@@ -401,7 +750,7 @@ impl TokenValidator {
         cache.insert(
             token.to_string(),
             TokenCacheEntry {
-                authenticated,
+                identity,
                 expires_at: now + Duration::from_millis(ttl_ms.max(1)),
             },
         );
@@ -480,7 +829,7 @@ impl OidcValidator {
     }
 
     /// Validates a JWT against configured issuer/JWKS/audience/scope rules.
-    pub async fn validate(&self, token: &str) -> Result<(), OidcError> {
+    async fn validate(&self, token: &str) -> Result<ResolvedIdentity, OidcError> {
         if token.trim().is_empty() {
             return Err(OidcError::MissingToken);
         }
@@ -527,7 +876,9 @@ impl OidcValidator {
                 return Err(OidcError::ScopeMismatch);
             }
         }
-        Ok(())
+        resolve_identity(&data.claims, true)
+            .filter(|identity| identity.authenticated)
+            .ok_or(OidcError::InvalidToken)
     }
 
     async fn jwks(&self) -> Result<JwkSet, OidcError> {
@@ -722,6 +1073,80 @@ mod tests {
         });
 
         assert!(validator.validate("central-token").await.is_ok());
+        handle.abort();
+    }
+
+    #[test]
+    fn resolve_identity_defaults_to_public_tracey_observe_for_authenticated_users() {
+        let identity = resolve_identity(
+            &json!({
+                "authenticated": true,
+                "user": "pbisaacs",
+                "role": "user",
+                "groups": ["user"]
+            }),
+            true,
+        )
+        .expect("identity should resolve");
+
+        assert!(identity.can_access(AccessRequirement::tracey_observe()));
+        assert!(!identity.can_access(AccessRequirement::tracey_use()));
+        assert!(!identity.can_access(AccessRequirement::tracey_control()));
+    }
+
+    #[test]
+    fn resolve_identity_preserves_explicit_service_account_groups() {
+        let identity = resolve_identity(
+            &json!({
+                "authenticated": true,
+                "identity_type": "service_account",
+                "user": "tracey-sync",
+                "role": "service_account",
+                "groups": ["ops"]
+            }),
+            true,
+        )
+        .expect("identity should resolve");
+
+        assert_eq!(identity.role, "service_account");
+        assert_eq!(identity.groups, vec!["ops".to_string()]);
+        assert!(identity.can_access(AccessRequirement::tracey_observe()));
+        assert!(!identity.can_access(AccessRequirement::tracey_use()));
+    }
+
+    #[tokio::test]
+    async fn token_validator_resolves_service_access_from_central_session() {
+        let (base_url, handle) = spawn_session_server(
+            axum::http::StatusCode::OK,
+            json!({
+                "authenticated": true,
+                "user": "pbisaacs",
+                "role": "user",
+                "groups": ["user"],
+                "service_access": {
+                    "tracey": {
+                        "service_key": "tracey",
+                        "access_level": "use",
+                        "public_access_level": "observe"
+                    }
+                }
+            }),
+        )
+        .await;
+        let validator = TokenValidator::new(TokenAuthConfig {
+            session_url: Some(format!("{}/api/session", base_url)),
+            static_token: None,
+            cache_ttl_ms: 15_000,
+            http_timeout_ms: 1_000,
+        });
+
+        let identity = validator
+            .validate("central-token")
+            .await
+            .expect("central token should resolve");
+        assert!(identity.can_access(AccessRequirement::tracey_observe()));
+        assert!(identity.can_access(AccessRequirement::tracey_use()));
+        assert!(!identity.can_access(AccessRequirement::tracey_control()));
         handle.abort();
     }
 

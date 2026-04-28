@@ -3,7 +3,7 @@
 //! Metrics are normalized into Tracey `Event` records with optional
 //! deduplication when Prometheus is the preferred source.
 
-use crate::auth::{AuthGate, AuthSystem};
+use crate::auth::{AccessRequirement, AuthGate, AuthSystem};
 use crate::bus::EventBus;
 use crate::config::{OtlpReceiverConfig, TelemetryConfig};
 use crate::event::{Event, EventKind, Severity};
@@ -940,7 +940,11 @@ impl MetricsService for OtlpService {
         request: tonic::Request<ExportMetricsServiceRequest>,
     ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
         let headers = metadata_to_header_map(request.metadata());
-        if let Err(status) = self.auth.authorize_grpc(request.metadata()).await {
+        if let Err(status) = self
+            .auth
+            .authorize_grpc(request.metadata(), AccessRequirement::tracey_use())
+            .await
+        {
             observe_otlp_grpc_request(
                 &self.probe_watch,
                 &headers,
@@ -1034,7 +1038,11 @@ async fn otlp_http_handler(
         .await;
         return Ok(StatusCode::METHOD_NOT_ALLOWED);
     }
-    if let Err(code) = state.auth.authorize_http(&headers).await {
+    if let Err(code) = state
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_use())
+        .await
+    {
         observe_otlp_http_request(
             &state.probe_watch,
             remote_addr,

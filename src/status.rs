@@ -3,7 +3,7 @@
 //! Includes posture-aware snapshots, TraceyBan summaries, and TraceyGuard
 //! status/control endpoints with optional auth gating.
 
-use crate::auth::AuthGate;
+use crate::auth::{AccessRequirement, AuthGate};
 use crate::continuum_loop::{ContinuumLoopSnapshot, derive_continuum_loop_snapshot};
 use crate::coordination::{Coordination, CoordinatorRole};
 use crate::event::now_ms;
@@ -174,7 +174,11 @@ async fn status_handler(
     headers: HeaderMap,
 ) -> Result<Json<StatusSnapshot>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_observe())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -239,7 +243,11 @@ async fn tracey_ban_handler(
     headers: HeaderMap,
 ) -> Result<Json<crate::tracey_ban::TraceyBanStatusSnapshot>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_observe())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -292,7 +300,11 @@ async fn tracey_ban_control_handler(
     Json(request): Json<crate::tracey_ban::TraceyBanControlRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_control())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -350,7 +362,11 @@ async fn tracey_guard_handler(
     headers: HeaderMap,
 ) -> Result<Json<crate::tracey_guard::TraceyGuardStatusSnapshot>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_observe())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -403,7 +419,11 @@ async fn tracey_guard_control_handler(
     Json(request): Json<crate::tracey_guard::TraceyGuardControlRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_control())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -461,7 +481,11 @@ async fn probe_watch_handler(
     headers: HeaderMap,
 ) -> Result<Json<crate::probe_watch::ProbeWatchSnapshot>, StatusCode> {
     let remote = remote.map(|value| value.0);
-    if let Err(code) = service.auth.authorize_http(&headers).await {
+    if let Err(code) = service
+        .auth
+        .authorize_http(&headers, AccessRequirement::tracey_observe())
+        .await
+    {
         observe_status_request(
             &service,
             remote,
@@ -1300,6 +1324,7 @@ mod tests {
     use crate::storage::Storage;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use axum::{Json, routing::get};
     use proptest::prelude::*;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1310,12 +1335,16 @@ mod tests {
         runtime: crate::tracey_guard::TraceyGuardRuntimeHandle,
         shutdown: Shutdown,
         log_path: PathBuf,
+        session_handle: Option<tokio::task::JoinHandle<()>>,
     }
 
     impl TraceyGuardRouteHarness {
         async fn cleanup(self) {
             self.shutdown.trigger();
             tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(handle) = self.session_handle {
+                handle.abort();
+            }
             let _ = tokio::fs::remove_file(&self.log_path).await;
         }
     }
@@ -1325,7 +1354,13 @@ mod tests {
         cfg.agent_id = "status-test-agent".to_string();
         cfg.tracey_guard.synthetic_devices = 1;
         cfg.tracey_guard.max_devices = 1;
+        tracey_guard_harness_with_config(cfg, None).await
+    }
 
+    async fn tracey_guard_harness_with_config(
+        cfg: Config,
+        session_handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> TraceyGuardRouteHarness {
         let coordination = Coordination::new(
             cfg.agent_id.clone(),
             cfg.coordination.clone(),
@@ -1397,7 +1432,31 @@ mod tests {
             runtime,
             shutdown,
             log_path,
+            session_handle,
         }
+    }
+
+    async fn spawn_session_server(
+        status: StatusCode,
+        payload: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock session server");
+        let addr = listener.local_addr().expect("mock session server addr");
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let payload = payload.clone();
+                async move { (status, Json(payload)) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run mock session server");
+        });
+        (format!("http://{}", addr), handle)
     }
 
     async fn request_json(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -1545,6 +1604,66 @@ mod tests {
             reflected["control"]["overhead_budget_pct"].as_f64(),
             Some(7.5)
         );
+
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn tracey_guard_routes_enforce_observe_vs_control_access() {
+        let (base_url, session_handle) = spawn_session_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "authenticated": true,
+                "user": "observer",
+                "role": "user",
+                "groups": ["user"],
+                "service_access": {
+                    "tracey": {
+                        "service_key": "tracey",
+                        "access_level": "none",
+                        "public_access_level": "observe"
+                    }
+                }
+            }),
+        )
+        .await;
+        let mut cfg = Config::default();
+        cfg.agent_id = "status-authz-test-agent".to_string();
+        cfg.tracey_guard.synthetic_devices = 1;
+        cfg.tracey_guard.max_devices = 1;
+        cfg.auth.mode = "token".to_string();
+        cfg.auth.token.session_url = Some(format!("{}/api/session", base_url));
+        let harness = tracey_guard_harness_with_config(cfg, Some(session_handle)).await;
+        wait_for_runtime_snapshot(&harness.runtime).await;
+
+        let (observe_status, _) = request_json(
+            &harness.app,
+            Request::builder()
+                .uri("/tracey_guard")
+                .header("authorization", "Bearer observe-token")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(observe_status, StatusCode::OK);
+
+        let (control_status, _) = request_json(
+            &harness.app,
+            Request::builder()
+                .method("POST")
+                .uri("/control/tracey_guard")
+                .header("authorization", "Bearer observe-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "enabled": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(control_status, StatusCode::FORBIDDEN);
 
         harness.cleanup().await;
     }

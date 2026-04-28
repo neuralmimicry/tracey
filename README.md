@@ -27,10 +27,10 @@ The current code does all of the following:
 - always attempts Slurm/Continuum environment detection and folds the result into capability tags and status snapshots when a local deployment is detected
 - enables the HTTP status surface by default on `0.0.0.0:48000`
 - always maintains bounded Continuum telemetry and inferred location snapshots for the status and dashboard surfaces
-- always derives a Continuum closed-loop `plan / ramp / optimize / repeat` snapshot from autoscaler, assessment, telemetry, TraceyGuard, loader-threat, and Slurm state
-- leaves `auth.mode` off by default, which means status and TraceyGuard control routes are unauthenticated unless you explicitly enable OIDC
+- always derives a Continuum closed-loop `plan / ramp / optimise / repeat` snapshot from autoscaler, assessment, telemetry, TraceyGuard, loader-threat, and Slurm state
+- leaves `auth.mode` off by default, which means status, TraceyBan, TraceyGuard, and protected OTLP routes are unauthenticated unless you explicitly enable token or OIDC auth
 - enables the Prometheus log exporter by default, which probes `https://prometheus.neuralmimicry.ai/-/ready` unless reconfigured or disabled
-- ships Continuum assessment and autoscaler integrations, but both sanitize off until a Continuum base URL is configured and the autoscaler also has recruit hosts
+- ships Continuum assessment and autoscaler integrations, but both sanitise off until a Continuum base URL is configured and the autoscaler also has recruit hosts
 
 That default profile is useful for local evaluation and continuous self-exercise, but it is not a hardened deployment baseline.
 
@@ -42,7 +42,7 @@ That default profile is useful for local evaluation and continuous self-exercise
 | Embedded collectors | On | Linux-only; publishes CPU, memory, disk, network, process, battery, Jetson, and GPU metrics, including low-overhead socket-to-process attribution on Linux. |
 | TraceyGuard | On | Discovers GPUs where possible, otherwise creates synthetic devices and synthetic probe activity. |
 | Discovery gossip | On | Broadcast UDP with a shared-key MAC; default key is a development placeholder. |
-| Status API | On | Binds to `0.0.0.0:48000`; authorisation is off until OIDC is enabled. |
+| Status API | On | Binds to `0.0.0.0:48000`; authorisation is off until token or OIDC auth is enabled. |
 | Prometheus log export | On | Depends on status being enabled; exposes `/metrics` and signed `/prometheus/ingest`. |
 | Slurm detection | On | Best-effort native and Continuum Podman detection; contributes capability tags and status snapshots when found. |
 | Continuum telemetry snapshot | On | Always builds bounded host, GPU, action, probe, and attributed network telemetry for `/status` and page 3 of the dashboard. |
@@ -103,7 +103,7 @@ When `--status` is omitted, the dashboard prefers a reachable local `tracey` or 
 
 No-scheme loopback targets default to `http://`; other no-scheme dashboard targets default to `https://`. The header shows `🔒 https` or `🔓 http` for the active status connection.
 
-The dashboard now has three pages: an overview page with the closed-loop `plan / ramp / optimize / repeat` summary plus autoscaler and Slurm context, a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency, and a telemetry page for Continuum host, GPU, action, and probe snapshots.
+The dashboard now has three pages: an overview page with the closed-loop `plan / ramp / optimise / repeat` summary plus autoscaler and Slurm context, a location page with fuzzy host/site/building/room/network inference plus a text cluster map built from local system facts, discovered peers, capability tags, and observed gossip latency, and a telemetry page for Continuum host, GPU, action, and probe snapshots.
 
 Location confidence improves when the runtime can see direct hints. `TRACEY_SITE`, `TRACEY_BUILDING`, `TRACEY_ROOM`, and `TRACEY_GEO` are consumed automatically, propagated through discovery capability tags, and reused by the location page when peers are close enough to share the same inferred room/building/site.
 
@@ -159,7 +159,7 @@ Operator CLI notes:
 
 | Surface | Default bind | Protocol | Purpose | Security note |
 | --- | --- | --- | --- | --- |
-| Status API | `0.0.0.0:48000` | HTTP | `/status`, `/health`, `/ready`, TraceyBan and TraceyGuard views/control, `/metrics`, `/prometheus/ingest` | Open by default unless OIDC is enabled; `/metrics` is never OIDC-gated. |
+| Status API | `0.0.0.0:48000` | HTTP | `/status`, `/health`, `/ready`, TraceyBan and TraceyGuard views/control, `/metrics`, `/prometheus/ingest` | Open by default unless token or OIDC auth is enabled; `/metrics` is never auth-gated. |
 | Discovery | `0.0.0.0:47990` to broadcast `255.255.255.255:47990` | UDP | Peer presence, capability, ban, fault, Slurm, and Prometheus-probe gossip | Shared-key authenticated, but not encrypted. |
 | Loader gossip | `0.0.0.0:47989` | UDP | Loader peer announcements for distributable cores | Shared-key authenticated, not encrypted. |
 | Loader transfer | `0.0.0.0:47988` | HTTP | Health, loader status, current core metadata, signature, and bundle | Plain HTTP; integrity is checked after download. |
@@ -182,6 +182,16 @@ When `status.enabled` is true, the Axum server exposes:
 The `/status` payload currently carries posture and coordination state plus optional TraceyGuard, Slurm, Continuum autoscaler/assessment/telemetry, resource-forecast projections, the derived `continuum_loop`, loader-threat, and inferred self/peer location snapshots.
 
 The operator CLI subcommands `tracey status`, `tracey tracey-ban ...`, and `tracey tracey-guard ...` are thin wrappers over these same routes.
+
+When auth is enabled, Tracey resolves the shared Customers-style `service_access` contract from the central session payload or OIDC claims and enforces it per route:
+
+- `tracey:observe`: `/status`, `/health`, `/ready`, `/tracey_ban`, `/tracey_guard`, `/tracey_guard/deepdive`, `/probe_watch`
+- `tracey:control`: `/control/tracey_ban`, `/control/tracey_guard`
+- `tracey:use`: protected OTLP HTTP and OTLP gRPC ingest routes
+
+Customers-issued service-account bearer tokens are supported for backend-to-backend calls. They keep only their explicit groups and public visibility, so Tracey never grants them extra human fallback access.
+
+Static bearer tokens remain admin-equivalent and map to `tracey:control`.
 
 ### Loader transfer routes
 
@@ -228,7 +238,7 @@ A minimal hardened starting point usually needs to:
 
 1. rotate `discovery.shared_key` and `update.shared_key`, or disable those subsystems
 2. move `status.listen_addr` to loopback or place it behind a reverse proxy
-3. enable OIDC if the status or OTLP surfaces are reachable beyond a tightly controlled network
+3. enable token or OIDC auth if the status or OTLP surfaces are reachable beyond a tightly controlled network
 4. decide whether synthetic sensors, TraceyGuard synthetic fallback, and Prometheus exporter probing are acceptable for the environment
 5. disable any default-on subsystem that is not wanted operationally
 
@@ -334,7 +344,7 @@ See `[docs/OPERATIONS.md](docs/OPERATIONS.md)` for operational detail.
 
 GitHub Actions release automation lives in `.github/workflows/build-and-release.yml`.
 
-Current behavior:
+Current behaviour:
 
 - every pull request and push to `main` runs the Rust verification job
 - the verification job runs `scripts/preflight.sh`, smoke-tests `tracey --tui --help`, and shell-syntax checks the release scripts
@@ -352,10 +362,10 @@ The repository contains real security controls, but several surfaces are intenti
 
 Important examples:
 
-- OIDC support exists, but `auth.mode` defaults to `off`
+- token and OIDC auth support exist, but `auth.mode` defaults to `off`
 - discovery, update, loader gossip, and Prometheus follower forwarding use symmetric shared-key MACs rather than asymmetric signatures
 - the loader transfer server and status server are plain HTTP unless you add TLS externally
-- `/metrics` is not OIDC-gated and should be protected with network controls or a reverse proxy
+- `/metrics` is not auth-gated and should be protected with network controls or a reverse proxy
 - `TraceyBan` action hooks run shell commands from configuration and may require root access
 
 Detailed guidance is in `[SECURITY.md](SECURITY.md)`. Compliance posture notes are in `[COMPLIANCE.md](COMPLIANCE.md)`.
@@ -382,4 +392,4 @@ cargo run --locked --bin tracey -- --tui --help
 cargo run --locked --bin tracey-top -- --help
 ```
 
-Result: **171 tests passed, 0 failed**. The dashboard help commands still matched the documented three-page interface and the operator CLI help/catalog commands matched the documented `tracey-ban` and `tracey-guard` surfaces.
+Result: **171 tests passed, 0 failed**. The dashboard help commands still matched the documented three-page interface and the operator CLI help/catalogue commands matched the documented `tracey-ban` and `tracey-guard` surfaces.

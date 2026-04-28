@@ -34,6 +34,6 @@ Practical parity means TraceyBan can ingest real authentication failures from fi
 
 ## Optional Next Steps For Broader Upstream Compatibility
 - [ ] Add broader legacy filter macro/interpolation compatibility for imported filter files
-- [ ] Expand the built-in filter catalog beyond SSH to common web/app auth surfaces
+- [ ] Expand the built-in filter catalogue beyond SSH to common web/app auth surfaces
 - [ ] Add hostname-based ignore resolution alongside exact IP and CIDR matching
 - [ ] Add regression fixtures for common auth log formats and journal transcripts

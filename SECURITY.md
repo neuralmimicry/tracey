@@ -1,6 +1,6 @@
 # Security Notes
 
-This document describes the security mechanisms that are actually present in the repository as of **7 April 2026**. It is intentionally narrower and more precise than a marketing-style security overview.
+This document describes the security mechanisms that are actually present in the repository as of **28 April 2026**. It is intentionally narrower and more precise than a marketing-style security overview.
 
 The project contains meaningful controls, but it is not secure by default in every deployment shape. Several network surfaces are enabled or reachable without authorisation until you explicitly harden them.
 
@@ -8,11 +8,12 @@ The project contains meaningful controls, but it is not secure by default in eve
 
 Tracey currently relies on three different trust patterns.
 
-### 1. Optional OIDC for operator-facing HTTP and OTLP routes
+### 1. Optional token or OIDC auth for operator-facing HTTP and OTLP routes
 
 `src/auth.rs` implements an `AuthGate` that can protect:
 
 - status routes
+- TraceyBan status and control routes
 - TraceyGuard status and control routes
 - OTLP HTTP ingest
 - OTLP gRPC ingest
@@ -24,7 +25,14 @@ Important defaults:
 - `protect_otlp_http` defaults to `true`, but again only matters once auth mode is enabled
 - `protect_otlp_grpc` defaults to `false`
 
-In other words, the code supports OIDC, but it does not enable it automatically.
+When auth is enabled, the gate no longer treats every authenticated token as equivalent. It resolves the shared `service_access.tracey` claim and enforces:
+
+- `tracey:observe` for status and read-only Tracey surfaces
+- `tracey:control` for TraceyBan and TraceyGuard control routes
+- `tracey:use` for protected OTLP ingest routes
+
+Token mode can validate against the central session endpoint and can still fall back to a static admin-equivalent bearer token. OIDC mode uses JWT claims directly.
+Customers-issued service-account tokens stay least-privilege by default: they keep their explicit groups, inherit public visibility only, and require an explicit `service_access.tracey` grant for anything beyond observation.
 
 ### 2. Shared-key MACs for distributed internal trust
 
@@ -123,11 +131,11 @@ Resource-bounding is also a security and resilience concern. The code currently 
 
 These are the most important code-backed caveats.
 
-### Status API is open unless you enable OIDC
+### Status API is open unless you enable token or OIDC auth
 
 `status.enabled` defaults to true, `status.listen_addr` defaults to `0.0.0.0:48000`, and `auth.mode` defaults to `off`.
 
-That means the following routes are open by default unless you add network controls or enable OIDC:
+That means the following routes are open by default unless you add network controls or enable token or OIDC auth:
 
 - `/status`
 - `/health`
@@ -138,7 +146,7 @@ That means the following routes are open by default unless you add network contr
 
 If that is unacceptable in your environment, move the bind address to loopback immediately or place the service behind a reverse proxy or service mesh with transport security and authentication.
 
-### `/metrics` is not OIDC-gated
+### `/metrics` is not auth-gated
 
 The Prometheus exposition route does not call `AuthGate` at all.
 
@@ -235,9 +243,9 @@ This means a discovery-key compromise can also affect pertinent-log forwarding a
 Recommended hardening steps:
 
 1. bind to loopback unless remote access is genuinely needed
-2. enable OIDC and test both status and OTLP paths explicitly
+2. enable token or OIDC auth and test both status and OTLP paths explicitly
 3. add TLS at a reverse proxy, ingress controller, or service mesh layer
-4. restrict `/control/tracey_guard` to a minimal operator audience
+4. restrict `tracey:control` routes such as `/control/tracey_guard` to a minimal operator audience
 
 ### Discovery and loader gossip
 
@@ -260,7 +268,7 @@ Recommended hardening steps:
 Recommended hardening steps:
 
 1. keep OTLP listeners on loopback unless there is a specific remote-ingest design
-2. enable OIDC before opening OTLP listeners beyond a trusted local host
+2. enable token or OIDC auth before opening OTLP listeners beyond a trusted local host
 3. review the allowlist settings so Tracey only accepts metrics it is expected to process
 
 ## Logging, Audit, and Evidence Value
@@ -294,9 +302,9 @@ The runtime always starts synthetic sensors, and TraceyGuard can synthesise devi
 
 Neither the status server nor the loader transfer server terminates TLS natively.
 
-### No RBAC beyond route-level gate choices
+### Route-level authorisation is coarse but not binary
 
-OIDC support allows token validation and scope checks, but there is no finer-grained role model within the application itself.
+Tracey now enforces `tracey:observe`, `tracey:use`, and `tracey:control` at the route boundary, but it does not yet implement a richer object-level or tenant-level policy model inside individual handlers.
 
 ### Shared-key model concentrates trust
 
@@ -313,7 +321,7 @@ Those are not accidental omissions in the documentation; they reflect the actual
 
 1. Set `discovery.shared_key` and `update.shared_key` to non-default secrets, or disable those subsystems.
 2. Move `status.listen_addr` to loopback or place the service behind a protected ingress path.
-3. Enable `auth.mode=oidc` and configure issuer, audiences, and scopes before exposing status or OTLP routes.
+3. Enable `auth.mode=token` or `auth.mode=oidc`, then verify the expected `service_access.tracey` grants before exposing status or OTLP routes.
 4. Disable the Prometheus exporter if you do not need pertinent-log aggregation or external probe traffic.
 5. Review whether TraceyGuard synthetic behaviour and always-on synthetic sensors are appropriate for the target environment.
 6. Treat TraceyBan configuration and action templates as privileged code and prefer system-scope service installs when root access is genuinely required.

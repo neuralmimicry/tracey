@@ -71,7 +71,7 @@ cargo run --bin tracey-top -- --help
 Behaviour:
 
 - `tracey --tui` and `tracey-top` expose the same dashboard interface
-- page 1 is the overview with the derived `plan / ramp / optimize / repeat` loop, page 2 is locations, and page 3 is Continuum telemetry
+- page 1 is the overview with the derived `plan / ramp / optimise / repeat` loop, page 2 is locations, and page 3 is Continuum telemetry
 - current options are `--status`, `--bearer`, `--log-path` or `--no-log`, `--refresh-ms`, and `--tail-bytes`
 - when `--status` is omitted, the dashboard prefers a reachable local agent instead of starting duplicate collectors
 - the minimum supported terminal size is `120x33`
@@ -101,7 +101,7 @@ Operational notes:
 
 - `tracey status` reads `/status`
 - `tracey tracey-ban status|ban|unban|refresh-backend` read or write `/tracey_ban` and `/control/tracey_ban`
-- `tracey tracey-ban filters|actions` print the built-in filter and action catalogs without contacting the API
+- `tracey tracey-ban filters|actions` print the built-in filter and action catalogues without contacting the API
 - `tracey tracey-guard status` reads `/tracey_guard`
 - `tracey tracey-guard enable|disable|deep-dive|tmr|set-overhead|set-parallelism|force-scan` write `/control/tracey_guard`
 - `--addr`, `TRACEY_STATUS_ADDR`, `status.public_addr`, and `status.listen_addr` are resolved in that order
