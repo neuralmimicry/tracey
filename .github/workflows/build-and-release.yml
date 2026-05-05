@@ -60,9 +60,9 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -195,11 +195,10 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
-          rustup target add "${{ matrix.rust_target }}"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -337,11 +336,10 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
-          rustup target add "${{ matrix.rust_target }}"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v5
