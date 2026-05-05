@@ -323,7 +323,7 @@ jobs:
             archive_format: tar.gz
             binary_suffix: ""
             supports_update_bundle: false
-          - runner: ubuntu-24.04
+          - runner: X64
             rust_target: aarch64-linux-android
             platform: android-arm64
             archive_format: tar.gz
@@ -454,7 +454,7 @@ jobs:
       - release-meta
       - package-linux
       - package-release
-    runs-on: [self-hosted, Linux, ubuntu-latest]
+    runs-on: [self-hosted, Linux, X64]
     if: >-
       always() &&
       needs.release-meta.outputs.publish_release == 'true' &&
