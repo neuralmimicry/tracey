@@ -291,14 +291,18 @@ For direct repository runs:
 
 ```bash
 cargo run
+bash scripts/preflight.sh
+bash scripts/preflight.sh --ci
+bash scripts/derive-version.sh
 cargo test --all-targets
 ```
 
-Current verified result on **7 April 2026**:
+Current verified result on **5 May 2026**:
 
-- `cargo test --all-targets` passed with `145 passed, 0 failed`
+- `scripts/preflight.sh --ci` passed with `201 passed, 0 failed`
 - `cargo run --locked --bin tracey -- --tui --help` printed the current three-page dashboard help
 - `cargo run --locked --bin tracey-top -- --help` matched the same interface
+- `scripts/package-release.sh --skip-preflight` produced a Linux x86_64 archive, an `amd64` Debian package, and a passing checksum file
 
 Practical expectations for an unconfigured run:
 
@@ -309,6 +313,26 @@ Practical expectations for an unconfigured run:
 - Continuum telemetry and inferred location snapshots are available on `/status` and in the dashboard even before any external Continuum service is configured
 - Continuum assessment and Continuum autoscaler remain disabled until a Continuum base URL is configured
 - Prometheus pertinent-log export begins probing `https://prometheus.neuralmimicry.ai/-/ready`
+
+## CI and Release Workflow
+
+The repository uses `.github/workflows/build-and-release.yml` as the single GitHub Actions entry point for verification, version tags, packaging, and release publication.
+
+Workflow behaviour:
+
+- pull requests run verification only
+- default-branch pushes run verification and then create an immutable annotated tag named from the runtime build version, such as `v0.2.0042`
+- default-branch pushes also package release artifacts and create or update the GitHub release for that tag
+- non-default branch pushes verify only, avoiding release-tag collisions across divergent branch histories
+- manual `workflow_dispatch` runs can package any ref, and publish only when `publish_release` is enabled
+
+The workflow deliberately reuses repository scripts:
+
+- `scripts/derive-version.sh` derives `TRACEY_BUILD_VERSION`, `TRACEY_RELEASE_VERSION`, the git commit, and the `v<build-version>` tag from the same inputs as `build.rs`
+- `scripts/preflight.sh --ci` runs formatting, build graph checks, clippy, and tests
+- `scripts/package-release.sh --skip-preflight` packages already-verified builds in the release matrix
+
+Default release artifacts cover Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64. Linux jobs also emit `.deb` packages. When `TRACEY_UPDATE_KEY` is configured and signing is enabled, the package jobs attach signed update bundles for the loader/update pipeline.
 
 ## Loader Bootstrap Workflow
 

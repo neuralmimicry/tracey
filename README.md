@@ -342,19 +342,20 @@ See `[docs/OPERATIONS.md](docs/OPERATIONS.md)` for operational detail.
 
 ## GitHub Release Workflow
 
-GitHub Actions release automation lives in `.github/workflows/build-and-release.yml`.
+GitHub Actions automation lives in `.github/workflows/build-and-release.yml`.
 
 Current behaviour:
 
-- every pull request and push to `main` runs the Rust verification job
-- the verification job runs `scripts/preflight.sh`, smoke-tests `tracey --tui --help`, and shell-syntax checks the release scripts
-- pushing a `v*` tag packages release artifacts for Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64, iOS arm64, and Android arm64, then publishes a GitHub release
-- manual `workflow_dispatch` runs can package artifacts from any ref
-- manual publishing is allowed only when the workflow is run against a `v*` tag ref and `publish_release` is enabled
-- release packaging emits per-platform archives plus checksum files; Linux packages also include optional signed `tracey.update` bundles when signing is enabled
-- iOS and Android outputs are raw target binaries packaged for distribution and testing, not signed app-store bundles
+- every pull request and branch push runs one canonical verification job via `scripts/preflight.sh --ci`
+- successful default-branch pushes create an immutable annotated version tag for the pushed commit
+- generated tags use the same git-aware build version reported by `tracey --version`, for example `v0.2.0042`
+- default-branch pushes also package artifacts and create or update the GitHub release for that tag
+- non-default branch pushes verify only, avoiding release-tag collisions across divergent branch histories
+- manual `workflow_dispatch` runs can package any selected ref, and publish only when `publish_release` is enabled
+- release packaging reuses `scripts/package-release.sh` and emits per-platform archives plus checksum files for Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64
+- Linux release jobs also produce `.deb` packages for `amd64` and `arm64`
 
-If the repository secret `TRACEY_UPDATE_KEY` is configured, tagged releases automatically attach signed update artifacts compatible with the loader/update pipeline.
+`scripts/derive-version.sh` is the shared metadata helper for workflow outputs, local inspection, and release tags. If the repository secret `TRACEY_UPDATE_KEY` is configured and signing is enabled, release jobs attach signed `tracey.update` artifacts compatible with the loader/update pipeline.
 
 ## Security and Compliance Notes
 
@@ -380,16 +381,18 @@ Detailed guidance is in `[SECURITY.md](SECURITY.md)`. Compliance posture notes a
 
 ## Local Verification
 
-Last locally verified on **8 April 2026**:
+Last locally verified on **5 May 2026**:
 
 ```bash
 bash scripts/preflight.sh
-cargo test
+bash scripts/preflight.sh --ci
+bash scripts/derive-version.sh
 cargo run --locked --bin tracey -- --help
 cargo run --locked --bin tracey -- tracey-ban actions
 cargo run --locked --bin tracey -- tracey-guard --help
 cargo run --locked --bin tracey -- --tui --help
 cargo run --locked --bin tracey-top -- --help
+bash scripts/package-release.sh --version "$(bash scripts/derive-version.sh --build-version)" --output-dir ./dist --platform linux-x86_64 --archive-format tar.gz --deb-arch amd64 --skip-preflight
 ```
 
-Result: **171 tests passed, 0 failed**. The dashboard help commands still matched the documented three-page interface and the operator CLI help/catalogue commands matched the documented `tracey-ban` and `tracey-guard` surfaces.
+Result: **201 tests passed, 0 failed** through `scripts/preflight.sh --ci`. The package smoke test produced a Linux x86_64 archive, an `amd64` Debian package, and a passing checksum file.

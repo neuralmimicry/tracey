@@ -34,22 +34,22 @@ fn main() {
         "default"
     };
 
-    if build_number.is_none() {
-        if let Some(value) =
+    if build_number.is_none()
+        && let Some(value) =
             git_output(&["rev-list", "--count", "HEAD"]).and_then(|raw| raw.parse::<u64>().ok())
-        {
-            build_number = Some(value);
-            source = "git";
-        }
+    {
+        build_number = Some(value);
+        source = "git";
     }
 
     let build_number = build_number.unwrap_or(0);
     let mut build_version = format!("{major}.{minor}.{build_number:04}");
-    if let Some(value) = explicit_version.as_deref() {
-        if is_build_version(value) {
-            build_version = value.to_string();
-            source = "env";
-        }
+    if let Some(value) = explicit_version
+        .as_deref()
+        .filter(|value| is_build_version(value))
+    {
+        build_version = value.to_string();
+        source = "env";
     }
 
     let commit = env_first(&["GIT_COMMIT", "TRACEY_GIT_COMMIT"])

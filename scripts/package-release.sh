@@ -16,6 +16,7 @@ Options:
   --binary-suffix SUFFIX      Binary suffix in packaged filenames (for example .exe).
   --deb-arch ARCH             Also build a Debian package for linux using ARCH (amd64 or arm64).
   --skip-build                Reuse existing release binaries instead of building them.
+  --skip-preflight            Skip scripts/preflight.sh before building.
   --sign-update               Generate tracey.update(.meta.json/.sig) with TRACEY_UPDATE_KEY.
   -h, --help                  Show this help text.
 
@@ -107,7 +108,11 @@ run_preflight_checks() {
 build_binaries() {
   local args
   local cmd
-  run_preflight_checks
+  if (( ! SKIP_PREFLIGHT )); then
+    run_preflight_checks
+  else
+    log "skipping preflight checks"
+  fi
   args=(cargo build --locked --release --bin tracey --bin tracey-loader)
   if [[ -n "$TARGET_TRIPLE" ]]; then
     args+=(--target "$TARGET_TRIPLE")
@@ -274,6 +279,7 @@ ARCHIVE_FORMAT=
 BINARY_SUFFIX=
 DEB_ARCH=
 SKIP_BUILD=0
+SKIP_PREFLIGHT=0
 SIGN_UPDATE=0
 BUILD_AS_USER=
 
@@ -316,6 +322,9 @@ while (($#)); do
       ;;
     --skip-build)
       SKIP_BUILD=1
+      ;;
+    --skip-preflight)
+      SKIP_PREFLIGHT=1
       ;;
     --sign-update)
       SIGN_UPDATE=1
