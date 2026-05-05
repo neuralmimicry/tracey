@@ -302,7 +302,7 @@ Current verified result on **5 May 2026**:
 - `scripts/preflight.sh --ci` passed with `201 passed, 0 failed`
 - `cargo run --locked --bin tracey -- --tui --help` printed the current three-page dashboard help
 - `cargo run --locked --bin tracey-top -- --help` matched the same interface
-- `scripts/package-release.sh --skip-preflight` produced a Linux x86_64 archive, an `amd64` Debian package, and a passing checksum file
+- `scripts/package-release.sh --skip-preflight` produced a Linux `amd64` archive, an `amd64` Debian package, and a passing checksum file
 
 Practical expectations for an unconfigured run:
 
@@ -320,10 +320,10 @@ The repository uses `.github/workflows/build-and-release.yml` as the single GitH
 
 Workflow behaviour:
 
-- pull requests run verification only
-- default-branch pushes run verification and then create an immutable annotated tag named from the runtime build version, such as `v0.2.0042`
-- default-branch pushes also package release artifacts and create or update the GitHub release for that tag
-- non-default branch pushes verify only, avoiding release-tag collisions across divergent branch histories
+- pull requests run Linux `amd64` and `arm64` verification only
+- default-branch pushes run verification and packaging before creating an immutable annotated tag named from the runtime build version, such as `v0.2.0042`
+- default-branch pushes create or update the GitHub release only after every package job has produced artifacts for that tag
+- non-default branch pushes run Linux `amd64` and `arm64` verification only, avoiding release-tag collisions across divergent branch histories
 - manual `workflow_dispatch` runs can package any ref, and publish only when `publish_release` is enabled
 
 The workflow deliberately reuses repository scripts:
@@ -332,7 +332,15 @@ The workflow deliberately reuses repository scripts:
 - `scripts/preflight.sh --ci` runs formatting, build graph checks, clippy, and tests
 - `scripts/package-release.sh --skip-preflight` packages already-verified builds in the release matrix
 
-Default release artifacts cover Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64. Linux jobs also emit `.deb` packages. When `TRACEY_UPDATE_KEY` is configured and signing is enabled, the package jobs attach signed update bundles for the loader/update pipeline.
+Default release artifacts cover all requested platform/architecture pairs:
+
+| Platform | amd64 target | arm64 target | Runner |
+| --- | --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` | self-hosted `Linux` `X64` / `ARM64` |
+| Windows | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` | GitHub-hosted Windows x64 / ARM64 |
+| iOS | `x86_64-apple-ios` | `aarch64-apple-ios` | GitHub-hosted macOS Intel / ARM64 build hosts |
+
+Linux jobs also emit `.deb` packages. iOS outputs are raw target binaries for distribution/testing, not signed App Store bundles. When `TRACEY_UPDATE_KEY` is configured and signing is enabled, the package jobs attach signed update bundles for the loader/update pipeline.
 
 ## Loader Bootstrap Workflow
 

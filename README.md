@@ -346,14 +346,16 @@ GitHub Actions automation lives in `.github/workflows/build-and-release.yml`.
 
 Current behaviour:
 
-- every pull request and branch push runs one canonical verification job via `scripts/preflight.sh --ci`
-- successful default-branch pushes create an immutable annotated version tag for the pushed commit
+- every pull request and branch push runs the canonical verification path via `scripts/preflight.sh --ci` on Linux `amd64` and `arm64`
+- successful default-branch packaging creates an immutable annotated version tag for the pushed commit
 - generated tags use the same git-aware build version reported by `tracey --version`, for example `v0.2.0042`
-- default-branch pushes also package artifacts and create or update the GitHub release for that tag
+- default-branch pushes package artifacts first, then create or update the GitHub release for the resulting tag
 - non-default branch pushes verify only, avoiding release-tag collisions across divergent branch histories
 - manual `workflow_dispatch` runs can package any selected ref, and publish only when `publish_release` is enabled
-- release packaging reuses `scripts/package-release.sh` and emits per-platform archives plus checksum files for Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64
+- release packaging reuses `scripts/package-release.sh` and emits per-platform archives plus checksum files for Linux, Windows, and iOS across `amd64` and `arm64`
+- Linux verification and packaging run on the self-hosted `X64` and `ARM64` Linux runners
 - Linux release jobs also produce `.deb` packages for `amd64` and `arm64`
+- iOS artifacts are target binaries packaged from macOS build hosts, not signed App Store bundles
 
 `scripts/derive-version.sh` is the shared metadata helper for workflow outputs, local inspection, and release tags. If the repository secret `TRACEY_UPDATE_KEY` is configured and signing is enabled, release jobs attach signed `tracey.update` artifacts compatible with the loader/update pipeline.
 
@@ -392,7 +394,7 @@ cargo run --locked --bin tracey -- tracey-ban actions
 cargo run --locked --bin tracey -- tracey-guard --help
 cargo run --locked --bin tracey -- --tui --help
 cargo run --locked --bin tracey-top -- --help
-bash scripts/package-release.sh --version "$(bash scripts/derive-version.sh --build-version)" --output-dir ./dist --platform linux-x86_64 --archive-format tar.gz --deb-arch amd64 --skip-preflight
+bash scripts/package-release.sh --version "$(bash scripts/derive-version.sh --build-version)" --output-dir ./dist --target-triple x86_64-unknown-linux-gnu --platform linux-amd64 --archive-format tar.gz --deb-arch amd64 --skip-preflight
 ```
 
-Result: **201 tests passed, 0 failed** through `scripts/preflight.sh --ci`. The package smoke test produced a Linux x86_64 archive, an `amd64` Debian package, and a passing checksum file.
+Result: **201 tests passed, 0 failed** through `scripts/preflight.sh --ci`. The package smoke test produced a Linux `amd64` archive, an `amd64` Debian package, and a passing checksum file.

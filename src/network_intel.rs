@@ -17,6 +17,7 @@ use crate::storage::Storage;
 #[cfg(not(target_os = "linux"))]
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(unix)]
 use std::ffi::CStr;
 #[cfg(not(target_os = "linux"))]
 use std::hash::{Hash, Hasher};
@@ -1824,6 +1825,7 @@ async fn read_arp_cache() -> HashMap<Ipv4Addr, String> {
     out
 }
 
+#[cfg(unix)]
 fn collect_interface_inventory() -> InterfaceInventory {
     let mut addresses = Vec::new();
     let mut ifap = std::ptr::null_mut::<libc::ifaddrs>();
@@ -1832,7 +1834,7 @@ fn collect_interface_inventory() -> InterfaceInventory {
         return InterfaceInventory::default();
     }
 
-    let mut mac_by_iface = HashMap::new();
+    let mut mac_by_iface: HashMap<String, String> = HashMap::new();
 
     #[cfg(target_os = "linux")]
     {
@@ -1922,6 +1924,12 @@ fn collect_interface_inventory() -> InterfaceInventory {
     InterfaceInventory { addresses }
 }
 
+#[cfg(windows)]
+fn collect_interface_inventory() -> InterfaceInventory {
+    InterfaceInventory::default()
+}
+
+#[cfg(unix)]
 unsafe fn c_string(raw: *const libc::c_char) -> Option<String> {
     if raw.is_null() {
         return None;
@@ -1933,6 +1941,7 @@ unsafe fn c_string(raw: *const libc::c_char) -> Option<String> {
     )
 }
 
+#[cfg(unix)]
 fn ipv4_prefix_len(mask: &libc::sockaddr_in) -> u8 {
     mask.sin_addr
         .s_addr
@@ -1942,6 +1951,7 @@ fn ipv4_prefix_len(mask: &libc::sockaddr_in) -> u8 {
         .sum::<u32>() as u8
 }
 
+#[cfg(unix)]
 fn ipv6_prefix_len(mask: &libc::sockaddr_in6) -> u8 {
     mask.sin6_addr
         .s6_addr

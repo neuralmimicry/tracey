@@ -58,9 +58,17 @@ jobs:
         run: bash scripts/derive-version.sh --github-output
 
   verify:
-    name: Verify
+    name: Verify (${{ matrix.arch }})
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+          - arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -118,6 +126,7 @@ jobs:
     needs:
       - version
       - verify
+      - package
     if: >-
       ${{
         (
@@ -183,7 +192,7 @@ jobs:
           github.ref_name == github.event.repository.default_branch
         )
       }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     defaults:
       run:
         shell: bash
@@ -191,31 +200,60 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            platform: linux-x86_64
+          - os: linux
+            arch: amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+            rust_target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
             archive_format: tar.gz
             binary_suffix: ""
             deb_arch: amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux-aarch64
+            can_execute: true
+          - os: linux
+            arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
+            rust_target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
             archive_format: tar.gz
             binary_suffix: ""
             deb_arch: arm64
-          - runner: macos-15-intel
-            platform: macos-x86_64
-            archive_format: tar.gz
-            binary_suffix: ""
-            deb_arch: ""
-          - runner: macos-15
-            platform: macos-aarch64
-            archive_format: tar.gz
-            binary_suffix: ""
-            deb_arch: ""
-          - runner: windows-latest
-            platform: windows-x86_64
+            can_execute: true
+          - os: windows
+            arch: amd64
+            runs_on: '["windows-2025"]'
+            rust_target: x86_64-pc-windows-msvc
+            platform: windows-amd64
             archive_format: zip
             binary_suffix: ".exe"
             deb_arch: ""
+            can_execute: true
+          - os: windows
+            arch: arm64
+            runs_on: '["windows-11-arm"]'
+            rust_target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            archive_format: zip
+            binary_suffix: ".exe"
+            deb_arch: ""
+            can_execute: true
+          - os: ios
+            arch: amd64
+            runs_on: '["macos-15-intel"]'
+            rust_target: x86_64-apple-ios
+            platform: ios-amd64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: ""
+            can_execute: false
+          - os: ios
+            arch: arm64
+            runs_on: '["macos-15"]'
+            rust_target: aarch64-apple-ios
+            platform: ios-arm64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: ""
+            can_execute: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -225,8 +263,41 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --target "${{ matrix.rust_target }}"
           rustup default stable
+
+      - name: Configure iOS linker
+        if: ${{ matrix.os == 'ios' }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            aarch64-apple-ios)
+              sdk=iphoneos
+              min_flag=-miphoneos-version-min=13.0
+              ;;
+            x86_64-apple-ios)
+              sdk=iphonesimulator
+              min_flag=-mios-simulator-version-min=13.0
+              ;;
+            *)
+              echo "::error::Unsupported iOS Rust target: ${{ matrix.rust_target }}"
+              exit 1
+              ;;
+          esac
+
+          sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
+          clang_path="$(xcrun --sdk "$sdk" --find clang)"
+          ar_path="$(xcrun --sdk "$sdk" --find ar)"
+          target_env="$(printf '%s' "${{ matrix.rust_target }}" | tr '[:lower:]-' '[:upper:]_')"
+          cc_env="$(printf '%s' "${{ matrix.rust_target }}" | tr '-' '_')"
+
+          {
+            echo "SDKROOT=$sdk_path"
+            echo "CARGO_TARGET_${target_env}_LINKER=$clang_path"
+            echo "CARGO_TARGET_${target_env}_RUSTFLAGS=-C link-arg=-isysroot -C link-arg=$sdk_path -C link-arg=$min_flag"
+            echo "CC_${cc_env}=$clang_path"
+            echo "AR_${cc_env}=$ar_path"
+          } >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v5
@@ -250,6 +321,7 @@ jobs:
           SIGN_UPDATE_BUNDLE: >-
             ${{ github.event_name != 'workflow_dispatch' || inputs.sign_update_bundle }}
           RELEASE_VERSION: ${{ needs.version.outputs.build_version }}
+          RUST_TARGET: ${{ matrix.rust_target }}
           PLATFORM: ${{ matrix.platform }}
           ARCHIVE_FORMAT: ${{ matrix.archive_format }}
           BINARY_SUFFIX: ${{ matrix.binary_suffix }}
@@ -259,6 +331,7 @@ jobs:
           args=(
             --version "${RELEASE_VERSION}"
             --output-dir "./dist"
+            --target-triple "${RUST_TARGET}"
             --platform "${PLATFORM}"
             --archive-format "${ARCHIVE_FORMAT}"
             --binary-suffix "${BINARY_SUFFIX}"
@@ -296,10 +369,15 @@ jobs:
           [[ "$actual_arch" == "$DEB_ARCH" ]]
 
       - name: Smoke test packaged binaries
+        if: ${{ matrix.can_execute }}
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
         run: |
           set -euo pipefail
-          ./target/release/tracey${{ matrix.binary_suffix }} --version
-          ./target/release/tracey-loader${{ matrix.binary_suffix }} --version
+          bin_dir="./target/${RUST_TARGET}/release"
+          "${bin_dir}/tracey${BINARY_SUFFIX}" --version
+          "${bin_dir}/tracey-loader${BINARY_SUFFIX}" --version
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7

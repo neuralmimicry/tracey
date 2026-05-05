@@ -22,8 +22,8 @@ Options:
 
 Examples:
   ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist
-  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --platform windows-x86_64 --archive-format zip --binary-suffix .exe
-  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --platform linux-x86_64 --deb-arch amd64
+  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --target-triple x86_64-pc-windows-msvc --platform windows-amd64 --archive-format zip --binary-suffix .exe
+  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --target-triple x86_64-unknown-linux-gnu --platform linux-amd64 --deb-arch amd64
   TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --sign-update
 USAGE
 }
@@ -46,8 +46,8 @@ default_platform() {
     mingw*|msys*|cygwin*) os="windows" ;;
   esac
   case "$arch" in
-    amd64) arch="x86_64" ;;
-    arm64) arch="aarch64" ;;
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
   esac
   printf '%s-%s\n' "$os" "$arch"
 }
