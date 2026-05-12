@@ -21,10 +21,11 @@ Options:
   -h, --help                  Show this help text.
 
 Examples:
-  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist
-  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --target-triple x86_64-pc-windows-msvc --platform windows-amd64 --archive-format zip --binary-suffix .exe
-  ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --target-triple x86_64-unknown-linux-gnu --platform linux-amd64 --deb-arch amd64
-  TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version 0.2.0 --output-dir ./dist --sign-update
+  version="$(bash scripts/derive-version.sh --build-version)"
+  ./scripts/package-release.sh --version "$version" --output-dir ./dist
+  ./scripts/package-release.sh --version "$version" --output-dir ./dist --target-triple x86_64-pc-windows-msvc --platform windows-amd64 --archive-format zip --binary-suffix .exe
+  ./scripts/package-release.sh --version "$version" --output-dir ./dist --target-triple x86_64-unknown-linux-gnu --platform linux-amd64 --deb-arch amd64
+  TRACEY_UPDATE_KEY=shared ./scripts/package-release.sh --version "$version" --output-dir ./dist --sign-update
 USAGE
 }
 

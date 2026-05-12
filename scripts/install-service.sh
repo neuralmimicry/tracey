@@ -10,13 +10,13 @@ The service entrypoint is `tracey-loader`, which supervises and updates the
 mutable `tracey` core from the service state directory.
 By default, `--scope auto` prefers a boot-time system service and will use
 `sudo` for privileged install steps when needed.
-System-scope installs use the packaged Tracey `.deb` by default.
+System-scope installs use the latest successful packaged Tracey `.deb` by default.
 
 Options:
   --scope auto|system|user     `auto` prefers a system service; `user` is opt-in.
   --service-name NAME          Base service name. Default: tracey
   --deb-file PATH              Local Tracey .deb to install for system scope.
-  --release-version VERSION    Tracey release version to fetch when no local .deb is found.
+  --release-version VERSION    Pin a Tracey package build version instead of using latest.
   --binary PATH                Alias for --core-binary PATH.
   --core-binary PATH           Source Tracey core binary to install instead of using the .deb package.
   --loader-binary PATH         Source Tracey loader binary to install instead of using the .deb package.
@@ -41,12 +41,13 @@ Options:
 Environment:
   TRACEY_GITHUB_TOKEN          Optional GitHub token used when downloading from a private release.
   GH_TOKEN, GITHUB_TOKEN       Alternative GitHub token variable names.
+  TRACEY_RELEASE_VERSION       Optional pinned package build version.
 
 Examples:
   ./scripts/install-service.sh
   sudo ./scripts/install-service.sh
-  sudo ./scripts/install-service.sh --deb-file ./dist/tracey_0.2.2_amd64.deb
-  sudo ./scripts/install-service.sh --release-version 0.2.2
+  sudo ./scripts/install-service.sh --deb-file ./dist/tracey_<version>_amd64.deb
+  sudo ./scripts/install-service.sh --release-version <build-version>
   ./scripts/install-service.sh --scope user --core-channel development --dry-run
 USAGE
 }
@@ -546,6 +547,74 @@ resolve_latest_release_version() {
   esac
 }
 
+resolve_latest_package_release_version() {
+  local repo="$1"
+  local arch="$2"
+  local token=
+
+  if command -v python3 >/dev/null 2>&1; then
+    token=$(github_api_token || true)
+    python3 - "$repo" "$arch" "$token" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+repo, arch, token = sys.argv[1:]
+headers = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "tracey-install-service",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+try:
+    for page in range(1, 6):
+        url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            releases = json.load(response)
+
+        if not isinstance(releases, list):
+            fail("unexpected GitHub releases API response")
+        if not releases:
+            break
+
+        for release in releases:
+            if release.get("draft") or release.get("prerelease"):
+                continue
+            tag = str(release.get("tag_name") or "")
+            if not tag.startswith("v"):
+                continue
+            version = tag[1:]
+            asset_name = f"tracey_{version}_{arch}.deb"
+            if any(
+                str(asset.get("name") or "") == asset_name
+                for asset in release.get("assets") or []
+            ):
+                print(version)
+                raise SystemExit(0)
+except urllib.error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", "replace")[:200]
+    fail(f"GitHub releases API request failed ({exc.code}): {detail}")
+except urllib.error.URLError as exc:
+    fail(f"GitHub releases API request failed: {exc.reason}")
+
+fail(f"no published Tracey release contains tracey_*_{arch}.deb")
+PY
+    return $?
+  fi
+
+  warn "python3 is unavailable; falling back to GitHub's latest release without package-asset validation"
+  resolve_latest_release_version "$repo"
+}
+
 download_to_path() {
   local url="$1"
   local out="$2"
@@ -584,6 +653,21 @@ gh_authenticated() {
 
 github_token() {
   env_first TRACEY_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+}
+
+github_api_token() {
+  local token
+  if token=$(github_token 2>/dev/null); then
+    printf '%s\n' "$token"
+    return 0
+  fi
+
+  if gh_authenticated; then
+    run_as_build_user gh auth token 2>/dev/null
+    return $?
+  fi
+
+  return 1
 }
 
 download_release_asset_via_gh() {
@@ -729,10 +813,9 @@ resolve_package_install_plan() {
     PACKAGE_RELEASE_VERSION=$(env_first TRACEY_RELEASE_VERSION || true)
   fi
   if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
-    PACKAGE_RELEASE_VERSION=$(read_source_release_version || true)
-  fi
-  if [[ -z "$PACKAGE_RELEASE_VERSION" ]]; then
-    PACKAGE_RELEASE_VERSION=$(resolve_latest_release_version "$RELEASE_REPO")
+    PACKAGE_RELEASE_VERSION=$(
+      resolve_latest_package_release_version "$RELEASE_REPO" "$DEB_ARCH"
+    ) || die "could not resolve the latest successful Tracey package build"
   fi
 
   PACKAGE_RELEASE_TAG="v${PACKAGE_RELEASE_VERSION}"
@@ -1692,13 +1775,12 @@ UNIT_NAME="${UNIT_BASE}.service"
 validate_name
 require_linux_systemd
 resolve_scope
+BUILD_AS_USER=$(resolve_build_user || true)
 resolve_package_install_plan
 
 if [[ -z "$AGENT_ID" ]]; then
   AGENT_ID=$(default_agent_id)
 fi
-
-BUILD_AS_USER=$(resolve_build_user || true)
 
 ensure_binary_sources
 resolve_core_channel

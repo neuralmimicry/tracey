@@ -458,8 +458,9 @@ Operational limitation: the repository expects PEM material on disk and does not
 In system scope, unless explicit binary paths are supplied, the script installs the Tracey `.deb` package:
 
 - from `--deb-file` when provided
-- from a matching local `tracey_<version>_<arch>.deb` under the script directory or `dist/`
-- from the matching GitHub release asset for the selected release version
+- from the newest published GitHub release that contains `tracey_<version>_<arch>.deb` for the detected architecture
+- from a matching local `tracey_<version>_<arch>.deb` under the script directory or `dist/` when it matches the selected package build version
+- from an explicitly pinned package build when `--release-version` or `TRACEY_RELEASE_VERSION` is set
 
 In user scope, or when explicit binaries are supplied, the script keeps the older binary-resolution flow:
 

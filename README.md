@@ -324,7 +324,7 @@ A new loader deployment must be bootstrapped with a core binary at `loader/curre
 
 What the script does in the current implementation:
 
-- in system scope, installs the Tracey `.deb` package from a local file or the matching GitHub release
+- in system scope, installs the Tracey `.deb` package from a local file or the latest successful GitHub package build for the detected architecture
 - in user scope, or when explicit binaries are supplied, resolves or builds `tracey` and `tracey-loader`
 - installs a PATH-visible `tracey` command for CLI and `tracey --tui` access
 - uses packaged `tracey-loader` as the service entry point in system scope
