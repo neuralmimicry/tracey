@@ -351,6 +351,7 @@ TraceyBan is disabled by default but substantially configured out of the box.
 | `tracey_ban.sudo_program` | `sudo` | Sudo executable used for elevation or action wrapping. |
 | `tracey_ban.sudo_non_interactive` | `true` | Uses non-interactive sudo mode where applicable. |
 | `tracey_ban.use_sudo_for_actions` | `true` | Allows actions to be wrapped in sudo. |
+| `tracey_ban.enforce_remote_bans` | `false` | Installs matching local jail bans from signed discovery ban advertisements. |
 | `tracey_ban.inherit_global_fuzzy` | `true` | Copies global fuzzy settings and `min_samples` at runtime. |
 | `tracey_ban.min_samples` | `12` | Local value only used when inheritance is disabled. |
 | `tracey_ban.fuzzy_min_risk` | `0.62` | Minimum fuzzy risk for ban confirmation. |
@@ -375,6 +376,10 @@ TraceyBan ships with one default enabled jail.
 | `ban_randomize_ms` | `15_000` |
 | `ignore_ips` | `127.0.0.1`, `::1` |
 | `poll_interval_ms` | `1000` |
+| `ports` | `22` |
+| `nftables_table` | `tracey_ban` |
+| `nftables_chain` | `tracey_input` |
+| `nftables_forward_chain` | `tracey_forward` |
 | `shell` | `/bin/sh` |
 | `action_timeout_ms` | `5000` |
 
@@ -386,11 +391,26 @@ Default event IP keys are:
 - `client_ip`
 - `remote_addr`
 
+Built-in filter catalogs:
+
+| Catalog | Purpose |
+| --- | --- |
+| `sshd` | OpenSSH authentication failures from auth logs or journald. |
+| `sshd-aggressive` | OpenSSH auth failures plus aggressive pre-auth disconnects. |
+| `nginx-http-auth` | Nginx basic-auth and htpasswd failures. |
+| `apache-auth` | Apache HTTP auth failures. |
+| `postfix` | Postfix SMTP AUTH failures. |
+| `refiner-web-probe` | Refiner, reverse-proxy, and CRI-prefixed Kubernetes pod access-log exploit probes such as PHP ini injection, PHPUnit `eval-stdin.php`, ThinkPHP invocation probes, path traversal, environment-file probes, and Docker API probes. |
+| `recidive` | Repeat-offender escalation from TraceyBan ban records. |
+
 Important behaviour:
 
 - if a jail name is blank, sanitisation replaces it with `tracey-jail-N`
 - if a jail shell is blank, sanitisation restores `/bin/sh`
 - if `event_ip_keys` is empty, sanitisation restores the default IP-key list
+- `log_paths` supports simple `*` and `?` wildcards, which allows a host Tracey process to follow local Kubernetes pod logs such as `/var/log/containers/*.log`
+- an explicit empty `ports` list means block the source on every port for that jail
+- the nftables action backend installs rules in both the input and forward hooks, so host-level bans can cover local services and routed Kubernetes pod traffic on the node
 - TraceyBan action hooks are arbitrary shell commands and should be treated as privileged code
 
 ## Governance, Coordination, and Tuning
@@ -736,6 +756,7 @@ The code supports both `TRACEY_*` and `NM_*` aliases for many settings. Coverage
 - `TRACEY_BAN_SUDO_PROGRAM`
 - `TRACEY_BAN_SUDO_NON_INTERACTIVE`
 - `TRACEY_BAN_USE_SUDO_FOR_ACTIONS`
+- `TRACEY_BAN_ENFORCE_REMOTE_BANS`
 - `TRACEY_BAN_INHERIT_GLOBAL_FUZZY`
 - `TRACEY_BAN_STATE_PATH`
 - `TRACEY_BAN_MAX_ADVERTISED_IPS`

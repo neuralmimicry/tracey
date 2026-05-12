@@ -40,6 +40,7 @@ const FIREWALL_ACTION_KEYWORDS: &[&str] = &[
 ];
 const TRACEY_BAN_LOCAL_SNAPSHOT_MAX_ENTRIES: usize = 128;
 const TRACEY_BAN_REMOTE_SNAPSHOT_MAX_ENTRIES: usize = 128;
+const TRACEY_BAN_LOG_GLOB_MAX_MATCHES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -397,6 +398,19 @@ impl BanIntelHub {
             .values()
             .filter(|record| record.entries.iter().any(|entry| entry.ip == normalized))
             .count()
+    }
+
+    pub async fn remote_entries(&self, max_entries: usize) -> Vec<BanAdvertisementEntry> {
+        let mut state = self.state.write().await;
+        cleanup_expired(&mut state, now_ms());
+
+        let mut remote_entries: Vec<BanAdvertisementEntry> = state
+            .remote
+            .values()
+            .flat_map(|record| record.entries.iter().cloned())
+            .collect();
+        remote_entries.sort_by(|a, b| b.last_ban_ms.cmp(&a.last_ban_ms));
+        remote_entries.into_iter().take(max_entries).collect()
     }
 
     pub async fn snapshot(&self, max_entries: usize) -> BanStatusSnapshot {
@@ -813,6 +827,22 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
         r"(?i)^.*warning: .*?\[<HOST>\]: SASL (?:LOGIN|PLAIN|XOAUTH2|(?:CRAM|DIGEST)-MD5)? ?authentication failed:.*$",
         r"(?i)^.*lost connection after AUTH from .*?\[<HOST>\].*$",
     ];
+    const REFINER_WEB_PROBE_LOG_PATHS: &[&str] = &[
+        "/var/log/nginx/access.log",
+        "/var/log/nginx/refiner.access.log",
+        "/var/log/nginx/refiner_access.log",
+        "/var/log/nginx/refiner.neuralmimicry.ai.access.log",
+        "/app/job_data/logs/refiner_web.log",
+        "/srv/continuum/refiner-job-data/logs/refiner_web.log",
+        "/var/lib/continuum/refiner-job-data/logs/refiner_web.log",
+        "/home/continuum-shared-storage/refiner-job-data/logs/refiner_web.log",
+        "/var/log/refiner/refiner_web.log",
+        "/var/log/containers/*.log",
+        "/var/log/pods/*/*/*.log",
+    ];
+    const REFINER_WEB_PROBE_FAIL_REGEX: &[&str] = &[
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:%ad|allow_url_include|auto_prepend_file|php://input|eval-stdin\.php|/vendor/phpunit|/phpunit(?:/|$)|think\\+app/invokefunction|pearcmd|(?:\.\./){2,}|/containers/json|/\.env(?:[/?\s]|$)|/wp-(?:admin|login)|/xmlrpc\.php|/cgi-bin/|/actuator(?:[/?\s]|$)|/server-status|/HNAP1|/setup\.cgi)[^"]* HTTP/[0-9.]+" \d{3} .*$"#,
+    ];
     const RECIDIVE_LOG_PATHS: &[&str] = &["tracey.log.jsonl"];
     const RECIDIVE_FAIL_REGEX: &[&str] = &[
         r#"(?i)^\{"type":"ban_update","payload":\{.*"jail":"[^"]+".*"ip":"<HOST>".*"banned":true.*\}\}\s*$"#,
@@ -824,6 +854,7 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
     const EMPTY_PORTS: &[u16] = &[];
     const SSH_PORTS: &[u16] = &[22];
     const HTTP_PORTS: &[u16] = &[80, 443];
+    const WEB_APP_PORTS: &[u16] = &[80, 443, 5001];
     const SMTP_PORTS: &[u16] = &[25, 465, 587];
 
     match name {
@@ -872,6 +903,15 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
             ports: SMTP_PORTS,
             protocol: "tcp",
         }),
+        "refiner-web-probe" => Some(FilterCatalogDefinition {
+            description: "Refiner and reverse-proxy access-log exploit probes",
+            log_paths: REFINER_WEB_PROBE_LOG_PATHS,
+            journal_matches: EMPTY,
+            fail_regex: REFINER_WEB_PROBE_FAIL_REGEX,
+            ignore_regex: EMPTY,
+            ports: WEB_APP_PORTS,
+            protocol: "tcp",
+        }),
         "recidive" => Some(FilterCatalogDefinition {
             description: "Escalate repeat offenders from TraceyBan ban records in tracey.log.jsonl",
             log_paths: RECIDIVE_LOG_PATHS,
@@ -892,6 +932,7 @@ pub fn built_in_filter_catalog_summaries() -> Vec<TraceyBanFilterCatalogInfo> {
         "nginx-http-auth",
         "apache-auth",
         "postfix",
+        "refiner-web-probe",
         "recidive",
     ]
     .into_iter()
@@ -936,7 +977,8 @@ pub fn built_in_action_catalog_summaries() -> Vec<TraceyBanActionCatalogInfo> {
         TraceyBanActionCatalogInfo {
             name: "nftables".to_string(),
             description:
-                "Use nftables sets and input-chain drop rules managed by TraceyBan".to_string(),
+                "Use nftables sets with input and forward drop rules managed by TraceyBan"
+                    .to_string(),
         },
     ]
 }
@@ -1346,6 +1388,7 @@ async fn run_tracey_ban_runtime(
             }
             _ = unban_tick.tick() => {
                 process_unbans(&mut jails, &bus, &storage, &intel_hub, &config, &config.agent_id).await;
+                process_remote_bans(&mut jails, &bus, &storage, &intel_hub, &config).await;
                 refresh_tracey_ban_snapshot(&snapshot, &jails, &intel_hub, true).await;
             }
             _ = persist_tick.tick() => {
@@ -1866,25 +1909,28 @@ async fn run_log_worker(
             _ = shutdown.wait() => break,
             _ = interval.tick() => {
                 for path in &jail_cfg.log_paths {
-                    if let Err(err) = process_log_path(
-                        &jail_name,
-                        path,
-                        &fail_regex,
-                        &ignore_regex,
-                        prefilter.as_ref(),
-                        &offsets,
-                        &tx,
-                    ).await {
-                        if err.kind() == std::io::ErrorKind::PermissionDenied {
-                            tracing::warn!(
-                                jail = %jail_name,
-                                path = %path.display(),
-                                root_like_path = is_root_log_path(path),
-                                error = %err,
-                                "tracey_ban cannot read log path due to permissions"
-                            );
-                        } else {
-                            tracing::debug!(jail=%jail_name, path=%path.display(), error=%err, "tracey_ban log worker read failed");
+                    for resolved_path in expand_log_path_pattern(path) {
+                        if let Err(err) = process_log_path(
+                            &jail_name,
+                            &resolved_path,
+                            &fail_regex,
+                            &ignore_regex,
+                            prefilter.as_ref(),
+                            &offsets,
+                            &tx,
+                        ).await {
+                            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                                tracing::warn!(
+                                    jail = %jail_name,
+                                    path = %resolved_path.display(),
+                                    configured_path = %path.display(),
+                                    root_like_path = is_root_log_path(&resolved_path),
+                                    error = %err,
+                                    "tracey_ban cannot read log path due to permissions"
+                                );
+                            } else {
+                                tracing::debug!(jail=%jail_name, path=%resolved_path.display(), configured_path=%path.display(), error=%err, "tracey_ban log worker read failed");
+                            }
                         }
                     }
                 }
@@ -1947,6 +1993,92 @@ async fn process_log_path(
     let end_offset = reader.stream_position().await?;
     offsets.write().await.insert(key, end_offset);
     Ok(())
+}
+
+fn expand_log_path_pattern(path: &Path) -> Vec<PathBuf> {
+    let pattern = path.to_string_lossy();
+    if !path_pattern_has_wildcards(&pattern) {
+        return vec![path.to_path_buf()];
+    }
+
+    let absolute = pattern.starts_with('/');
+    let segments: Vec<&str> = pattern
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let mut prefixes = if absolute {
+        vec![PathBuf::from("/")]
+    } else {
+        vec![PathBuf::new()]
+    };
+
+    for segment in segments {
+        let has_wildcards = path_pattern_has_wildcards(segment);
+        let mut next = Vec::new();
+        for prefix in &prefixes {
+            if has_wildcards {
+                let read_dir_path = if prefix.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    prefix.as_path()
+                };
+                let Ok(entries) = std::fs::read_dir(read_dir_path) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    if wildcard_match(segment, &file_name.to_string_lossy()) {
+                        next.push(entry.path());
+                        if next.len() >= TRACEY_BAN_LOG_GLOB_MAX_MATCHES {
+                            next.sort();
+                            return next;
+                        }
+                    }
+                }
+            } else {
+                next.push(prefix.join(segment));
+                if next.len() >= TRACEY_BAN_LOG_GLOB_MAX_MATCHES {
+                    next.sort();
+                    return next;
+                }
+            }
+        }
+        next.sort();
+        prefixes = next;
+        if prefixes.is_empty() {
+            break;
+        }
+    }
+
+    prefixes
+}
+
+fn path_pattern_has_wildcards(pattern: &str) -> bool {
+    pattern.chars().any(|ch| matches!(ch, '*' | '?'))
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut dp = vec![false; text.len() + 1];
+    dp[0] = true;
+
+    for pattern_ch in pattern {
+        let mut next = vec![false; text.len() + 1];
+        if pattern_ch == '*' {
+            next[0] = dp[0];
+            for idx in 1..=text.len() {
+                next[idx] = next[idx - 1] || dp[idx];
+            }
+        } else {
+            for idx in 1..=text.len() {
+                next[idx] = dp[idx - 1] && (pattern_ch == '?' || pattern_ch == text[idx - 1]);
+            }
+        }
+        dp = next;
+    }
+
+    dp[text.len()]
 }
 
 async fn run_event_worker(
@@ -2488,6 +2620,62 @@ async fn process_unbans(
     }
 }
 
+async fn process_remote_bans(
+    jails: &mut HashMap<String, JailRuntime>,
+    bus: &EventBus,
+    storage: &Storage,
+    intel_hub: &BanIntelHub,
+    config: &TraceyBanConfig,
+) {
+    if !config.enforce_remote_bans {
+        return;
+    }
+
+    let now = now_ms();
+    let remote_entries = intel_hub.remote_entries(config.max_advertised_ips).await;
+    for entry in remote_entries {
+        let Some(jail) = jails.get_mut(&entry.jail) else {
+            continue;
+        };
+        if jail.is_ignored_ip(&entry.ip) || jail.active_bans.contains_key(&entry.ip) {
+            continue;
+        }
+        let duration_ms = match entry.expires_ms {
+            Some(expires_ms) if expires_ms <= now => continue,
+            Some(expires_ms) => Some(expires_ms.saturating_sub(now).max(1)),
+            None => None,
+        };
+        let counter_key = make_ban_key(&jail.config.name, &entry.ip);
+        let next_ban_count = jail
+            .ban_counts
+            .get(&counter_key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(entry.ban_count);
+        let reason = format!(
+            "remote tracey_ban advertisement jail={} remote_ban_count={}",
+            entry.jail, entry.ban_count
+        );
+        let _ = install_ban_record(
+            jail,
+            config,
+            bus,
+            storage,
+            intel_hub,
+            &entry.ip,
+            now,
+            "tracey_ban_remote",
+            &reason,
+            duration_ms,
+            None,
+            None,
+            next_ban_count,
+        )
+        .await;
+    }
+}
+
 async fn install_ban_record(
     jail: &mut JailRuntime,
     config: &TraceyBanConfig,
@@ -3021,7 +3209,7 @@ async fn run_builtin_nftables_action(
 
 async fn ensure_nftables_infra(config: &TraceyBanConfig, jail: &mut JailRuntime) -> bool {
     let table = jail.config.nftables_table.clone();
-    let chain = jail.config.nftables_chain.clone();
+    let chain_specs = nftables_chain_specs(&jail.config);
     let use_sudo = config.use_sudo_for_actions && !is_running_as_root();
 
     let table_args = vec![
@@ -3054,36 +3242,41 @@ async fn ensure_nftables_infra(config: &TraceyBanConfig, jail: &mut JailRuntime)
         }
     }
 
-    let chain_args = vec![
-        "nft".to_string(),
-        "list".to_string(),
-        "chain".to_string(),
-        "inet".to_string(),
-        table.clone(),
-        chain.clone(),
-    ];
-    let chain_result = run_argv_action(config, &jail.config, &chain_args, use_sudo).await;
-    if !chain_result.success {
-        let add_args = vec![
+    for (chain, hook) in &chain_specs {
+        let chain_args = vec![
             "nft".to_string(),
-            "add".to_string(),
+            "list".to_string(),
             "chain".to_string(),
             "inet".to_string(),
             table.clone(),
             chain.clone(),
-            "{ type filter hook input priority -10; policy accept; }".to_string(),
         ];
-        let add_result = run_argv_action(config, &jail.config, &add_args, use_sudo).await;
-        if !nft_definition_succeeded(&add_result) {
-            log_action_failure(
-                config,
-                &jail.config,
-                JailActionKind::Start,
-                &add_args.join(" "),
-                use_sudo,
-                &add_result,
-            );
-            return false;
+        let chain_result = run_argv_action(config, &jail.config, &chain_args, use_sudo).await;
+        if !chain_result.success {
+            let add_args = vec![
+                "nft".to_string(),
+                "add".to_string(),
+                "chain".to_string(),
+                "inet".to_string(),
+                table.clone(),
+                chain.clone(),
+                format!(
+                    "{{ type filter hook {} priority -10; policy accept; }}",
+                    hook
+                ),
+            ];
+            let add_result = run_argv_action(config, &jail.config, &add_args, use_sudo).await;
+            if !nft_definition_succeeded(&add_result) {
+                log_action_failure(
+                    config,
+                    &jail.config,
+                    JailActionKind::Start,
+                    &add_args.join(" "),
+                    use_sudo,
+                    &add_result,
+                );
+                return false;
+            }
         }
     }
 
@@ -3122,47 +3315,49 @@ async fn ensure_nftables_infra(config: &TraceyBanConfig, jail: &mut JailRuntime)
         }
     }
 
-    let chain_state_args = vec![
-        "nft".to_string(),
-        "list".to_string(),
-        "chain".to_string(),
-        "inet".to_string(),
-        table.clone(),
-        chain.clone(),
-    ];
-    let chain_state = run_argv_action(config, &jail.config, &chain_state_args, use_sudo).await;
-    if !chain_state.success {
-        log_action_failure(
-            config,
-            &jail.config,
-            JailActionKind::Start,
-            &chain_state_args.join(" "),
-            use_sudo,
-            &chain_state,
-        );
-        return false;
-    }
-
-    for (is_ipv6, set_name) in [
-        (false, nftables_set_name(&jail.config, "v4")),
-        (true, nftables_set_name(&jail.config, "v6")),
-    ] {
-        let signature = nft_rule_signature(&jail.config, &set_name, is_ipv6);
-        if chain_state.stdout.contains(&signature) {
-            continue;
-        }
-        let add_args = build_nft_rule_args(&jail.config, &set_name, is_ipv6);
-        let add_result = run_argv_action(config, &jail.config, &add_args, use_sudo).await;
-        if !nft_definition_succeeded(&add_result) {
+    for (chain, _) in &chain_specs {
+        let chain_state_args = vec![
+            "nft".to_string(),
+            "list".to_string(),
+            "chain".to_string(),
+            "inet".to_string(),
+            table.clone(),
+            chain.clone(),
+        ];
+        let chain_state = run_argv_action(config, &jail.config, &chain_state_args, use_sudo).await;
+        if !chain_state.success {
             log_action_failure(
                 config,
                 &jail.config,
                 JailActionKind::Start,
-                &add_args.join(" "),
+                &chain_state_args.join(" "),
                 use_sudo,
-                &add_result,
+                &chain_state,
             );
             return false;
+        }
+
+        for (is_ipv6, set_name) in [
+            (false, nftables_set_name(&jail.config, "v4")),
+            (true, nftables_set_name(&jail.config, "v6")),
+        ] {
+            let signature = nft_rule_signature(&jail.config, &set_name, is_ipv6);
+            if chain_state.stdout.contains(&signature) {
+                continue;
+            }
+            let add_args = build_nft_rule_args(&jail.config, &set_name, is_ipv6, chain);
+            let add_result = run_argv_action(config, &jail.config, &add_args, use_sudo).await;
+            if !nft_definition_succeeded(&add_result) {
+                log_action_failure(
+                    config,
+                    &jail.config,
+                    JailActionKind::Start,
+                    &add_args.join(" "),
+                    use_sudo,
+                    &add_result,
+                );
+                return false;
+            }
         }
     }
 
@@ -3463,6 +3658,21 @@ fn nftables_set_names(jail: &TraceyBanJailConfig) -> Vec<(String, String)> {
     ]
 }
 
+fn nftables_chain_specs(jail: &TraceyBanJailConfig) -> Vec<(String, &'static str)> {
+    let mut seen = HashSet::new();
+    let mut chains = Vec::new();
+    for (chain, hook) in [
+        (jail.nftables_chain.trim(), "input"),
+        (jail.nftables_forward_chain.trim(), "forward"),
+    ] {
+        if chain.is_empty() || !seen.insert(chain.to_string()) {
+            continue;
+        }
+        chains.push((chain.to_string(), hook));
+    }
+    chains
+}
+
 fn nftables_set_name(jail: &TraceyBanJailConfig, suffix: &str) -> String {
     format!(
         "tb_{}_{}",
@@ -3519,14 +3729,19 @@ fn nft_rule_signature(jail: &TraceyBanJailConfig, set_name: &str, ipv6: bool) ->
     }
 }
 
-fn build_nft_rule_args(jail: &TraceyBanJailConfig, set_name: &str, ipv6: bool) -> Vec<String> {
+fn build_nft_rule_args(
+    jail: &TraceyBanJailConfig,
+    set_name: &str,
+    ipv6: bool,
+    chain: &str,
+) -> Vec<String> {
     let mut args = vec![
         "nft".to_string(),
         "add".to_string(),
         "rule".to_string(),
         "inet".to_string(),
         jail.nftables_table.clone(),
-        jail.nftables_chain.clone(),
+        chain.to_string(),
         if ipv6 { "ip6" } else { "ip" }.to_string(),
         "saddr".to_string(),
         format!("@{}", set_name),
@@ -4295,6 +4510,7 @@ mod tests {
         assert!(filter_names.contains(&"nginx-http-auth".to_string()));
         assert!(filter_names.contains(&"apache-auth".to_string()));
         assert!(filter_names.contains(&"postfix".to_string()));
+        assert!(filter_names.contains(&"refiner-web-probe".to_string()));
         assert!(filter_names.contains(&"recidive".to_string()));
     }
 
@@ -4346,6 +4562,73 @@ mod tests {
             match_line_with_regexes(line, &fail, &[], None).as_deref(),
             Some("203.0.113.23")
         );
+    }
+
+    #[test]
+    fn refiner_web_probe_filter_matches_phpunit_scanner() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        assert_eq!(resolved.ports, vec![80, 443, 5001]);
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let line = r#"178.17.53.215 - - [12/May/2026 09:37:55] "GET /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php HTTP/1.1" 302 -"#;
+        assert_eq!(
+            match_line_with_regexes(line, &fail, &[], None).as_deref(),
+            Some("178.17.53.215")
+        );
+    }
+
+    #[test]
+    fn refiner_web_probe_filter_matches_php_ini_and_thinkphp_scanners() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let php_ini_line = r#"178.17.53.215 - - [12/May/2026 09:37:55] "POST /hello.world?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input HTTP/1.1" 302 -"#;
+        let thinkphp_line = r#"178.17.53.215 - - [12/May/2026 09:38:04] "GET /index.php?s=/index/\\think\\app/invokefunction&function=call_user_func_array&vars[0]=md5&vars[1][]=Hello HTTP/1.1" 302 -"#;
+        assert_eq!(
+            match_line_with_regexes(php_ini_line, &fail, &[], None).as_deref(),
+            Some("178.17.53.215")
+        );
+        assert_eq!(
+            match_line_with_regexes(thinkphp_line, &fail, &[], None).as_deref(),
+            Some("178.17.53.215")
+        );
+    }
+
+    #[test]
+    fn refiner_web_probe_filter_matches_cri_prefixed_pod_log_line() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let line = r#"2026-05-12T09:37:55.000000000Z stdout F 178.17.53.215 - - [12/May/2026 09:37:55] "GET /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php HTTP/1.1" 302 -"#;
+        assert_eq!(
+            match_line_with_regexes(line, &fail, &[], None).as_deref(),
+            Some("178.17.53.215")
+        );
+    }
+
+    #[test]
+    fn refiner_web_probe_filter_ignores_external_login_health_redirects() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let line = r#"81.130.134.82 - - [12/May/2026 09:37:58] "GET /auth/external-login?rd=https://prometheus.neuralmimicry.ai/-/ready HTTP/1.1" 302 -"#;
+        assert_eq!(match_line_with_regexes(line, &fail, &[], None), None);
     }
 
     #[test]
@@ -4417,7 +4700,7 @@ mod tests {
     #[test]
     fn nft_action_builders_render_expected_structure() {
         let jail = TraceyBanJailConfig::default();
-        let rule_args = build_nft_rule_args(&jail, "tb_tracey_default_v4", false);
+        let rule_args = build_nft_rule_args(&jail, "tb_tracey_default_v4", false, "tracey_input");
         assert_eq!(
             rule_args,
             vec![
@@ -4436,6 +4719,13 @@ mod tests {
                 "drop"
             ]
         );
+        assert_eq!(
+            nftables_chain_specs(&jail),
+            vec![
+                ("tracey_input".to_string(), "input"),
+                ("tracey_forward".to_string(), "forward")
+            ]
+        );
 
         let element_args = build_nft_element_action_args(&jail, true, "203.0.113.9");
         assert_eq!(
@@ -4450,6 +4740,23 @@ mod tests {
                 "{ 203.0.113.9 }"
             ]
         );
+    }
+
+    #[test]
+    fn log_path_glob_expands_kubernetes_container_logs() {
+        let root = std::env::temp_dir().join(format!("tracey_ban_glob_test_{}", now_ms()));
+        let containers_dir = root.join("var/log/containers");
+        std::fs::create_dir_all(&containers_dir).expect("container log dir");
+        let matching = containers_dir.join("refiner_refiner_refiner-abc123.log");
+        let other = containers_dir.join("not-a-log.txt");
+        std::fs::write(&matching, "").expect("matching log");
+        std::fs::write(&other, "").expect("other file");
+
+        let mut expanded = expand_log_path_pattern(&root.join("var/log/containers/*.log"));
+        expanded.sort();
+        assert_eq!(expanded, vec![matching]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -4571,6 +4878,71 @@ mod tests {
             .await
         );
         assert!(jail.active_bans.contains_key("203.0.113.10"));
+
+        shutdown.trigger();
+        let _ = tokio::fs::remove_file(storage_path).await;
+    }
+
+    #[tokio::test]
+    async fn remote_ban_advertisement_installs_matching_local_jail_ban() {
+        let mut config = TraceyBanConfig::default();
+        config.agent_id = "unit".to_string();
+        config.enforce_remote_bans = true;
+        config.use_sudo_for_actions = false;
+        let mut jail_cfg = TraceyBanJailConfig::default();
+        jail_cfg.name = "refiner-web-probe".to_string();
+        jail_cfg.filter_catalog = None;
+        jail_cfg.fail_regex = vec![r"(?i)^.*probe .* from <HOST>.*$".to_string()];
+        jail_cfg.action_catalog = None;
+        jail_cfg.action_ban = Some("true".to_string());
+
+        let jail = JailRuntime::from_config(&jail_cfg, &config).expect("jail runtime");
+        let mut jails = HashMap::from([(jail.config.name.clone(), jail)]);
+
+        let bus = EventBus::new(16);
+        let (shutdown, listener) = Shutdown::new();
+        let storage_path =
+            std::env::temp_dir().join(format!("tracey_ban_remote_test_{}.jsonl", now_ms()));
+        let storage = Storage::new(
+            StorageConfig {
+                log_path: storage_path.clone(),
+                ..StorageConfig::default()
+            },
+            listener,
+        )
+        .await
+        .expect("storage");
+        let intel_hub = BanIntelHub::new(15_000);
+        let now = now_ms();
+        intel_hub
+            .ingest_remote(
+                "peer",
+                BanAdvertisement {
+                    ts_ms: now,
+                    epoch: 1,
+                    entries: vec![BanAdvertisementEntry {
+                        ip: "203.0.113.11".to_string(),
+                        jail: "refiner-web-probe".to_string(),
+                        expires_ms: Some(now + 60_000),
+                        ban_count: 1,
+                        last_ban_ms: now,
+                    }],
+                },
+            )
+            .await;
+
+        process_remote_bans(&mut jails, &bus, &storage, &intel_hub, &config).await;
+
+        let jail = jails.get("refiner-web-probe").expect("jail");
+        assert!(jail.active_bans.contains_key("203.0.113.11"));
+        assert!(
+            intel_hub
+                .snapshot(16)
+                .await
+                .local_entries
+                .iter()
+                .any(|entry| entry.ip == "203.0.113.11")
+        );
 
         shutdown.trigger();
         let _ = tokio::fs::remove_file(storage_path).await;

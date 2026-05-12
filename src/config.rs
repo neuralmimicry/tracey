@@ -530,6 +530,7 @@ pub struct TraceyBanConfig {
     pub sudo_non_interactive: bool,
     pub use_sudo_for_actions: bool,
     pub allow_shell_actions: bool,
+    pub enforce_remote_bans: bool,
     pub inherit_global_fuzzy: bool,
     pub min_samples: u64,
     pub fuzzy: FuzzyConfig,
@@ -554,6 +555,7 @@ impl Default for TraceyBanConfig {
             sudo_non_interactive: true,
             use_sudo_for_actions: true,
             allow_shell_actions: false,
+            enforce_remote_bans: false,
             inherit_global_fuzzy: true,
             min_samples: 12,
             fuzzy: FuzzyConfig::default(),
@@ -597,6 +599,7 @@ pub struct TraceyBanJailConfig {
     pub firewalld_zone: Option<String>,
     pub nftables_table: String,
     pub nftables_chain: String,
+    pub nftables_forward_chain: String,
     pub action_start: Option<String>,
     pub action_stop: Option<String>,
     pub action_ban: Option<String>,
@@ -644,6 +647,7 @@ impl Default for TraceyBanJailConfig {
             firewalld_zone: None,
             nftables_table: "tracey_ban".to_string(),
             nftables_chain: "tracey_input".to_string(),
+            nftables_forward_chain: "tracey_forward".to_string(),
             action_start: None,
             action_stop: None,
             action_ban: None,
@@ -1033,14 +1037,14 @@ impl Config {
             jail.ports.retain(|port| *port > 0);
             jail.ports.sort_unstable();
             jail.ports.dedup();
-            if jail.ports.is_empty() {
-                jail.ports = TraceyBanJailConfig::default().ports;
-            }
             if jail.nftables_table.trim().is_empty() {
                 jail.nftables_table = "tracey_ban".to_string();
             }
             if jail.nftables_chain.trim().is_empty() {
                 jail.nftables_chain = "tracey_input".to_string();
+            }
+            if jail.nftables_forward_chain.trim().is_empty() {
+                jail.nftables_forward_chain = "tracey_forward".to_string();
             }
             if jail.shell.trim().is_empty() {
                 jail.shell = "/bin/sh".to_string();
@@ -1288,6 +1292,12 @@ impl Config {
             "NM_TRACEY_BAN_ALLOW_SHELL_ACTIONS",
         ]) {
             self.tracey_ban.allow_shell_actions = value;
+        }
+        if let Some(value) = env_bool_any(&[
+            "TRACEY_BAN_ENFORCE_REMOTE_BANS",
+            "NM_TRACEY_BAN_ENFORCE_REMOTE_BANS",
+        ]) {
+            self.tracey_ban.enforce_remote_bans = value;
         }
         if let Some(value) = env_bool_any(&[
             "TRACEY_BAN_INHERIT_GLOBAL_FUZZY",
