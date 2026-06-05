@@ -763,6 +763,14 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     } else {
         crate::tracey_ban::BanStatusSnapshot::default()
     };
+    let (local_probe_entries, remote_probe_entries) = if let Some(ban_intel) = &service.ban_intel {
+        (
+            ban_intel.local_probe_entries(16).await,
+            ban_intel.remote_probe_entries(16).await,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let tracey_guard = if let Some(tracey_guard) = &service.tracey_guard {
         Some(tracey_guard.snapshot().await)
@@ -820,9 +828,14 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     let blocked_ip_locations = crate::location::infer_blocked_ip_locations(
         &ban_snapshot.local_entries,
         &ban_snapshot.remote_entries,
+        &local_probe_entries,
+        &remote_probe_entries,
         &location,
         &peer_locations,
     );
+    if let Some(ban_intel) = &service.ban_intel {
+        publish_blocked_ip_probe_intel(ban_intel, &blocked_ip_locations).await;
+    }
 
     StatusSnapshot {
         ts_ms: now_ms(),
@@ -876,6 +889,28 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         probe_watch,
         location,
         peer_locations,
+    }
+}
+
+async fn publish_blocked_ip_probe_intel(
+    ban_intel: &crate::tracey_ban::BanIntelHub,
+    blocked_ip_locations: &[crate::location::BlockedIpLocationSnapshot],
+) {
+    for entry in blocked_ip_locations {
+        if entry.probe.status != "cached" || entry.probe.origin != "local" {
+            continue;
+        }
+        let Some(sampled_at_ms) = entry.probe.sampled_at_ms else {
+            continue;
+        };
+        let _ = ban_intel
+            .update_local_probe_observation(crate::tracey_ban::BanProbeAdvertisementEntry {
+                ip: entry.ip.clone(),
+                sampled_at_ms,
+                mode: entry.probe.mode.clone(),
+                open_ports: entry.probe.open_ports.clone(),
+            })
+            .await;
     }
 }
 

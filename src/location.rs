@@ -12,6 +12,7 @@ const BLOCKED_IP_PROBE_TIMEOUT_MS: u64 = 180;
 const BLOCKED_IP_PROBE_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const BLOCKED_IP_PROBE_SCHEDULE_COOLDOWN_MS: u64 = 30_000;
 const BLOCKED_IP_PROBE_SCHEDULE_BUDGET: usize = 1;
+const BLOCKED_IP_PROBE_COHORT_TARGET: usize = 2;
 const BLOCKED_IP_PROBE_PORTS: &[u16] = &[443, 80];
 #[cfg(test)]
 const BLOCKED_IP_ACTIVE_PROBING_ENABLED: bool = false;
@@ -74,6 +75,7 @@ pub struct AgentLocationSnapshot {
 pub struct BlockedIpProbeSnapshot {
     pub mode: String,
     pub status: String,
+    pub origin: String,
     pub sampled_at_ms: Option<u64>,
     pub open_ports: Vec<u16>,
 }
@@ -108,6 +110,13 @@ struct BlockedIpAggregate {
     last_ban_ms: u64,
     local_seen: bool,
     remote_seen: bool,
+    probe_sampled_at_ms: Option<u64>,
+    probe_open_ports: BTreeSet<u16>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlockedIpProbePlan {
+    assigned_ports: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -290,6 +299,8 @@ pub fn infer_single_agent_location(
 pub fn infer_blocked_ip_locations(
     local_entries: &[crate::tracey_ban::BanAdvertisementEntry],
     remote_entries: &[crate::tracey_ban::BanAdvertisementEntry],
+    local_probe_entries: &[crate::tracey_ban::BanProbeAdvertisementEntry],
+    remote_probe_entries: &[crate::tracey_ban::BanProbeAdvertisementEntry],
     local: &AgentLocationSnapshot,
     peers: &[AgentLocationSnapshot],
 ) -> Vec<BlockedIpLocationSnapshot> {
@@ -299,6 +310,12 @@ pub fn infer_blocked_ip_locations(
     }
     for entry in remote_entries {
         accumulate_blocked_ip(&mut aggregates, entry, false);
+    }
+    for entry in local_probe_entries {
+        accumulate_blocked_ip_probe(&mut aggregates, entry);
+    }
+    for entry in remote_probe_entries {
+        accumulate_blocked_ip_probe(&mut aggregates, entry);
     }
 
     let mut ordered: Vec<BlockedIpAggregate> = aggregates.into_values().collect();
@@ -314,7 +331,14 @@ pub fn infer_blocked_ip_locations(
     let mut probe_budget = BLOCKED_IP_PROBE_SCHEDULE_BUDGET;
     ordered
         .into_iter()
-        .filter_map(|entry| infer_blocked_entry_location(entry, &trusted_nodes, &mut probe_budget))
+        .filter_map(|entry| {
+            infer_blocked_entry_location(
+                entry,
+                local.agent_id.as_str(),
+                &trusted_nodes,
+                &mut probe_budget,
+            )
+        })
         .collect()
 }
 
@@ -342,8 +366,36 @@ fn accumulate_blocked_ip(
     }
 }
 
+fn accumulate_blocked_ip_probe(
+    aggregates: &mut HashMap<String, BlockedIpAggregate>,
+    entry: &crate::tracey_ban::BanProbeAdvertisementEntry,
+) {
+    let Ok(parsed) = entry.ip.parse::<IpAddr>() else {
+        return;
+    };
+    if entry.sampled_at_ms == 0 {
+        return;
+    }
+    let ip = parsed.to_string();
+    let Some(slot) = aggregates.get_mut(&ip) else {
+        return;
+    };
+    if slot
+        .probe_sampled_at_ms
+        .is_none_or(|current| entry.sampled_at_ms >= current)
+    {
+        slot.probe_sampled_at_ms = Some(entry.sampled_at_ms);
+    }
+    for port in &entry.open_ports {
+        if *port > 0 {
+            slot.probe_open_ports.insert(*port);
+        }
+    }
+}
+
 fn infer_blocked_entry_location(
     entry: BlockedIpAggregate,
+    local_agent_id: &str,
     trusted_nodes: &[AgentLocationSnapshot],
     probe_budget: &mut usize,
 ) -> Option<BlockedIpLocationSnapshot> {
@@ -435,11 +487,11 @@ fn infer_blocked_entry_location(
         });
     }
 
-    let probe = blocked_ip_probe_snapshot(&entry.ip, probe_budget);
-    if probe.status == "cached" && !probe.open_ports.is_empty() {
+    let probe = blocked_ip_probe_snapshot(&entry, ip, local_agent_id, trusted_nodes, probe_budget);
+    if (probe.status == "cached" || probe.status == "shared") && !probe.open_ports.is_empty() {
         confidence += 0.05;
         evidence.push(format!(
-            "minimal probe cached open tcp ports {}",
+            "distributed probe intel open tcp ports {}",
             probe
                 .open_ports
                 .iter()
@@ -453,10 +505,14 @@ fn infer_blocked_entry_location(
                 confidence: 0.57,
             });
         }
+    } else if probe.status == "shared" {
+        evidence.push("fleet-shared distributed probe intel reused".to_string());
     } else if probe.status == "scheduled" {
-        evidence.push("minimal probe scheduled (cached to avoid repeated scans)".to_string());
+        evidence.push("distributed low-noise probe slice scheduled".to_string());
     } else if probe.status == "pending" {
-        evidence.push("minimal probe already in progress".to_string());
+        evidence.push("distributed probe slice already in progress".to_string());
+    } else if probe.status == "delegated" {
+        evidence.push("probe slice delegated to a small trusted agent cohort".to_string());
     }
 
     confidence = confidence.clamp(0.0, 0.95);
@@ -540,30 +596,94 @@ fn is_private_like(ip: IpAddr) -> bool {
     }
 }
 
-fn blocked_ip_probe_snapshot(ip: &str, probe_budget: &mut usize) -> BlockedIpProbeSnapshot {
+fn blocked_ip_probe_snapshot(
+    entry: &BlockedIpAggregate,
+    ip: IpAddr,
+    local_agent_id: &str,
+    trusted_nodes: &[AgentLocationSnapshot],
+    probe_budget: &mut usize,
+) -> BlockedIpProbeSnapshot {
+    let ip_text = ip.to_string();
     let now = crate::event::now_ms();
     prune_blocked_ip_probe_cache(now);
-    let cached = blocked_ip_probe_cache_entry(ip);
+    let shared = blocked_ip_shared_probe_entry(entry, now);
+    let cached = blocked_ip_probe_cache_entry(&ip_text);
     if let Some(entry) = cached.as_ref() {
         if now.saturating_sub(entry.sampled_at_ms) <= BLOCKED_IP_PROBE_CACHE_TTL_MS {
-            return probe_snapshot("cached", Some(entry.clone()));
+            return probe_snapshot(
+                "distributed_minimal_tcp_connect",
+                "cached",
+                "local",
+                Some(entry.clone()),
+                shared,
+            );
         }
     }
+    if shared.is_some() {
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "shared",
+            "shared",
+            cached,
+            shared,
+        );
+    }
+
+    let plan = blocked_ip_probe_plan(&ip_text, local_agent_id, trusted_nodes);
 
     if !BLOCKED_IP_ACTIVE_PROBING_ENABLED {
-        return probe_snapshot("disabled", cached);
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "disabled",
+            "none",
+            cached,
+            None,
+        );
     }
-    if blocked_ip_probe_is_inflight(ip) {
-        return probe_snapshot("pending", cached);
+    if plan.assigned_ports.is_empty() {
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "delegated",
+            "none",
+            cached,
+            None,
+        );
+    }
+    if blocked_ip_probe_is_inflight(&ip_text) {
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "pending",
+            "none",
+            cached,
+            None,
+        );
     }
     if *probe_budget == 0 || !permit_probe_schedule(now) {
-        return probe_snapshot("deferred", cached);
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "deferred",
+            "none",
+            cached,
+            None,
+        );
     }
-    if schedule_blocked_ip_probe(ip.to_string()) {
+    if schedule_blocked_ip_probe(ip_text, plan.assigned_ports) {
         *probe_budget = probe_budget.saturating_sub(1);
-        return probe_snapshot("scheduled", cached);
+        return probe_snapshot(
+            "distributed_minimal_tcp_connect",
+            "scheduled",
+            "none",
+            cached,
+            None,
+        );
     }
-    probe_snapshot("deferred", cached)
+    probe_snapshot(
+        "distributed_minimal_tcp_connect",
+        "deferred",
+        "none",
+        cached,
+        None,
+    )
 }
 
 fn blocked_ip_probe_cache_entry(ip: &str) -> Option<BlockedIpProbeCacheEntry> {
@@ -598,10 +718,70 @@ fn permit_probe_schedule(now: u64) -> bool {
     true
 }
 
-fn schedule_blocked_ip_probe(ip: String) -> bool {
+fn blocked_ip_probe_plan(
+    ip: &str,
+    local_agent_id: &str,
+    trusted_nodes: &[AgentLocationSnapshot],
+) -> BlockedIpProbePlan {
+    if local_agent_id.trim().is_empty() {
+        return BlockedIpProbePlan {
+            assigned_ports: BLOCKED_IP_PROBE_PORTS.to_vec(),
+        };
+    }
+    let mut participants = trusted_nodes
+        .iter()
+        .map(|node| node.agent_id.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    participants.push(local_agent_id.trim().to_string());
+    participants.sort();
+    participants.dedup();
+    if participants.is_empty() {
+        return BlockedIpProbePlan::default();
+    }
+    let cohort_size = BLOCKED_IP_PROBE_COHORT_TARGET
+        .max(1)
+        .min(participants.len());
+    let mut cohort = Vec::with_capacity(cohort_size);
+    let start = (stable_u64(ip) % participants.len() as u64) as usize;
+    for offset in 0..cohort_size {
+        let idx = (start + offset) % participants.len();
+        cohort.push(participants[idx].clone());
+    }
+
+    let mut assigned_ports = Vec::new();
+    for port in BLOCKED_IP_PROBE_PORTS {
+        let key = format!("{ip}:{port}");
+        let owner_idx = (stable_u64(&key) % cohort.len() as u64) as usize;
+        if cohort[owner_idx] == local_agent_id {
+            assigned_ports.push(*port);
+        }
+    }
+    BlockedIpProbePlan { assigned_ports }
+}
+
+fn blocked_ip_shared_probe_entry(
+    entry: &BlockedIpAggregate,
+    now: u64,
+) -> Option<BlockedIpProbeCacheEntry> {
+    let sampled_at_ms = entry.probe_sampled_at_ms?;
+    if now.saturating_sub(sampled_at_ms) > BLOCKED_IP_PROBE_CACHE_TTL_MS {
+        return None;
+    }
+    Some(BlockedIpProbeCacheEntry {
+        sampled_at_ms,
+        open_ports: entry.probe_open_ports.iter().copied().collect(),
+    })
+}
+
+fn schedule_blocked_ip_probe(ip: String, ports: Vec<u16>) -> bool {
     let Ok(parsed_ip) = ip.parse::<IpAddr>() else {
         return false;
     };
+    if ports.is_empty() {
+        return false;
+    }
     {
         let mut inflight = blocked_ip_probe_inflight()
             .lock()
@@ -615,7 +795,7 @@ fn schedule_blocked_ip_probe(ip: String) -> bool {
     let label = shorten(&format!("tracey-ban-{}", ip.replace(':', "_")), 24);
     let probe_ip = ip.clone();
     let thread = std::thread::Builder::new().name(label).spawn(move || {
-        let open_ports = run_minimal_blocked_ip_probe(parsed_ip);
+        let open_ports = run_minimal_blocked_ip_probe(parsed_ip, &ports);
         let sampled_at_ms = crate::event::now_ms();
         blocked_ip_probe_cache()
             .write()
@@ -643,9 +823,9 @@ fn schedule_blocked_ip_probe(ip: String) -> bool {
     true
 }
 
-fn run_minimal_blocked_ip_probe(ip: IpAddr) -> Vec<u16> {
+fn run_minimal_blocked_ip_probe(ip: IpAddr, ports: &[u16]) -> Vec<u16> {
     let mut open_ports = Vec::new();
-    for port in BLOCKED_IP_PROBE_PORTS {
+    for port in ports {
         let socket = SocketAddr::new(ip, *port);
         if TcpStream::connect_timeout(&socket, Duration::from_millis(BLOCKED_IP_PROBE_TIMEOUT_MS))
             .is_ok()
@@ -657,15 +837,42 @@ fn run_minimal_blocked_ip_probe(ip: IpAddr) -> Vec<u16> {
 }
 
 fn probe_snapshot(
+    mode: &str,
     status: &str,
+    origin: &str,
     cached: Option<BlockedIpProbeCacheEntry>,
+    shared: Option<BlockedIpProbeCacheEntry>,
 ) -> BlockedIpProbeSnapshot {
-    BlockedIpProbeSnapshot {
-        mode: "minimal_tcp_connect".to_string(),
-        status: status.to_string(),
-        sampled_at_ms: cached.as_ref().map(|entry| entry.sampled_at_ms),
-        open_ports: cached.map(|entry| entry.open_ports).unwrap_or_default(),
+    let mut merged_ports = BTreeSet::new();
+    for entry in [cached.as_ref(), shared.as_ref()].into_iter().flatten() {
+        for port in &entry.open_ports {
+            if *port > 0 {
+                merged_ports.insert(*port);
+            }
+        }
     }
+    let sampled_at_ms = [cached.as_ref(), shared.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.sampled_at_ms)
+        .max();
+
+    BlockedIpProbeSnapshot {
+        mode: mode.to_string(),
+        status: status.to_string(),
+        origin: origin.to_string(),
+        sampled_at_ms,
+        open_ports: merged_ports.into_iter().collect(),
+    }
+}
+
+fn stable_u64(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn blocked_ip_probe_cache() -> &'static RwLock<HashMap<String, BlockedIpProbeCacheEntry>> {
@@ -2056,7 +2263,7 @@ mod tests {
             last_ban_ms: 100,
         }];
 
-        let inferred = infer_blocked_ip_locations(&local_entries, &[], &local, &[]);
+        let inferred = infer_blocked_ip_locations(&local_entries, &[], &[], &[], &local, &[]);
         assert_eq!(inferred.len(), 1);
         assert_eq!(inferred[0].ip, "10.42.7.250");
         assert_eq!(inferred[0].source, "local");
@@ -2095,11 +2302,50 @@ mod tests {
             last_ban_ms: 120,
         }];
 
-        let inferred = infer_blocked_ip_locations(&local_entries, &remote_entries, &local, &[]);
+        let inferred =
+            infer_blocked_ip_locations(&local_entries, &remote_entries, &[], &[], &local, &[]);
         assert_eq!(inferred.len(), 1);
         assert_eq!(inferred[0].source, "local+remote");
         assert_eq!(inferred[0].ban_count, 3);
         assert_eq!(inferred[0].last_ban_ms, 120);
         assert_eq!(inferred[0].probe.status, "disabled");
+    }
+
+    #[test]
+    fn blocked_ip_location_inference_reuses_shared_probe_intel() {
+        let local = AgentLocationSnapshot {
+            agent_id: "tracey-alpha".to_string(),
+            host: "alpha".to_string(),
+            addresses: vec!["10.42.7.10".to_string()],
+            is_self: true,
+            ..AgentLocationSnapshot::default()
+        };
+        let local_entries = vec![crate::tracey_ban::BanAdvertisementEntry {
+            ip: "185.136.52.240".to_string(),
+            jail: "web-file-scan-probe".to_string(),
+            expires_ms: None,
+            ban_count: 2,
+            last_ban_ms: 100,
+        }];
+        let sampled_at_ms = crate::event::now_ms();
+        let remote_probe_entries = vec![crate::tracey_ban::BanProbeAdvertisementEntry {
+            ip: "185.136.52.240".to_string(),
+            sampled_at_ms,
+            mode: "distributed_minimal_tcp_connect".to_string(),
+            open_ports: vec![443],
+        }];
+
+        let inferred = infer_blocked_ip_locations(
+            &local_entries,
+            &[],
+            &[],
+            &remote_probe_entries,
+            &local,
+            &[],
+        );
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].probe.status, "shared");
+        assert_eq!(inferred[0].probe.origin, "shared");
+        assert_eq!(inferred[0].probe.open_ports, vec![443]);
     }
 }

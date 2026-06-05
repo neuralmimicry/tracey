@@ -41,6 +41,8 @@ const FIREWALL_ACTION_KEYWORDS: &[&str] = &[
 ];
 const TRACEY_BAN_LOCAL_SNAPSHOT_MAX_ENTRIES: usize = 128;
 const TRACEY_BAN_REMOTE_SNAPSHOT_MAX_ENTRIES: usize = 128;
+const TRACEY_BAN_PROBE_LOCAL_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const TRACEY_BAN_PROBE_MAX_PORTS_PER_ENTRY: usize = 16;
 const TRACEY_BAN_LOG_GLOB_MAX_MATCHES: usize = 4096;
 const TRACEY_BAN_MISSING_LOG_WARN_INTERVAL_MS: u64 = 300_000;
 
@@ -263,11 +265,23 @@ pub struct BanAdvertisementEntry {
     pub last_ban_ms: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BanProbeAdvertisementEntry {
+    pub ip: String,
+    pub sampled_at_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_ports: Vec<u16>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct BanAdvertisement {
     pub ts_ms: u64,
     pub epoch: u64,
     pub entries: Vec<BanAdvertisementEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_entries: Vec<BanProbeAdvertisementEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -289,12 +303,14 @@ struct LocalBanRecord {
 struct RemoteBanRecord {
     ts_ms: u64,
     entries: Vec<BanAdvertisementEntry>,
+    probe_entries: Vec<BanProbeAdvertisementEntry>,
 }
 
 #[derive(Default)]
 struct BanIntelState {
     epoch: u64,
     local: HashMap<String, LocalBanRecord>,
+    local_probe: HashMap<String, BanProbeAdvertisementEntry>,
     remote: HashMap<String, RemoteBanRecord>,
     remote_ttl_ms: u64,
 }
@@ -310,6 +326,7 @@ impl BanIntelHub {
             state: Arc::new(RwLock::new(BanIntelState {
                 epoch: 0,
                 local: HashMap::new(),
+                local_probe: HashMap::new(),
                 remote: HashMap::new(),
                 remote_ttl_ms,
             })),
@@ -360,10 +377,18 @@ impl BanIntelHub {
             entries.truncate(max_entries);
         }
 
+        let mut probe_entries: Vec<BanProbeAdvertisementEntry> =
+            state.local_probe.values().cloned().collect();
+        probe_entries.sort_by(|a, b| b.sampled_at_ms.cmp(&a.sampled_at_ms));
+        if probe_entries.len() > max_entries {
+            probe_entries.truncate(max_entries);
+        }
+
         BanAdvertisement {
             ts_ms: now_ms(),
             epoch: state.epoch,
             entries,
+            probe_entries,
         }
     }
 
@@ -380,11 +405,19 @@ impl BanIntelHub {
             entries.push(entry);
         }
 
+        let mut probe_entries = Vec::with_capacity(advertisement.probe_entries.len());
+        for entry in advertisement.probe_entries {
+            if let Some(entry) = sanitize_probe_entry(entry) {
+                probe_entries.push(entry);
+            }
+        }
+
         state.remote.insert(
             agent_id.to_string(),
             RemoteBanRecord {
                 ts_ms: advertisement.ts_ms,
                 entries,
+                probe_entries,
             },
         );
     }
@@ -439,12 +472,65 @@ impl BanIntelHub {
             remote_entries: remote_entries.into_iter().take(max_entries).collect(),
         }
     }
+
+    pub async fn update_local_probe_observation(
+        &self,
+        mut entry: BanProbeAdvertisementEntry,
+    ) -> bool {
+        let Some(entry) = sanitize_probe_entry(std::mem::take(&mut entry)) else {
+            return false;
+        };
+        let mut state = self.state.write().await;
+        cleanup_expired(&mut state, now_ms());
+        let key = entry.ip.clone();
+        let changed = state
+            .local_probe
+            .get(&key)
+            .map(|existing| {
+                existing.sampled_at_ms != entry.sampled_at_ms
+                    || existing.mode != entry.mode
+                    || existing.open_ports != entry.open_ports
+            })
+            .unwrap_or(true);
+        if changed {
+            state.epoch = state.epoch.saturating_add(1);
+            state.local_probe.insert(key, entry);
+        }
+        changed
+    }
+
+    pub async fn local_probe_entries(&self, max_entries: usize) -> Vec<BanProbeAdvertisementEntry> {
+        let mut state = self.state.write().await;
+        cleanup_expired(&mut state, now_ms());
+        let mut entries: Vec<BanProbeAdvertisementEntry> =
+            state.local_probe.values().cloned().collect();
+        entries.sort_by(|a, b| b.sampled_at_ms.cmp(&a.sampled_at_ms));
+        entries.into_iter().take(max_entries).collect()
+    }
+
+    pub async fn remote_probe_entries(
+        &self,
+        max_entries: usize,
+    ) -> Vec<BanProbeAdvertisementEntry> {
+        let mut state = self.state.write().await;
+        cleanup_expired(&mut state, now_ms());
+        let mut entries: Vec<BanProbeAdvertisementEntry> = state
+            .remote
+            .values()
+            .flat_map(|record| record.probe_entries.iter().cloned())
+            .collect();
+        entries.sort_by(|a, b| b.sampled_at_ms.cmp(&a.sampled_at_ms));
+        entries.into_iter().take(max_entries).collect()
+    }
 }
 
 fn cleanup_expired(state: &mut BanIntelState, now: u64) {
     state
         .local
         .retain(|_, record| record.entry.expires_ms.is_none_or(|expires| expires > now));
+    state.local_probe.retain(|_, entry| {
+        now.saturating_sub(entry.sampled_at_ms) <= TRACEY_BAN_PROBE_LOCAL_TTL_MS
+    });
 
     let remote_ttl_ms = state.remote_ttl_ms;
     state
@@ -454,7 +540,32 @@ fn cleanup_expired(state: &mut BanIntelState, now: u64) {
         record
             .entries
             .retain(|entry| entry.expires_ms.is_none_or(|expires| expires > now));
+        record.probe_entries.retain(|entry| {
+            now.saturating_sub(entry.sampled_at_ms) <= TRACEY_BAN_PROBE_LOCAL_TTL_MS
+        });
     }
+}
+
+fn sanitize_probe_entry(
+    mut entry: BanProbeAdvertisementEntry,
+) -> Option<BanProbeAdvertisementEntry> {
+    let Some(ip) = normalize_ip(&entry.ip) else {
+        return None;
+    };
+    if entry.sampled_at_ms == 0 {
+        return None;
+    }
+    entry.ip = ip;
+    entry.mode = entry.mode.trim().to_string();
+    entry.open_ports = entry
+        .open_ports
+        .into_iter()
+        .filter(|port| *port > 0)
+        .take(TRACEY_BAN_PROBE_MAX_PORTS_PER_ENTRY)
+        .collect::<Vec<_>>();
+    entry.open_ports.sort_unstable();
+    entry.open_ports.dedup();
+    Some(entry)
 }
 
 fn make_ban_key(jail: &str, ip: &str) -> String {
@@ -5690,6 +5801,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_intel_is_shared_through_ban_advertisement() {
+        let source_hub = BanIntelHub::new(60_000);
+        source_hub
+            .update_local_probe_observation(BanProbeAdvertisementEntry {
+                ip: "185.136.52.240".to_string(),
+                sampled_at_ms: now_ms(),
+                mode: "distributed_minimal_tcp_connect".to_string(),
+                open_ports: vec![80, 443],
+            })
+            .await;
+
+        let advertisement = source_hub.build_advertisement(8).await;
+        assert_eq!(advertisement.probe_entries.len(), 1);
+
+        let sink_hub = BanIntelHub::new(60_000);
+        sink_hub.ingest_remote("peer-a", advertisement).await;
+        let remote_probe_entries = sink_hub.remote_probe_entries(8).await;
+        assert_eq!(remote_probe_entries.len(), 1);
+        assert_eq!(remote_probe_entries[0].ip, "185.136.52.240");
+        assert_eq!(remote_probe_entries[0].open_ports, vec![80, 443]);
+    }
+
+    #[tokio::test]
     async fn remote_ban_advertisement_installs_matching_local_jail_ban() {
         let mut config = TraceyBanConfig::default();
         config.agent_id = "unit".to_string();
@@ -5733,6 +5867,7 @@ mod tests {
                         ban_count: 1,
                         last_ban_ms: now,
                     }],
+                    probe_entries: Vec::new(),
                 },
             )
             .await;

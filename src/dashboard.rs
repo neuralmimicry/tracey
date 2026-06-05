@@ -4597,6 +4597,7 @@ mod tests {
             probe: crate::location::BlockedIpProbeSnapshot {
                 mode: "minimal_tcp_connect".to_string(),
                 status: "cached".to_string(),
+                origin: "local".to_string(),
                 sampled_at_ms: Some(1),
                 open_ports: vec![443],
             },

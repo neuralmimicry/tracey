@@ -674,6 +674,16 @@ fn parse_ban_advertisement_lossy(value: &Value) -> Option<crate::tracey_ban::Ban
         ts_ms,
         epoch,
         entries,
+        probe_entries: if let Some(items) =
+            peer_compat::array_for(&object, &["probe_entries", "probeEntries", "probes"])
+        {
+            items
+                .into_iter()
+                .filter_map(|entry| parse_probe_entry_lossy(&entry))
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -700,6 +710,49 @@ fn parse_ban_entry_lossy(
         )
         .and_then(peer_compat::coerce_u64)
         .unwrap_or(advertisement_ts_ms),
+    })
+}
+
+fn parse_probe_entry_lossy(value: &Value) -> Option<crate::tracey_ban::BanProbeAdvertisementEntry> {
+    let object = peer_compat::value_as_object(value)?;
+    let ip = peer_compat::value_for(&object, &["ip", "address", "addr", "host"])
+        .and_then(peer_compat::coerce_string)?;
+    let sampled_at_ms = peer_compat::value_for(
+        &object,
+        &["sampled_at_ms", "sampledAtMs", "ts_ms", "timestamp_ms"],
+    )
+    .and_then(peer_compat::coerce_u64)
+    .unwrap_or(0);
+    if sampled_at_ms == 0 {
+        return None;
+    }
+    let mode = peer_compat::value_for(&object, &["mode", "probe_mode", "probeMode"])
+        .and_then(peer_compat::coerce_string)
+        .unwrap_or_default();
+    let mut open_ports = Vec::new();
+    if let Some(raw_ports) = peer_compat::value_for(
+        &object,
+        &["open_ports", "openPorts", "ports", "open_tcp_ports"],
+    ) {
+        if let Some(items) = raw_ports.as_array() {
+            for value in items {
+                if let Some(port) = peer_compat::coerce_u64(value)
+                    && (1..=u16::MAX as u64).contains(&port)
+                {
+                    open_ports.push(port as u16);
+                }
+            }
+        } else if let Some(port) = peer_compat::coerce_u64(raw_ports)
+            && (1..=u16::MAX as u64).contains(&port)
+        {
+            open_ports.push(port as u16);
+        }
+    }
+    Some(crate::tracey_ban::BanProbeAdvertisementEntry {
+        ip,
+        sampled_at_ms,
+        mode,
+        open_ports,
     })
 }
 
@@ -952,6 +1005,41 @@ fn sanitize_announcement(
             );
         }
         advertisement.entries = cleaned;
+
+        let original_probe_len = advertisement.probe_entries.len();
+        let mut cleaned_probe = Vec::with_capacity(advertisement.probe_entries.len());
+        for mut entry in advertisement.probe_entries.drain(..) {
+            let Ok(ip) = entry.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            if entry.sampled_at_ms == 0 || entry.sampled_at_ms > now.saturating_add(60_000) {
+                continue;
+            }
+            entry.ip = ip.to_string();
+            entry.mode = entry.mode.trim().to_string();
+            entry.open_ports = entry
+                .open_ports
+                .into_iter()
+                .filter(|port| *port > 0)
+                .take(16)
+                .collect::<Vec<_>>();
+            entry.open_ports.sort_unstable();
+            entry.open_ports.dedup();
+            cleaned_probe.push(entry);
+            if cleaned_probe.len() >= max_advertised_ips {
+                break;
+            }
+        }
+        if original_probe_len > max_advertised_ips {
+            tracing::warn!(
+                peer = %peer,
+                agent_id = %announcement.agent_id,
+                received_entries = original_probe_len,
+                max_advertised_ips,
+                "discovery ban probe advertisement exceeded maximum entries and was truncated"
+            );
+        }
+        advertisement.probe_entries = cleaned_probe;
     }
 
     let drop_slurm = if let Some(snapshot) = announcement.slurm.as_mut() {
@@ -1208,6 +1296,7 @@ mod tests {
                         last_ban_ms: now,
                     },
                 ],
+                probe_entries: Vec::new(),
             }),
             fault_advertisement: None,
             slurm: None,
