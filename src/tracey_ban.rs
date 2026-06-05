@@ -10,7 +10,7 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -471,6 +471,28 @@ struct Detection {
     line: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ApiAccessObservation {
+    ts_ms: u64,
+    path: Option<String>,
+    status: Option<u16>,
+    body_bytes: Option<u64>,
+    cookie_fp: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ApiAbuseAssessment {
+    retry_reduction: u32,
+    behavior_pressure: f64,
+    path_hits: u32,
+    unauthorized_hits: u32,
+    repeated_body_hits: u32,
+    cookie_fp_samples: u32,
+    cookie_fp_distinct: u32,
+    cookie_variation_suspected: bool,
+    current_cookie_fp: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct FuzzyBanDecision {
     risk: f64,
@@ -639,6 +661,7 @@ struct JailRuntime {
     ignore_networks: Vec<IgnoreNetwork>,
     ignore_ip_raw: HashSet<String>,
     failure_windows: HashMap<String, VecDeque<u64>>,
+    api_observations: HashMap<String, VecDeque<ApiAccessObservation>>,
     active_bans: HashMap<String, ActiveBan>,
     ban_counts: HashMap<String, u32>,
     scorer: AdaptiveScorer,
@@ -712,6 +735,7 @@ impl JailRuntime {
             ignore_networks,
             ignore_ip_raw,
             failure_windows: HashMap::new(),
+            api_observations: HashMap::new(),
             active_bans: HashMap::new(),
             ban_counts: HashMap::new(),
             scorer: AdaptiveScorer::new(tracey_ban_cfg.min_samples, tracey_ban_cfg.fuzzy.clone()),
@@ -850,6 +874,10 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
         r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:/\.git-credentials(?:[/?][^"]*)?|/\.npmrc(?:[/?][^"]*)?|/\.yarnrc(?:\.yml)?(?:[/?][^"]*)?|/\.pypirc(?:[/?][^"]*)?|/\.vscode/settings\.json(?:[/?][^"]*)?|/\.idea/workspace\.xml(?:[/?][^"]*)?|/\.github/workflows/[^"?\s]+(?:[/?][^"]*)?|/jenkinsfile(?:[/?][^"]*)?|/\.gitlab-ci\.yml(?:[/?][^"]*)?|/(?:next|nuxt|vite)\.config\.js(?:[/?][^"]*)?|/firebase\.json(?:[/?][^"]*)?|/amplify\.yml(?:[/?][^"]*)?|/\.firebase/hosting\.json(?:[/?][^"]*)?|/composer\.json(?:[/?][^"]*)?|/docker-compose\.ya?ml(?:[/?][^"]*)?) HTTP/[0-9.]+" \d{3} .*$"#,
         r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:/\.git/config(?:[/?][^"]*)?|/wp-config\.php(?:\.[A-Za-z0-9._-]+)?(?:[/?][^"]*)?|/config\.php(?:\.[A-Za-z0-9._-]+)?(?:[/?][^"]*)?|/phpinfo\.php(?:[/?][^"]*)?|/config\.json\.(?:save|bak|backup|old|orig|tmp)(?:[/?][^"]*)?|/aws(?:[-.]config)?\.js(?:[/?][^"]*)?) HTTP/[0-9.]+" \d{3} .*$"#,
     ];
+    const WEB_API_RATE_ABUSE_LOG_PATHS: &[&str] = REFINER_WEB_PROBE_LOG_PATHS;
+    const WEB_API_RATE_ABUSE_FAIL_REGEX: &[&str] = &[
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) /api/(?:session|auth/config|login(?:/mfa/totp)?|register|setup|sso/issue|oidc/exchange|profile(?:/password)?|profile/mfa/totp/(?:start|verify|disable)|profile/passkeys/register/(?:options|verify)|passkeys/authenticate/(?:options|verify))(?:[/?][^"]*)? HTTP/[0-9.]+" \d{3} .*$"#,
+    ];
     const RECIDIVE_LOG_PATHS: &[&str] = &["tracey.log.jsonl"];
     const RECIDIVE_FAIL_REGEX: &[&str] = &[
         r#"(?i)^\{"type":"ban_update","payload":\{.*"jail":"[^"]+".*"ip":"<HOST>".*"banned":true.*\}\}\s*$"#,
@@ -919,6 +947,24 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
             ports: WEB_APP_PORTS,
             protocol: "tcp",
         }),
+        "web-api-rate-abuse" => Some(FilterCatalogDefinition {
+            description: "Repeated API authentication/session endpoint probing from web access logs (generic, including Refiner and CRI pod logs)",
+            log_paths: WEB_API_RATE_ABUSE_LOG_PATHS,
+            journal_matches: EMPTY,
+            fail_regex: WEB_API_RATE_ABUSE_FAIL_REGEX,
+            ignore_regex: EMPTY,
+            ports: WEB_APP_PORTS,
+            protocol: "tcp",
+        }),
+        "refiner-api-rate-abuse" => Some(FilterCatalogDefinition {
+            description: "Compatibility alias for web-api-rate-abuse",
+            log_paths: WEB_API_RATE_ABUSE_LOG_PATHS,
+            journal_matches: EMPTY,
+            fail_regex: WEB_API_RATE_ABUSE_FAIL_REGEX,
+            ignore_regex: EMPTY,
+            ports: WEB_APP_PORTS,
+            protocol: "tcp",
+        }),
         "refiner-web-probe" => Some(FilterCatalogDefinition {
             description: "Compatibility alias for web-file-scan-probe",
             log_paths: REFINER_WEB_PROBE_LOG_PATHS,
@@ -949,6 +995,8 @@ pub fn built_in_filter_catalog_summaries() -> Vec<TraceyBanFilterCatalogInfo> {
         "apache-auth",
         "postfix",
         "web-file-scan-probe",
+        "web-api-rate-abuse",
+        "refiner-api-rate-abuse",
         "refiner-web-probe",
         "recidive",
     ]
@@ -2357,6 +2405,350 @@ fn ip_extract_re() -> &'static Regex {
     })
 }
 
+fn is_api_rate_abuse_jail(config: &TraceyBanJailConfig) -> bool {
+    if matches!(
+        config.filter_catalog.as_deref(),
+        Some("web-api-rate-abuse" | "refiner-api-rate-abuse")
+    ) {
+        return true;
+    }
+    let lower_name = config.name.to_ascii_lowercase();
+    lower_name.contains("api-rate") || lower_name.contains("session-probe")
+}
+
+fn is_external_source_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => !is_internal_ipv4(addr),
+        Ok(IpAddr::V6(addr)) => !is_internal_ipv6(addr),
+        Err(_) => false,
+    }
+}
+
+fn is_internal_ipv4(addr: Ipv4Addr) -> bool {
+    if addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+    {
+        return true;
+    }
+    // RFC 6598 shared CGNAT address space.
+    let octets = addr.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_internal_ipv6(addr: Ipv6Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_unique_local()
+        || addr.is_unicast_link_local()
+        || addr.is_multicast()
+}
+
+fn assess_api_abuse_patterns(
+    jail: &mut JailRuntime,
+    detection: &Detection,
+    external_risk_bias: bool,
+) -> ApiAbuseAssessment {
+    if !is_api_rate_abuse_jail(&jail.config) {
+        return ApiAbuseAssessment::default();
+    }
+    let Some(raw_line) = detection.line.as_deref() else {
+        return ApiAbuseAssessment::default();
+    };
+    let Some(mut observation) = parse_api_access_observation(raw_line) else {
+        return ApiAbuseAssessment::default();
+    };
+
+    observation.ts_ms = detection.ts_ms;
+    let current_path = observation.path.clone();
+    let current_cookie_fp = observation.cookie_fp.clone();
+    let window_start = detection
+        .ts_ms
+        .saturating_sub(jail.config.find_time_ms.max(1));
+
+    let queue = jail
+        .api_observations
+        .entry(detection.ip.clone())
+        .or_default();
+    queue.push_back(observation);
+    while queue
+        .front()
+        .is_some_and(|entry| entry.ts_ms < window_start)
+    {
+        queue.pop_front();
+    }
+
+    let mut path_hits = 0u32;
+    let mut unauthorized_hits = 0u32;
+    let mut body_repeats = HashMap::<u64, u32>::new();
+    let mut cookie_fingerprints = HashSet::<String>::new();
+    let mut cookie_fp_samples = 0u32;
+
+    for entry in queue.iter() {
+        let path_matches = match (current_path.as_deref(), entry.path.as_deref()) {
+            (Some(current), Some(candidate)) => current == candidate,
+            (Some(_), None) => false,
+            _ => true,
+        };
+        if !path_matches {
+            continue;
+        }
+
+        path_hits = path_hits.saturating_add(1);
+        if matches!(entry.status, Some(401 | 403)) {
+            unauthorized_hits = unauthorized_hits.saturating_add(1);
+        }
+        if let Some(bytes) = entry.body_bytes {
+            let counter = body_repeats.entry(bytes).or_insert(0);
+            *counter = counter.saturating_add(1);
+        }
+        if let Some(cookie_fp) = entry.cookie_fp.as_deref() {
+            cookie_fp_samples = cookie_fp_samples.saturating_add(1);
+            cookie_fingerprints.insert(cookie_fp.to_string());
+        }
+    }
+
+    let repeated_body_hits = body_repeats.values().copied().max().unwrap_or(0);
+    let cookie_fp_distinct = cookie_fingerprints.len() as u32;
+
+    let cookie_variation_suspected = if external_risk_bias {
+        cookie_fp_samples >= 3
+            && cookie_fp_distinct >= 2
+            && (unauthorized_hits >= 1 || path_hits >= 6)
+    } else {
+        cookie_fp_samples >= 4 && cookie_fp_distinct >= 3 && unauthorized_hits >= 2
+    };
+
+    let path_scale = path_hits.max(1) as f64;
+    let unauthorized_pressure = (unauthorized_hits as f64 / path_scale).clamp(0.0, 1.0);
+    let repeated_body_pressure = if repeated_body_hits >= 2 {
+        (repeated_body_hits as f64 / path_scale).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let cookie_pressure = if cookie_fp_samples == 0 {
+        0.0
+    } else {
+        (cookie_fp_distinct as f64 / cookie_fp_samples as f64).clamp(0.0, 1.0)
+    };
+    let churn_pressure = if cookie_variation_suspected { 1.0 } else { 0.0 };
+    let external_pressure = if external_risk_bias { 0.12 } else { 0.0 };
+    let behavior_pressure = (0.45 * unauthorized_pressure
+        + 0.20 * repeated_body_pressure
+        + 0.20 * cookie_pressure
+        + 0.15 * churn_pressure
+        + external_pressure)
+        .clamp(0.0, 1.0);
+
+    let mut retry_reduction = 0u32;
+    if unauthorized_hits >= 4 {
+        retry_reduction = retry_reduction.saturating_add(1);
+    }
+    if repeated_body_hits >= 6 && path_hits >= 6 {
+        retry_reduction = retry_reduction.saturating_add(1);
+    }
+    if cookie_variation_suspected {
+        retry_reduction = retry_reduction.saturating_add(1);
+    }
+    if external_risk_bias
+        && (unauthorized_hits >= 2 || behavior_pressure >= 0.65 || cookie_variation_suspected)
+    {
+        retry_reduction = retry_reduction.saturating_add(1);
+    }
+    if external_risk_bias && path_hits >= 10 {
+        retry_reduction = retry_reduction.saturating_add(1);
+    }
+
+    ApiAbuseAssessment {
+        retry_reduction: retry_reduction.min(3),
+        behavior_pressure,
+        path_hits,
+        unauthorized_hits,
+        repeated_body_hits,
+        cookie_fp_samples,
+        cookie_fp_distinct,
+        cookie_variation_suspected,
+        current_cookie_fp,
+    }
+}
+
+fn parse_api_access_observation(line: &str) -> Option<ApiAccessObservation> {
+    let candidate = strip_cri_access_log_prefix(line);
+    let captures = api_access_log_re().captures(candidate)?;
+    let path = captures
+        .name("path")
+        .map(|value| value.as_str().to_string());
+    let status = captures
+        .name("status")
+        .and_then(|value| value.as_str().parse::<u16>().ok());
+    let body_bytes = captures.name("bytes").and_then(|value| {
+        let raw = value.as_str();
+        if raw == "-" {
+            None
+        } else {
+            raw.parse::<u64>().ok()
+        }
+    });
+    let cookie_fp = extract_cookie_fingerprint(candidate);
+
+    Some(ApiAccessObservation {
+        ts_ms: 0,
+        path,
+        status,
+        body_bytes,
+        cookie_fp,
+    })
+}
+
+fn strip_cri_access_log_prefix(line: &str) -> &str {
+    if let Some(caps) = cri_access_log_prefix_re().captures(line)
+        && let Some(inner) = caps.name("line")
+    {
+        return inner.as_str();
+    }
+    line
+}
+
+fn cri_access_log_prefix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\S+\s+(?:stdout|stderr)\s+[FP]\s+(?P<line>.+)$"#).expect("cri log prefix")
+    })
+}
+
+fn api_access_log_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)"(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+(?P<path>/[^"\s]*)\s+HTTP/[0-9.]+"\s+(?P<status>\d{3})\s+(?P<bytes>\d+|-)"#,
+        )
+        .expect("api access log regex")
+    })
+}
+
+fn extract_cookie_fingerprint(line: &str) -> Option<String> {
+    if let Some(caps) = cookie_fp_field_re().captures(line)
+        && let Some(raw) = caps.name("fp")
+        && let Some(normalized) = normalize_cookie_fingerprint(raw.as_str())
+    {
+        return Some(normalized);
+    }
+
+    let raw_cookie = extract_cookie_header_material(line)?;
+    Some(hash_cookie_material(&raw_cookie))
+}
+
+fn normalize_cookie_fingerprint(value: &str) -> Option<String> {
+    let mut normalized = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase();
+    if normalized.len() < 8 {
+        return None;
+    }
+    if normalized.len() > 96 {
+        normalized.truncate(96);
+    }
+    Some(normalized)
+}
+
+fn extract_cookie_header_material(line: &str) -> Option<String> {
+    for re in [cookie_header_field_re(), cookie_json_field_re()] {
+        if let Some(caps) = re.captures(line)
+            && let Some(cookie) = caps.name("cookie")
+        {
+            let raw = cookie.as_str().trim();
+            if !raw.is_empty() {
+                return Some(raw.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn cookie_fp_field_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:cookie_fp|cookie_hash|cookie_digest|cookie_sha256|session_fp|session_hash|session_cookie_fp)\s*[:=]\s*"?(?P<fp>[A-Za-z0-9._:/+=-]{8,256})"?"#)
+            .expect("cookie fingerprint regex")
+    })
+}
+
+fn cookie_header_field_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?P<prefix>\b(?:cookie|http_cookie)\s*[:=]\s*")(?P<cookie>[^"]*)(?P<suffix>")"#,
+        )
+        .expect("cookie header regex")
+    })
+}
+
+fn cookie_json_field_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?P<prefix>"(?:cookie|http_cookie)"\s*:\s*")(?P<cookie>[^"]*)(?P<suffix>")"#,
+        )
+        .expect("cookie json regex")
+    })
+}
+
+fn hash_cookie_material(raw: &str) -> String {
+    let digest = blake3::hash(format!("tracey_cookie_fp_v1:{}", raw.trim()).as_bytes());
+    let hex = digest.to_hex().to_string();
+    format!("b3:{}", &hex[..24])
+}
+
+fn sanitize_cookie_material(raw: &str) -> String {
+    let mut tokens = Vec::new();
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some((name, value)) = trimmed.split_once('=') {
+            tokens.push(format!(
+                "{}={}",
+                name.trim(),
+                hash_cookie_material(value.trim())
+            ));
+        } else {
+            tokens.push(hash_cookie_material(trimmed));
+        }
+    }
+
+    if tokens.is_empty() {
+        hash_cookie_material(raw)
+    } else {
+        tokens.join("; ")
+    }
+}
+
+fn sanitize_sensitive_log_line(line: &str) -> String {
+    let mut sanitized = line.to_string();
+    for re in [cookie_header_field_re(), cookie_json_field_re()] {
+        sanitized = re
+            .replace_all(&sanitized, |caps: &Captures<'_>| {
+                let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or("");
+                let raw_cookie = caps.name("cookie").map(|m| m.as_str()).unwrap_or("");
+                let suffix = caps.name("suffix").map(|m| m.as_str()).unwrap_or("");
+                format!(
+                    "{}{}{}",
+                    prefix,
+                    sanitize_cookie_material(raw_cookie),
+                    suffix
+                )
+            })
+            .to_string();
+    }
+    sanitized
+}
+
 async fn process_detection(
     detection: Detection,
     jails: &mut HashMap<String, JailRuntime>,
@@ -2392,18 +2784,31 @@ async fn process_detection(
         queue.len() as u32
     };
     let remote_support = intel_hub.remote_support_count(&detection.ip).await as u32;
-    let effective_retry = jail
+    let base_effective_retry = jail
         .config
         .max_retry
         .saturating_sub(remote_support.min(jail.config.max_retry.saturating_sub(1)))
         .max(1);
+    let external_risk_bias =
+        is_external_source_ip(&detection.ip) && is_api_rate_abuse_jail(&jail.config);
+    let api_assessment = assess_api_abuse_patterns(jail, &detection, external_risk_bias);
+    let effective_retry = if external_risk_bias {
+        base_effective_retry.saturating_sub(1).max(1)
+    } else {
+        base_effective_retry
+    }
+    .saturating_sub(api_assessment.retry_reduction)
+    .max(1);
+    let sanitized_line = detection.line.as_deref().map(sanitize_sensitive_log_line);
     let fuzzy_decision = evaluate_fuzzy_decision(
         jail,
-        detection.line.as_deref(),
+        sanitized_line.as_deref(),
         &detection,
         attempts,
         effective_retry,
         remote_support,
+        external_risk_bias,
+        &api_assessment,
         config,
     );
     let adjusted_retry = fuzzy_decision
@@ -2419,12 +2824,22 @@ async fn process_detection(
     let next_ban_count = jail.ban_counts.get(&counter_key).copied().unwrap_or(0) + 1;
     let duration_ms = compute_ban_duration_ms(&jail.config, next_ban_count);
     let reason = format!(
-        "{} attempts={} threshold={} adjusted_retry={} remote_support={} fuzzy_risk={:.2} fuzzy_confidence={:.2} fuzzy_signal={:.2}",
+        "{} attempts={} threshold={} adjusted_retry={} remote_support={} external_risk_bias={} api_retry_reduction={} api_behavior_pressure={:.2} api_path_hits={} api_unauthorized_hits={} api_repeated_body_hits={} api_cookie_fp_samples={} api_cookie_fp_distinct={} api_cookie_variation_suspected={} api_cookie_fp_current={} fuzzy_risk={:.2} fuzzy_confidence={:.2} fuzzy_signal={:.2}",
         detection.reason,
         attempts,
         effective_retry,
         adjusted_retry,
         remote_support,
+        external_risk_bias,
+        api_assessment.retry_reduction,
+        api_assessment.behavior_pressure,
+        api_assessment.path_hits,
+        api_assessment.unauthorized_hits,
+        api_assessment.repeated_body_hits,
+        api_assessment.cookie_fp_samples,
+        api_assessment.cookie_fp_distinct,
+        api_assessment.cookie_variation_suspected,
+        api_assessment.current_cookie_fp.as_deref().unwrap_or("-"),
         fuzzy_decision
             .as_ref()
             .map(|decision| decision.risk)
@@ -2450,14 +2865,19 @@ async fn process_detection(
         &detection.source,
         &reason,
         duration_ms,
-        detection.line.as_deref(),
+        sanitized_line.as_deref(),
         fuzzy_decision.as_ref(),
         next_ban_count,
     )
     .await;
 
-    if installed && let Some(queue) = jail.failure_windows.get_mut(&detection.ip) {
-        queue.clear();
+    if installed {
+        if let Some(queue) = jail.failure_windows.get_mut(&detection.ip) {
+            queue.clear();
+        }
+        if let Some(queue) = jail.api_observations.get_mut(&detection.ip) {
+            queue.clear();
+        }
     }
 }
 
@@ -2468,6 +2888,8 @@ fn evaluate_fuzzy_decision(
     attempts: u32,
     effective_retry: u32,
     remote_support: u32,
+    external_risk_bias: bool,
+    api_assessment: &ApiAbuseAssessment,
     config: &TraceyBanConfig,
 ) -> Option<FuzzyBanDecision> {
     if !config.fuzzy.enabled {
@@ -2485,8 +2907,17 @@ fn evaluate_fuzzy_decision(
         remote_support,
         recidive_count,
         jail.config.max_retry,
+        external_risk_bias,
+        api_assessment.behavior_pressure,
     );
-    let severity = infer_detection_severity(line, attempts, effective_retry, remote_support);
+    let severity = infer_detection_severity(
+        line,
+        attempts,
+        effective_retry,
+        remote_support,
+        external_risk_bias,
+        api_assessment,
+    );
 
     let mut event = Event::new(
         TRACEY_BAN_FUZZY_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -2502,7 +2933,41 @@ fn evaluate_fuzzy_decision(
     .with_attr("attempts", attempts.to_string())
     .with_attr("effective_retry", effective_retry.to_string())
     .with_attr("remote_support", remote_support.to_string())
+    .with_attr("external_risk_bias", external_risk_bias.to_string())
+    .with_attr(
+        "api_behavior_pressure",
+        format!("{:.4}", api_assessment.behavior_pressure),
+    )
+    .with_attr(
+        "api_retry_reduction",
+        api_assessment.retry_reduction.to_string(),
+    )
+    .with_attr("api_path_hits", api_assessment.path_hits.to_string())
+    .with_attr(
+        "api_unauthorized_hits",
+        api_assessment.unauthorized_hits.to_string(),
+    )
+    .with_attr(
+        "api_repeated_body_hits",
+        api_assessment.repeated_body_hits.to_string(),
+    )
+    .with_attr(
+        "api_cookie_fp_samples",
+        api_assessment.cookie_fp_samples.to_string(),
+    )
+    .with_attr(
+        "api_cookie_fp_distinct",
+        api_assessment.cookie_fp_distinct.to_string(),
+    )
+    .with_attr(
+        "api_cookie_variation_suspected",
+        api_assessment.cookie_variation_suspected.to_string(),
+    )
     .with_attr("recidive_count", recidive_count.to_string());
+
+    if let Some(cookie_fp) = api_assessment.current_cookie_fp.as_deref() {
+        event = event.with_attr("api_cookie_fp_current", cookie_fp.to_string());
+    }
 
     if let Some(text) = line {
         let text = normalize_line_preview(text, 768);
@@ -2572,13 +3037,21 @@ fn build_fuzzy_signal(
     remote_support: u32,
     recidive_count: u32,
     max_retry: u32,
+    external_risk_bias: bool,
+    api_behavior_pressure: f64,
 ) -> f64 {
     let retry = effective_retry.max(1) as f64;
     let max_retry = max_retry.max(1) as f64;
     let attempt_pressure = (attempts as f64 / retry).clamp(0.0, 2.0);
     let remote_pressure = (remote_support as f64 / retry).clamp(0.0, 1.0);
     let recidive_pressure = (recidive_count as f64 / max_retry).clamp(0.0, 1.0);
-    (0.58 * (attempt_pressure / 2.0) + 0.22 * remote_pressure + 0.20 * recidive_pressure)
+    let external_pressure = if external_risk_bias { 1.0 } else { 0.0 };
+    let api_pressure = api_behavior_pressure.clamp(0.0, 1.0);
+    (0.42 * (attempt_pressure / 2.0)
+        + 0.16 * remote_pressure
+        + 0.15 * recidive_pressure
+        + 0.10 * external_pressure
+        + 0.17 * api_pressure)
         .clamp(0.0, 1.0)
 }
 
@@ -2587,13 +3060,32 @@ fn infer_detection_severity(
     attempts: u32,
     effective_retry: u32,
     remote_support: u32,
+    external_risk_bias: bool,
+    api_assessment: &ApiAbuseAssessment,
 ) -> Severity {
     let attempt_ratio = attempts as f64 / effective_retry.max(1) as f64;
-    if attempt_ratio >= 1.8 || remote_support >= 4 {
+    if api_assessment.cookie_variation_suspected && api_assessment.unauthorized_hits >= 2 {
+        if external_risk_bias || api_assessment.path_hits >= 6 {
+            return Severity::Critical;
+        }
+        return Severity::High;
+    }
+    if attempt_ratio >= 1.8 || remote_support >= 4 || (external_risk_bias && attempt_ratio >= 1.5) {
         return Severity::Critical;
     }
-    if attempt_ratio >= 1.2 || remote_support >= 2 {
+    if api_assessment.behavior_pressure >= 0.80 {
+        return Severity::Critical;
+    }
+    if attempt_ratio >= 1.2
+        || remote_support >= 2
+        || api_assessment.behavior_pressure >= 0.55
+        || api_assessment.unauthorized_hits >= 3
+        || (external_risk_bias && attempt_ratio >= 1.0)
+    {
         return Severity::High;
+    }
+    if api_assessment.unauthorized_hits >= 1 || api_assessment.repeated_body_hits >= 4 {
+        return Severity::Medium;
     }
 
     if let Some(line) = line {
@@ -4367,12 +4859,102 @@ mod tests {
 
     #[test]
     fn fuzzy_signal_increases_with_remote_and_recidive_pressure() {
-        let low = build_fuzzy_signal(2, 5, 0, 0, 5);
-        let high = build_fuzzy_signal(2, 5, 3, 5, 5);
+        let low = build_fuzzy_signal(2, 5, 0, 0, 5, false, 0.0);
+        let high = build_fuzzy_signal(2, 5, 3, 5, 5, false, 0.0);
         assert!(
             high > low,
             "expected higher fuzzy signal under more pressure"
         );
+    }
+
+    #[test]
+    fn fuzzy_signal_increases_for_external_api_bias() {
+        let internal = build_fuzzy_signal(3, 8, 0, 0, 8, false, 0.0);
+        let external = build_fuzzy_signal(3, 8, 0, 0, 8, true, 0.0);
+        assert!(
+            external > internal,
+            "expected external API abuse bias to increase fuzzy signal"
+        );
+    }
+
+    #[test]
+    fn fuzzy_signal_increases_with_api_behavior_pressure() {
+        let baseline = build_fuzzy_signal(3, 8, 0, 0, 8, false, 0.0);
+        let elevated = build_fuzzy_signal(3, 8, 0, 0, 8, false, 0.85);
+        assert!(
+            elevated > baseline,
+            "expected elevated api behavior pressure to raise fuzzy signal"
+        );
+    }
+
+    #[test]
+    fn sanitize_sensitive_log_line_redacts_raw_cookie_values() {
+        let line = r#"185.136.52.240 - - [05/Jun/2026 09:05:30] "GET /api/session HTTP/1.1" 403 512 Cookie: "sessionid=raw-token-123; csrftoken=another-secret""#;
+        let sanitized = sanitize_sensitive_log_line(line);
+        assert!(!sanitized.contains("raw-token-123"));
+        assert!(!sanitized.contains("another-secret"));
+        assert!(sanitized.contains("sessionid=b3:"));
+        assert!(sanitized.contains("csrftoken=b3:"));
+    }
+
+    #[test]
+    fn cookie_fingerprint_hashes_raw_cookie_material() {
+        let line = r#"185.136.52.240 - - [05/Jun/2026 09:05:30] "GET /api/session HTTP/1.1" 401 512 Cookie: "sessionid=raw-token-123; csrftoken=another-secret""#;
+        let fp = extract_cookie_fingerprint(line).expect("cookie fingerprint");
+        assert!(fp.starts_with("b3:"));
+        assert!(!fp.contains("raw-token-123"));
+        assert!(!fp.contains("another-secret"));
+    }
+
+    #[test]
+    fn parse_api_access_observation_reads_cookie_fp_field() {
+        let line = r#"185.136.52.240 - - [05/Jun/2026 09:05:30] "GET /api/session HTTP/1.1" 401 512 cookie_fp="B3:ABCDEF0123456789ABCDEF01""#;
+        let parsed = parse_api_access_observation(line).expect("parsed");
+        assert_eq!(parsed.path.as_deref(), Some("/api/session"));
+        assert_eq!(parsed.status, Some(401));
+        assert_eq!(parsed.body_bytes, Some(512));
+        assert_eq!(
+            parsed.cookie_fp.as_deref(),
+            Some("b3:abcdef0123456789abcdef01")
+        );
+    }
+
+    #[test]
+    fn api_assessment_detects_cookie_guessing_pattern() {
+        let tracey_cfg = TraceyBanConfig::default();
+        let jail_cfg = TraceyBanJailConfig {
+            name: "web-api-rate-abuse".to_string(),
+            filter_catalog: Some("web-api-rate-abuse".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let mut jail = JailRuntime::from_config(&jail_cfg, &tracey_cfg).expect("jail runtime");
+
+        let mut assessment = ApiAbuseAssessment::default();
+        for idx in 0..6u32 {
+            let cookie_fp = format!("b3:{:024x}", idx + 1);
+            let line = format!(
+                r#"185.136.52.240 - - [05/Jun/2026 09:05:3{}] "GET /api/session HTTP/1.1" 403 512 cookie_fp="{}""#,
+                idx % 10,
+                cookie_fp
+            );
+            let detection = Detection {
+                jail: "web-api-rate-abuse".to_string(),
+                ip: "185.136.52.240".to_string(),
+                ts_ms: 1_000 + idx as u64,
+                source: "unit".to_string(),
+                reason: "log_regex_match".to_string(),
+                line: Some(line),
+            };
+            assessment = assess_api_abuse_patterns(&mut jail, &detection, true);
+        }
+
+        assert!(assessment.cookie_variation_suspected);
+        assert!(
+            assessment.retry_reduction >= 2,
+            "expected stronger retry reduction for cookie-variation brute forcing"
+        );
+        assert!(assessment.unauthorized_hits >= 4);
+        assert!(assessment.cookie_fp_distinct >= 4);
     }
 
     #[test]
@@ -4609,6 +5191,8 @@ mod tests {
         assert!(filter_names.contains(&"apache-auth".to_string()));
         assert!(filter_names.contains(&"postfix".to_string()));
         assert!(filter_names.contains(&"web-file-scan-probe".to_string()));
+        assert!(filter_names.contains(&"web-api-rate-abuse".to_string()));
+        assert!(filter_names.contains(&"refiner-api-rate-abuse".to_string()));
         assert!(filter_names.contains(&"refiner-web-probe".to_string()));
         assert!(filter_names.contains(&"recidive".to_string()));
     }
@@ -4617,6 +5201,16 @@ mod tests {
     fn refiner_web_probe_catalog_is_compatibility_alias_for_web_file_scan_probe() {
         let web_scan = built_in_filter_catalog("web-file-scan-probe").expect("catalog exists");
         let alias = built_in_filter_catalog("refiner-web-probe").expect("catalog exists");
+        assert_eq!(web_scan.log_paths, alias.log_paths);
+        assert_eq!(web_scan.fail_regex, alias.fail_regex);
+        assert_eq!(web_scan.ports, alias.ports);
+        assert_eq!(web_scan.protocol, alias.protocol);
+    }
+
+    #[test]
+    fn refiner_api_rate_catalog_is_compatibility_alias_for_web_api_rate_abuse() {
+        let web_scan = built_in_filter_catalog("web-api-rate-abuse").expect("catalog exists");
+        let alias = built_in_filter_catalog("refiner-api-rate-abuse").expect("catalog exists");
         assert_eq!(web_scan.log_paths, alias.log_paths);
         assert_eq!(web_scan.fail_regex, alias.fail_regex);
         assert_eq!(web_scan.ports, alias.ports);
@@ -4741,6 +5335,36 @@ mod tests {
     }
 
     #[test]
+    fn web_api_rate_abuse_filter_matches_repeated_api_session_hits() {
+        let jail = TraceyBanJailConfig {
+            name: "web-api-rate-abuse".to_string(),
+            filter_catalog: Some("web-api-rate-abuse".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let line = r#"185.136.52.240 - - [05/Jun/2026 09:05:30] "GET /api/session HTTP/1.1" 200 -"#;
+        assert_eq!(
+            match_line_with_regexes(line, &fail, &[], None).as_deref(),
+            Some("185.136.52.240")
+        );
+    }
+
+    #[test]
+    fn web_api_rate_abuse_filter_ignores_non_target_api_paths() {
+        let jail = TraceyBanJailConfig {
+            name: "web-api-rate-abuse".to_string(),
+            filter_catalog: Some("web-api-rate-abuse".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let health_line =
+            r#"10.42.1.1 - - [05/Jun/2026 09:05:30] "GET /api/health HTTP/1.1" 200 -"#;
+        assert_eq!(match_line_with_regexes(health_line, &fail, &[], None), None);
+    }
+
+    #[test]
     fn refiner_web_probe_filter_matches_env_and_dotfile_scans() {
         let jail = TraceyBanJailConfig {
             name: "refiner-web-probe".to_string(),
@@ -4784,6 +5408,14 @@ mod tests {
             match_line_with_regexes(wp_config_line, &fail, &[], None).as_deref(),
             Some("45.148.10.62")
         );
+    }
+
+    #[test]
+    fn external_source_detection_distinguishes_private_and_public_ips() {
+        assert!(is_external_source_ip("185.136.52.240"));
+        assert!(!is_external_source_ip("10.42.1.6"));
+        assert!(!is_external_source_ip("192.168.1.70"));
+        assert!(!is_external_source_ip("127.0.0.1"));
     }
 
     #[test]

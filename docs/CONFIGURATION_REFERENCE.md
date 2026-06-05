@@ -401,6 +401,8 @@ Built-in filter catalogs:
 | `apache-auth` | Apache HTTP auth failures. |
 | `postfix` | Postfix SMTP AUTH failures. |
 | `web-file-scan-probe` | Generic web exploit and sensitive-file probe detection across nginx/apache/refiner access logs and CRI-prefixed Kubernetes pod logs (covers `.env` and related file-scanning attempts). |
+| `web-api-rate-abuse` | Repeated API authentication/session endpoint probing detection (including `/api/session`) for web access logs and CRI-prefixed Kubernetes pod logs, with additional nginx-style behavioural scoring (401/403 bursts, repeated response-size patterns, and cookie-fingerprint churn). Raw cookie values are redacted and one-way hashed before Tracey emits telemetry. |
+| `refiner-api-rate-abuse` | Compatibility alias for `web-api-rate-abuse`. |
 | `refiner-web-probe` | Compatibility alias for `web-file-scan-probe`. |
 | `recidive` | Repeat-offender escalation from TraceyBan ban records. |
 
