@@ -400,7 +400,8 @@ Built-in filter catalogs:
 | `nginx-http-auth` | Nginx basic-auth and htpasswd failures. |
 | `apache-auth` | Apache HTTP auth failures. |
 | `postfix` | Postfix SMTP AUTH failures. |
-| `refiner-web-probe` | Refiner, reverse-proxy, and CRI-prefixed Kubernetes pod access-log exploit probes such as PHP ini injection, PHPUnit `eval-stdin.php`, ThinkPHP invocation probes, path traversal, environment-file probes, and Docker API probes. |
+| `web-file-scan-probe` | Generic web exploit and sensitive-file probe detection across nginx/apache/refiner access logs and CRI-prefixed Kubernetes pod logs (covers `.env` and related file-scanning attempts). |
+| `refiner-web-probe` | Compatibility alias for `web-file-scan-probe`. |
 | `recidive` | Repeat-offender escalation from TraceyBan ban records. |
 
 Important behaviour:

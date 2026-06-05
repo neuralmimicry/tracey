@@ -542,6 +542,10 @@ pub struct TraceyBanConfig {
 
 impl Default for TraceyBanConfig {
     fn default() -> Self {
+        let mut default_jail = TraceyBanJailConfig::default();
+        default_jail.filter_catalog = Some("sshd".to_string());
+        default_jail.ports = vec![22];
+
         Self {
             enabled: false,
             state_path: PathBuf::from("tracey.tracey_ban.state.json"),
@@ -562,7 +566,7 @@ impl Default for TraceyBanConfig {
             fuzzy_min_risk: 0.62,
             fuzzy_min_confidence: 0.30,
             fuzzy_retry_reduction: 0.55,
-            jails: vec![TraceyBanJailConfig::default()],
+            jails: vec![default_jail],
         }
     }
 }
@@ -614,7 +618,7 @@ impl Default for TraceyBanJailConfig {
             name: "tracey-default".to_string(),
             enabled: true,
             backend: "auto".to_string(),
-            filter_catalog: Some("sshd".to_string()),
+            filter_catalog: None,
             action_catalog: Some("auto".to_string()),
             log_paths: Vec::new(),
             journal_matches: Vec::new(),
@@ -641,7 +645,7 @@ impl Default for TraceyBanJailConfig {
             ],
             event_require_message_match: true,
             scan_all_event_attrs_for_ip: false,
-            ports: vec![22],
+            ports: Vec::new(),
             protocol: "tcp".to_string(),
             firewall_backend: "auto".to_string(),
             firewalld_zone: None,

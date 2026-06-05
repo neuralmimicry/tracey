@@ -8,6 +8,7 @@ use crate::storage::{BanUpdateRecord, Storage};
 use crate::swarm::AdaptiveScorer;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ const FIREWALL_ACTION_KEYWORDS: &[&str] = &[
 const TRACEY_BAN_LOCAL_SNAPSHOT_MAX_ENTRIES: usize = 128;
 const TRACEY_BAN_REMOTE_SNAPSHOT_MAX_ENTRIES: usize = 128;
 const TRACEY_BAN_LOG_GLOB_MAX_MATCHES: usize = 4096;
+const TRACEY_BAN_MISSING_LOG_WARN_INTERVAL_MS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -829,6 +831,8 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
     ];
     const REFINER_WEB_PROBE_LOG_PATHS: &[&str] = &[
         "/var/log/nginx/access.log",
+        "/var/log/apache2/access.log",
+        "/var/log/httpd/access_log",
         "/var/log/nginx/refiner.access.log",
         "/var/log/nginx/refiner_access.log",
         "/var/log/nginx/refiner.neuralmimicry.ai.access.log",
@@ -841,7 +845,10 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
         "/var/log/pods/*/*/*.log",
     ];
     const REFINER_WEB_PROBE_FAIL_REGEX: &[&str] = &[
-        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:%ad|allow_url_include|auto_prepend_file|php://input|eval-stdin\.php|/vendor/phpunit|/phpunit(?:/|$)|think\\+app/invokefunction|pearcmd|(?:\.\./){2,}|/containers/json|/\.env(?:[/?\s]|$)|/wp-(?:admin|login)|/xmlrpc\.php|/cgi-bin/|/actuator(?:[/?\s]|$)|/server-status|/HNAP1|/setup\.cgi)[^"]* HTTP/[0-9.]+" \d{3} .*$"#,
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:%ad|allow_url_include|auto_prepend_file|php://input|eval-stdin\.php|/vendor/phpunit|/phpunit(?:/|$)|think\\+app/invokefunction|pearcmd|(?:\.\./){2,}|/containers/json|/wp-(?:admin|login)|/xmlrpc\.php|/cgi-bin/|/actuator(?:[/?\s]|$)|/server-status|/HNAP1|/setup\.cgi)[^"]* HTTP/[0-9.]+" \d{3} .*$"#,
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*/\.env(?:[._-][A-Za-z0-9][A-Za-z0-9._-]*)?(?:[/?][^"]*)? HTTP/[0-9.]+" \d{3} .*$"#,
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:/\.git-credentials(?:[/?][^"]*)?|/\.npmrc(?:[/?][^"]*)?|/\.yarnrc(?:\.yml)?(?:[/?][^"]*)?|/\.pypirc(?:[/?][^"]*)?|/\.vscode/settings\.json(?:[/?][^"]*)?|/\.idea/workspace\.xml(?:[/?][^"]*)?|/\.github/workflows/[^"?\s]+(?:[/?][^"]*)?|/jenkinsfile(?:[/?][^"]*)?|/\.gitlab-ci\.yml(?:[/?][^"]*)?|/(?:next|nuxt|vite)\.config\.js(?:[/?][^"]*)?|/firebase\.json(?:[/?][^"]*)?|/amplify\.yml(?:[/?][^"]*)?|/\.firebase/hosting\.json(?:[/?][^"]*)?|/composer\.json(?:[/?][^"]*)?|/docker-compose\.ya?ml(?:[/?][^"]*)?) HTTP/[0-9.]+" \d{3} .*$"#,
+        r#"(?i)^(?:\S+\s+(?:stdout|stderr)\s+[FP]\s+)?<HOST> \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) [^"]*(?:/\.git/config(?:[/?][^"]*)?|/wp-config\.php(?:\.[A-Za-z0-9._-]+)?(?:[/?][^"]*)?|/config\.php(?:\.[A-Za-z0-9._-]+)?(?:[/?][^"]*)?|/phpinfo\.php(?:[/?][^"]*)?|/config\.json\.(?:save|bak|backup|old|orig|tmp)(?:[/?][^"]*)?|/aws(?:[-.]config)?\.js(?:[/?][^"]*)?) HTTP/[0-9.]+" \d{3} .*$"#,
     ];
     const RECIDIVE_LOG_PATHS: &[&str] = &["tracey.log.jsonl"];
     const RECIDIVE_FAIL_REGEX: &[&str] = &[
@@ -903,8 +910,17 @@ fn built_in_filter_catalog(name: &str) -> Option<FilterCatalogDefinition> {
             ports: SMTP_PORTS,
             protocol: "tcp",
         }),
+        "web-file-scan-probe" => Some(FilterCatalogDefinition {
+            description: "Web access-log exploit and sensitive-file probes (generic, including Refiner and CRI pod logs)",
+            log_paths: REFINER_WEB_PROBE_LOG_PATHS,
+            journal_matches: EMPTY,
+            fail_regex: REFINER_WEB_PROBE_FAIL_REGEX,
+            ignore_regex: EMPTY,
+            ports: WEB_APP_PORTS,
+            protocol: "tcp",
+        }),
         "refiner-web-probe" => Some(FilterCatalogDefinition {
-            description: "Refiner and reverse-proxy access-log exploit probes",
+            description: "Compatibility alias for web-file-scan-probe",
             log_paths: REFINER_WEB_PROBE_LOG_PATHS,
             journal_matches: EMPTY,
             fail_regex: REFINER_WEB_PROBE_FAIL_REGEX,
@@ -932,6 +948,7 @@ pub fn built_in_filter_catalog_summaries() -> Vec<TraceyBanFilterCatalogInfo> {
         "nginx-http-auth",
         "apache-auth",
         "postfix",
+        "web-file-scan-probe",
         "refiner-web-probe",
         "recidive",
     ]
@@ -1021,7 +1038,7 @@ fn merge_filter_catalog_into_jail(
     extend_unique(&mut merged_ignore_regex, resolved.ignore_regex.clone());
     resolved.ignore_regex = merged_ignore_regex;
 
-    if resolved.ports.is_empty() || resolved.ports == TraceyBanJailConfig::default().ports {
+    if resolved.ports.is_empty() {
         resolved.ports = definition.ports.to_vec();
     }
     if resolved.protocol.trim().is_empty()
@@ -1904,12 +1921,49 @@ async fn run_log_worker(
     mut shutdown: ShutdownListener,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(jail_cfg.poll_interval_ms));
+    let mut missing_log_warnings = HashMap::<String, u64>::new();
     loop {
         tokio::select! {
             _ = shutdown.wait() => break,
             _ = interval.tick() => {
                 for path in &jail_cfg.log_paths {
-                    for resolved_path in expand_log_path_pattern(path) {
+                    let resolved_paths = expand_log_path_pattern(path);
+                    if resolved_paths.is_empty() {
+                        let warn_key = format!("glob::{}::{}", jail_name, path.display());
+                        if should_emit_missing_log_warning(&mut missing_log_warnings, &warn_key) {
+                            tracing::warn!(
+                                jail = %jail_name,
+                                configured_path = %path.display(),
+                                "tracey_ban log path glob has no matches; this source is not currently monitored"
+                            );
+                        }
+                        continue;
+                    }
+
+                    for resolved_path in resolved_paths {
+                        let missing_warn_key = format!(
+                            "path::{}::{}",
+                            jail_name,
+                            resolved_path.display()
+                        );
+                        if !resolved_path.exists() {
+                            if should_emit_missing_log_warning(
+                                &mut missing_log_warnings,
+                                &missing_warn_key,
+                            ) {
+                                tracing::warn!(
+                                    jail = %jail_name,
+                                    configured_path = %path.display(),
+                                    resolved_path = %resolved_path.display(),
+                                    root_like_path = is_root_log_path(&resolved_path),
+                                    "tracey_ban log path missing; this source is not currently monitored"
+                                );
+                            }
+                            continue;
+                        }
+
+                        missing_log_warnings.remove(&missing_warn_key);
+                        missing_log_warnings.remove(&format!("glob::{}::{}", jail_name, path.display()));
                         if let Err(err) = process_log_path(
                             &jail_name,
                             &resolved_path,
@@ -1935,6 +1989,21 @@ async fn run_log_worker(
                     }
                 }
             }
+        }
+    }
+}
+
+fn should_emit_missing_log_warning(warnings: &mut HashMap<String, u64>, key: &str) -> bool {
+    let now = now_ms();
+    match warnings.get(key).copied() {
+        Some(last_warned)
+            if now.saturating_sub(last_warned) < TRACEY_BAN_MISSING_LOG_WARN_INTERVAL_MS =>
+        {
+            false
+        }
+        _ => {
+            warnings.insert(key.to_string(), now);
+            true
         }
     }
 }
@@ -2224,6 +2293,9 @@ fn match_line_with_regexes(
     ignore_regex: &[Regex],
     prefilter: Option<&Regex>,
 ) -> Option<String> {
+    let normalized = strip_ansi_escape_sequences(line);
+    let line = normalized.as_ref();
+
     if let Some(prefilter) = prefilter
         && !prefilter.is_match(line)
     {
@@ -2245,6 +2317,15 @@ fn match_line_with_regexes(
     }
 
     None
+}
+
+fn strip_ansi_escape_sequences(line: &str) -> Cow<'_, str> {
+    ansi_escape_re().replace_all(line, "")
+}
+
+fn ansi_escape_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])").expect("ansi regex"))
 }
 
 fn extract_ip_from_captures(caps: &Captures<'_>, line: &str) -> Option<String> {
@@ -4471,6 +4552,7 @@ mod tests {
     #[test]
     fn filter_catalog_merges_sshd_defaults() {
         let mut jail = TraceyBanJailConfig::default();
+        jail.filter_catalog = Some("sshd".to_string());
         jail.log_paths.clear();
         jail.journal_matches.clear();
         jail.fail_regex.clear();
@@ -4502,6 +4584,22 @@ mod tests {
     }
 
     #[test]
+    fn custom_jail_without_filter_catalog_keeps_its_own_empty_defaults() {
+        let jail = TraceyBanJailConfig {
+            name: "custom".to_string(),
+            filter_catalog: None,
+            ports: Vec::new(),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        assert!(resolved.filter_catalog.is_none());
+        assert!(resolved.log_paths.is_empty());
+        assert!(resolved.journal_matches.is_empty());
+        assert!(resolved.fail_regex.is_empty());
+        assert!(resolved.ports.is_empty());
+    }
+
+    #[test]
     fn built_in_filter_catalogs_cover_common_auth_surfaces() {
         let filter_names: Vec<String> = built_in_filter_catalog_summaries()
             .into_iter()
@@ -4510,8 +4608,19 @@ mod tests {
         assert!(filter_names.contains(&"nginx-http-auth".to_string()));
         assert!(filter_names.contains(&"apache-auth".to_string()));
         assert!(filter_names.contains(&"postfix".to_string()));
+        assert!(filter_names.contains(&"web-file-scan-probe".to_string()));
         assert!(filter_names.contains(&"refiner-web-probe".to_string()));
         assert!(filter_names.contains(&"recidive".to_string()));
+    }
+
+    #[test]
+    fn refiner_web_probe_catalog_is_compatibility_alias_for_web_file_scan_probe() {
+        let web_scan = built_in_filter_catalog("web-file-scan-probe").expect("catalog exists");
+        let alias = built_in_filter_catalog("refiner-web-probe").expect("catalog exists");
+        assert_eq!(web_scan.log_paths, alias.log_paths);
+        assert_eq!(web_scan.fail_regex, alias.fail_regex);
+        assert_eq!(web_scan.ports, alias.ports);
+        assert_eq!(web_scan.protocol, alias.protocol);
     }
 
     #[test]
@@ -4632,6 +4741,68 @@ mod tests {
     }
 
     #[test]
+    fn refiner_web_probe_filter_matches_env_and_dotfile_scans() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let env_line =
+            r#"195.178.110.31 - - [05/Jun/2026 08:26:34] "GET /.env.production HTTP/1.1" 302 -"#;
+        let dotfile_line =
+            r#"195.178.110.31 - - [05/Jun/2026 08:27:53] "GET /.npmrc HTTP/1.1" 302 -"#;
+        assert_eq!(
+            match_line_with_regexes(env_line, &fail, &[], None).as_deref(),
+            Some("195.178.110.31")
+        );
+        assert_eq!(
+            match_line_with_regexes(dotfile_line, &fail, &[], None).as_deref(),
+            Some("195.178.110.31")
+        );
+    }
+
+    #[test]
+    fn web_file_scan_probe_filter_matches_sensitive_config_file_scans() {
+        let jail = TraceyBanJailConfig {
+            name: "web-file-scan-probe".to_string(),
+            filter_catalog: Some("web-file-scan-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let git_config_line =
+            r#"45.148.10.62 - - [05/Jun/2026 08:58:03] "GET /.git/config HTTP/1.1" 302 -"#;
+        let wp_config_line =
+            r#"45.148.10.62 - - [05/Jun/2026 08:58:03] "GET /wp-config.php.old HTTP/1.1" 302 -"#;
+        assert_eq!(
+            match_line_with_regexes(git_config_line, &fail, &[], None).as_deref(),
+            Some("45.148.10.62")
+        );
+        assert_eq!(
+            match_line_with_regexes(wp_config_line, &fail, &[], None).as_deref(),
+            Some("45.148.10.62")
+        );
+    }
+
+    #[test]
+    fn refiner_web_probe_filter_matches_ansi_colored_log_lines() {
+        let jail = TraceyBanJailConfig {
+            name: "refiner-web-probe".to_string(),
+            filter_catalog: Some("refiner-web-probe".to_string()),
+            ..TraceyBanJailConfig::default()
+        };
+        let resolved = merge_filter_catalog_into_jail(&jail).expect("catalog resolved");
+        let fail = compile_regexes(&resolved.fail_regex, "failregex", &resolved.name);
+        let line = "195.178.110.31 - - [05/Jun/2026 08:27:53] \"\u{1b}[32mGET /.git-credentials HTTP/1.1\u{1b}[0m\" 302 -";
+        assert_eq!(
+            match_line_with_regexes(line, &fail, &[], None).as_deref(),
+            Some("195.178.110.31")
+        );
+    }
+
+    #[test]
     fn recidive_filter_ignores_its_own_jail_records() {
         let jail = TraceyBanJailConfig {
             name: "recidive".to_string(),
@@ -4656,7 +4827,8 @@ mod tests {
 
     #[test]
     fn ufw_action_args_include_ports_and_protocol() {
-        let jail = TraceyBanJailConfig::default();
+        let mut jail = TraceyBanJailConfig::default();
+        jail.ports = vec![22];
         let args = build_ufw_action_args(&jail, JailActionKind::Ban, "203.0.113.9");
         assert_eq!(
             args[0],
@@ -4680,7 +4852,8 @@ mod tests {
 
     #[test]
     fn firewalld_action_args_render_rich_rule() {
-        let jail = TraceyBanJailConfig::default();
+        let mut jail = TraceyBanJailConfig::default();
+        jail.ports = vec![22];
         let args = build_firewalld_action_args(&jail, JailActionKind::Ban, "203.0.113.9", "public");
         assert_eq!(args[0][0], "firewall-cmd");
         assert!(
@@ -4699,7 +4872,8 @@ mod tests {
 
     #[test]
     fn nft_action_builders_render_expected_structure() {
-        let jail = TraceyBanJailConfig::default();
+        let mut jail = TraceyBanJailConfig::default();
+        jail.ports = vec![22];
         let rule_args = build_nft_rule_args(&jail, "tb_tracey_default_v4", false, "tracey_input");
         assert_eq!(
             rule_args,
