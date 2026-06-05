@@ -25,6 +25,7 @@ pub mod location;
 pub mod network_ebpf;
 pub mod network_intel;
 mod peer_compat;
+mod probe_backoff;
 pub mod probe_watch;
 pub mod prometheus_export;
 pub mod refiner_tracking;

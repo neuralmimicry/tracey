@@ -169,7 +169,7 @@ Important behaviour:
 | `refiner.service_name` | `refiner` | Service identifier included in events. |
 | `refiner.health_url` | `http://127.0.0.1:5001/api/health` | HTTP health probe target. |
 | `refiner.security_feed_path` | `refiner_security_feed.jsonl` | JSONL findings feed. |
-| `refiner.poll_interval_ms` | `5000` | Poll interval. |
+| `refiner.poll_interval_ms` | `5000` | Base poll interval; health probes now use adaptive backoff when state is stable while feed ingestion stays on this cadence. |
 | `refiner.timeout_ms` | `2500` | Health-check timeout. |
 
 Important behaviour:
@@ -227,7 +227,7 @@ Important behaviour:
 | `prometheus_log_export.enabled` | `true` | Enables the exporter runtime when status is enabled. |
 | `prometheus_log_export.server_url` | `https://prometheus.neuralmimicry.ai` | External Prometheus instance probed for readiness. |
 | `prometheus_log_export.probe_path` | `/-/ready` | Readiness path appended to `server_url`. |
-| `prometheus_log_export.probe_interval_ms` | `5000` | Probe cadence. |
+| `prometheus_log_export.probe_interval_ms` | `5000` | Base probe cadence; readiness probes now use adaptive backoff when outcomes stay unchanged. |
 | `prometheus_log_export.probe_timeout_ms` | `1500` | Probe timeout. |
 | `prometheus_log_export.forward_interval_ms` | `1000` | Follower forwarding cadence. |
 | `prometheus_log_export.batch_ttl_ms` | `30_000` | Maximum accepted batch age. |

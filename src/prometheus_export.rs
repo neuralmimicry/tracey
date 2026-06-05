@@ -4,6 +4,7 @@ use crate::config::PrometheusLogExportConfig;
 use crate::coordination::{Coordination, CoordinatorRole, PrometheusProbe};
 use crate::event::{Event, EventKind, Severity, now_ms};
 use crate::peer_compat::{self, SchemaField};
+use crate::probe_backoff::AdaptiveProbeBackoff;
 use crate::security::Action;
 use crate::shutdown::ShutdownListener;
 use crate::swarm::Decision;
@@ -18,6 +19,7 @@ use tokio::sync::{RwLock, broadcast};
 
 const BATCH_SIG_HEADER: &str = "x-tracey-prometheus-signature";
 const MAX_REMOTE_BATCH_BYTES: usize = 512 * 1024;
+const PROMETHEUS_PROBE_BACKOFF_MULTIPLIER: u64 = 24;
 
 #[derive(Clone)]
 pub struct PrometheusExportHandle {
@@ -303,6 +305,7 @@ pub fn spawn_prometheus_exporter(
     let state = Arc::new(RwLock::new(ExporterState::default()));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(config.probe_timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "prometheus export client init failed; using default client");
@@ -318,18 +321,31 @@ pub fn spawn_prometheus_exporter(
     };
     let task_handle = handle.clone();
     tokio::spawn(async move {
-        let mut probe_tick = tokio::time::interval(Duration::from_millis(config.probe_interval_ms));
+        let base_probe_interval = Duration::from_millis(config.probe_interval_ms);
+        let mut probe_backoff = AdaptiveProbeBackoff::new(
+            base_probe_interval,
+            Duration::from_millis(
+                config
+                    .probe_interval_ms
+                    .saturating_mul(PROMETHEUS_PROBE_BACKOFF_MULTIPLIER),
+            ),
+        );
+        let mut next_probe_at = tokio::time::Instant::now();
         let mut forward_tick =
             tokio::time::interval(Duration::from_millis(config.forward_interval_ms));
 
         loop {
+            let probe_sleep = tokio::time::sleep_until(next_probe_at);
+            tokio::pin!(probe_sleep);
             tokio::select! {
                 _ = shutdown.wait() => {
                     tracing::info!(agent_id = %agent_id, "prometheus export shutting down");
                     break;
                 }
-                _ = probe_tick.tick() => {
+                _ = &mut probe_sleep => {
                     let probe = probe_prometheus(&client, &config).await;
+                    let next_delay = probe_backoff.record_outcome(probe.ready);
+                    next_probe_at = tokio::time::Instant::now() + next_delay;
                     coordination.update_prometheus_probe(Some(probe.clone())).await;
                     let mut state = state.write().await;
                     state.local_probe = Some(probe);
@@ -642,13 +658,31 @@ async fn probe_prometheus(
     let sampled_at_ms = now_ms();
     match client.get(url).send().await {
         Ok(response) => {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(_) => {
+                    return PrometheusProbe {
+                        ready: false,
+                        latency_ms: started.elapsed().as_millis().max(1) as u64,
+                        bandwidth_mbps: 0.0,
+                        sampled_at_ms,
+                    };
+                }
+            };
             let latency_ms = started.elapsed().as_millis().max(1) as u64;
-            let ready = response.status().is_success();
-            let body_len = response
-                .bytes()
-                .await
-                .map(|body| body.len().max(32))
-                .unwrap_or(32);
+            let ready = probe_response_is_ready(
+                status,
+                content_type.as_deref(),
+                body.as_ref(),
+                &config.probe_path,
+            );
+            let body_len = body.len().max(32);
             let secs = started.elapsed().as_secs_f64().max(0.001);
             let bandwidth_mbps = (body_len as f64 * 8.0) / secs / 1_000_000.0;
             PrometheusProbe {
@@ -665,6 +699,38 @@ async fn probe_prometheus(
             sampled_at_ms,
         },
     }
+}
+
+fn probe_response_is_ready(
+    status: StatusCode,
+    content_type: Option<&str>,
+    body: &[u8],
+    probe_path: &str,
+) -> bool {
+    if !status.is_success() || status.is_redirection() {
+        return false;
+    }
+
+    let content_type = content_type.unwrap_or_default().trim().to_ascii_lowercase();
+    let body_text = String::from_utf8_lossy(body);
+    let body_text = body_text.trim();
+    let body_lower = body_text.to_ascii_lowercase();
+
+    let looks_like_html = content_type.contains("text/html")
+        || body_lower.starts_with("<!doctype html")
+        || body_lower.starts_with("<html")
+        || body_lower.contains("<head")
+        || body_lower.contains("<body");
+    if looks_like_html {
+        return false;
+    }
+
+    let path = probe_path.trim().to_ascii_lowercase();
+    if path == "/-/ready" || path.ends_with("/-/ready") {
+        return body_lower.contains("ready");
+    }
+
+    true
 }
 
 fn normalize_remote_record(agent_id: &str, mut record: PertinentLogRecord) -> PertinentLogRecord {
@@ -1126,5 +1192,31 @@ mod tests {
         let a = sign_batch("agent-a", 42, &body, &derive_key("shared"));
         let b = sign_batch("agent-a", 42, &body, &derive_key("shared"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn readiness_probe_rejects_redirects_and_html_login_pages() {
+        assert!(!probe_response_is_ready(
+            StatusCode::FOUND,
+            Some("text/plain"),
+            b"",
+            "/-/ready"
+        ));
+        assert!(!probe_response_is_ready(
+            StatusCode::OK,
+            Some("text/html; charset=utf-8"),
+            b"<html><body>login</body></html>",
+            "/-/ready"
+        ));
+    }
+
+    #[test]
+    fn readiness_probe_accepts_prometheus_ready_payload() {
+        assert!(probe_response_is_ready(
+            StatusCode::OK,
+            Some("text/plain; charset=utf-8"),
+            b"Prometheus is Ready.\n",
+            "/-/ready"
+        ));
     }
 }

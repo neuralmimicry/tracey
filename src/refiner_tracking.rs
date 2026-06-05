@@ -3,6 +3,7 @@
 use crate::bus::EventBus;
 use crate::config::RefinerTrackingConfig;
 use crate::event::{Event, EventKind, Severity};
+use crate::probe_backoff::AdaptiveProbeBackoff;
 use crate::shutdown::ShutdownListener;
 use crate::storage::Storage;
 use serde::Deserialize;
@@ -13,6 +14,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 
 static REFINER_EVENT_COUNTER: AtomicU64 = AtomicU64::new(5_000_000);
+const REFINER_HEALTH_BACKOFF_MULTIPLIER: u64 = 12;
 
 #[derive(Debug, Clone)]
 struct HealthProbe {
@@ -67,23 +69,37 @@ pub async fn spawn_refiner_tracking(
     };
 
     let mut feed_offset = 0u64;
-    let mut ticker = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
+    let mut feed_tick = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
+    let mut health_backoff = AdaptiveProbeBackoff::new(
+        Duration::from_millis(config.poll_interval_ms),
+        Duration::from_millis(
+            config
+                .poll_interval_ms
+                .saturating_mul(REFINER_HEALTH_BACKOFF_MULTIPLIER),
+        ),
+    );
+    let mut next_health_at = tokio::time::Instant::now();
     let mut last_health_state: Option<bool> = None;
 
     loop {
+        let health_sleep = tokio::time::sleep_until(next_health_at);
+        tokio::pin!(health_sleep);
         tokio::select! {
             _ = shutdown.wait() => {
                 tracing::info!("refiner tracking shutting down");
                 break;
             }
-            _ = ticker.tick() => {
+            _ = &mut health_sleep => {
                 let probe = probe_health(&client, &config).await;
                 let state_changed = last_health_state.map(|v| v != probe.healthy).unwrap_or(true);
                 if state_changed || !probe.healthy {
                     emit_health_event(&bus, &storage, &config, probe.clone()).await;
                 }
                 last_health_state = Some(probe.healthy);
-
+                let next_delay = health_backoff.record_outcome(probe.healthy);
+                next_health_at = tokio::time::Instant::now() + next_delay;
+            }
+            _ = feed_tick.tick() => {
                 if let Err(err) = read_security_feed(&config, &mut feed_offset, &bus, &storage).await {
                     tracing::warn!("refiner security feed read failed: {}", err);
                 }
