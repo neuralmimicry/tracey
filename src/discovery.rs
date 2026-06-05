@@ -13,7 +13,7 @@ use crate::peer_compat::{self, SchemaField};
 use crate::shutdown::ShutdownListener;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -25,6 +25,8 @@ const MAX_VERSION_LEN: usize = 64;
 const MAX_TAGS: usize = 64;
 const MAX_TAG_LEN: usize = 64;
 const DISCOVERY_PREVIEW_BYTES: usize = 160;
+const MAX_DISCOVERY_TARGETS: usize = 32;
+const MAX_DISCOVERY_OBSERVED_PEERS: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentAnnouncement {
@@ -100,9 +102,13 @@ pub async fn spawn_discovery(
     let mut ticker = tokio::time::interval(announce_interval);
     let mut buf = vec![0u8; 4096];
     let shared_key = derive_key(&config.shared_key);
+    let discovery_targets = parse_discovery_targets(&config.broadcast_addr);
+    let mut observed_peer_set: HashSet<String> = HashSet::new();
+    let mut observed_peer_order: VecDeque<String> = VecDeque::new();
     tracing::info!(
         bind = %config.bind_addr,
-        broadcast = %config.broadcast_addr,
+        target_count = discovery_targets.len(),
+        targets = %discovery_targets.join(","),
         "discovery enabled"
     );
 
@@ -146,12 +152,20 @@ pub async fn spawn_discovery(
                     );
                     match serde_json::to_vec(&announcement) {
                         Ok(payload) => {
-                            if let Err(err) = socket.send_to(&payload, &config.broadcast_addr).await {
-                                tracing::warn!(
-                                    target = %config.broadcast_addr,
-                                    error = %err,
-                                    "discovery broadcast send failed"
-                                );
+                            let mut send_targets = discovery_targets.clone();
+                            send_targets.extend(observed_peer_order.iter().cloned());
+                            let mut sent = HashSet::new();
+                            for target in send_targets {
+                                if !sent.insert(target.clone()) {
+                                    continue;
+                                }
+                                if let Err(err) = socket.send_to(&payload, &target).await {
+                                    tracing::warn!(
+                                        target = %target,
+                                        error = %err,
+                                        "discovery gossip send failed"
+                                    );
+                                }
                             }
                         }
                         Err(err) => {
@@ -216,6 +230,16 @@ pub async fn spawn_discovery(
                         max_advertised_faults,
                         &peer.to_string(),
                     );
+                    let observed = peer.to_string();
+                    if !observed_peer_set.contains(&observed) {
+                        if observed_peer_order.len() >= MAX_DISCOVERY_OBSERVED_PEERS
+                            && let Some(evicted) = observed_peer_order.pop_front()
+                        {
+                            observed_peer_set.remove(&evicted);
+                        }
+                        observed_peer_set.insert(observed.clone());
+                        observed_peer_order.push_back(observed);
+                    }
 
                     let presence = AgentPresence {
                         agent_id: announcement.agent_id,
@@ -254,6 +278,27 @@ pub async fn spawn_discovery(
     }
 
     Ok(())
+}
+
+fn parse_discovery_targets(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for token in raw
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if seen.insert(token.to_string()) {
+            out.push(token.to_string());
+        }
+        if out.len() >= MAX_DISCOVERY_TARGETS {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push("255.255.255.255:47990".to_string());
+    }
+    out
 }
 
 fn build_announcement(
@@ -1253,6 +1298,27 @@ mod tests {
     use crate::capabilities::Capabilities;
     use crate::tracey_ban::{BanAdvertisement, BanAdvertisementEntry};
     use proptest::prelude::*;
+
+    #[test]
+    fn parse_discovery_targets_supports_multi_target_strings() {
+        let targets = parse_discovery_targets(
+            "192.168.1.255:47990, 81.130.134.82:47990;tracey.edge.example:47990",
+        );
+        assert_eq!(
+            targets,
+            vec![
+                "192.168.1.255:47990".to_string(),
+                "81.130.134.82:47990".to_string(),
+                "tracey.edge.example:47990".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_discovery_targets_falls_back_to_default_when_empty() {
+        let targets = parse_discovery_targets("  , ;  ");
+        assert_eq!(targets, vec!["255.255.255.255:47990".to_string()]);
+    }
 
     #[test]
     fn sanitize_announcement_drops_invalid_ban_entries() {
