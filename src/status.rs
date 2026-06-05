@@ -103,6 +103,8 @@ struct StatusSnapshot {
     tracey_ban_local_entries: Vec<String>,
     tracey_ban_remote_entries: Vec<String>,
     #[serde(default)]
+    blocked_ip_locations: Vec<crate::location::BlockedIpLocationSnapshot>,
+    #[serde(default)]
     tracey_guard: Option<crate::tracey_guard::TraceyGuardStatusSnapshot>,
     #[serde(default)]
     slurm: Option<crate::slurm::SlurmSnapshot>,
@@ -815,6 +817,12 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
     if let Some(continuum) = continuum_telemetry.as_mut() {
         merge_continuum_snapshot(continuum, &location, tracey_guard.as_ref());
     }
+    let blocked_ip_locations = crate::location::infer_blocked_ip_locations(
+        &ban_snapshot.local_entries,
+        &ban_snapshot.remote_entries,
+        &location,
+        &peer_locations,
+    );
 
     StatusSnapshot {
         ts_ms: now_ms(),
@@ -848,14 +856,15 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         tracey_ban_remote_agents: ban_snapshot.remote_agents,
         tracey_ban_local_entries: ban_snapshot
             .local_entries
-            .into_iter()
+            .iter()
             .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
             .collect(),
         tracey_ban_remote_entries: ban_snapshot
             .remote_entries
-            .into_iter()
+            .iter()
             .map(|entry| format!("{}:{} ({})", entry.jail, entry.ip, entry.ban_count))
             .collect(),
+        blocked_ip_locations,
         tracey_guard,
         slurm,
         continuum_autoscaler,
@@ -1233,6 +1242,15 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
             )
             .map(peer_compat::coerce_string_vec)
             .unwrap_or_default(),
+            blocked_ip_locations: parse_array_field(
+                map,
+                &[
+                    "blocked_ip_locations",
+                    "blockedIpLocations",
+                    "ban_ip_locations",
+                    "banIpLocations",
+                ],
+            ),
             tracey_guard: parse_object_field(map, &["tracey_guard", "traceyGuard"]),
             slurm: parse_object_field(map, &["slurm", "slurm_status", "slurmSnapshot"]),
             continuum_autoscaler: parse_object_field(

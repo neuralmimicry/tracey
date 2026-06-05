@@ -5,7 +5,9 @@ use crate::continuum_loop::ContinuumLoopSnapshot;
 use crate::continuum_telemetry::ContinuumTelemetrySnapshot;
 use crate::event::{Event, EventKind, Severity, now_ms};
 use crate::governance::GovernanceUpdate;
-use crate::location::{AgentLocationSnapshot, infer_single_agent_location};
+use crate::location::{
+    AgentLocationSnapshot, BlockedIpLocationSnapshot, infer_single_agent_location,
+};
 use crate::security::Action;
 use crate::slurm::SlurmSnapshot;
 use crate::storage::BanUpdateRecord;
@@ -736,6 +738,8 @@ struct StatusSnapshot {
     tracey_ban_local_entries: Vec<String>,
     #[serde(default)]
     tracey_ban_remote_entries: Vec<String>,
+    #[serde(default)]
+    blocked_ip_locations: Vec<BlockedIpLocationSnapshot>,
     #[serde(default)]
     tracey_guard: Option<TraceyGuardStatusSnapshot>,
     #[serde(default)]
@@ -3682,6 +3686,52 @@ fn build_location_map_lines(app: &TraceyTopApp, width: usize, height: u16) -> Ve
         )));
     }
 
+    if let Some(status) = &app.status {
+        let blocked = status
+            .blocked_ip_locations
+            .iter()
+            .take(5)
+            .collect::<Vec<_>>();
+        if !blocked.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(truncate(
+                "blocked ip location hypotheses",
+                width,
+            )));
+            for entry in blocked {
+                let geo = location_guess_compact(entry.geo.as_ref().or(entry.site.as_ref()));
+                let room = location_guess_compact(entry.room.as_ref().or(entry.network.as_ref()));
+                let physical = location_guess_compact(entry.physical.as_ref());
+                let ports = if entry.probe.open_ports.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry
+                        .probe
+                        .open_ports
+                        .iter()
+                        .map(|port| port.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                lines.push(Line::from(truncate(
+                    &format!(
+                        "|- {} src={} conf={:.0}% geo={} room={} phys={} probe={} ports={} bans={}",
+                        entry.ip,
+                        entry.source,
+                        entry.confidence * 100.0,
+                        geo,
+                        room,
+                        physical,
+                        entry.probe.status,
+                        ports,
+                        entry.ban_count
+                    ),
+                    width,
+                )));
+            }
+        }
+    }
+
     let max_lines = height.saturating_sub(2) as usize;
     if lines.len() > max_lines {
         let hidden = lines.len() - max_lines + 1;
@@ -4187,6 +4237,7 @@ fn human_bytes(value: f64, per_second: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::location::LocationGuess;
     use serde_json::json;
     use std::fs;
     use std::time::Duration;
@@ -4247,6 +4298,7 @@ mod tests {
             tracey_ban_remote_agents: 0,
             tracey_ban_local_entries: Vec::new(),
             tracey_ban_remote_entries: Vec::new(),
+            blocked_ip_locations: Vec::new(),
             tracey_guard: None,
             slurm: None,
             continuum_autoscaler: None,
@@ -4528,6 +4580,40 @@ mod tests {
 
         assert!(text.contains(&format!("v{}", crate::package_version())));
         assert!(text.contains("agent cortex-1000"));
+    }
+
+    #[test]
+    fn location_map_shows_blocked_ip_location_hypotheses() {
+        let mut status = test_status("cortex-1000");
+        status.blocked_ip_locations.push(BlockedIpLocationSnapshot {
+            ip: "185.136.52.240".to_string(),
+            source: "local+remote".to_string(),
+            ban_count: 6,
+            confidence: 0.73,
+            physical: Some(LocationGuess {
+                label: "internet-host".to_string(),
+                confidence: 0.57,
+            }),
+            probe: crate::location::BlockedIpProbeSnapshot {
+                mode: "minimal_tcp_connect".to_string(),
+                status: "cached".to_string(),
+                sampled_at_ms: Some(1),
+                open_ports: vec![443],
+            },
+            ..BlockedIpLocationSnapshot::default()
+        });
+        let app = test_app("https://tracey.example.com:48000/status", status);
+
+        let text = build_location_map_lines(&app, 120, 14)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("blocked ip location hypotheses"));
+        assert!(text.contains("185.136.52.240"));
+        assert!(text.contains("phys=internet-host"));
+        assert!(text.contains("probe=cached"));
     }
 
     #[test]
