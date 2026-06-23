@@ -1,5 +1,13 @@
 # Tracey
 
+## Sponsor NeuralMimicry
+
+Tracey is an open-source asynchronous swarm runtime for anomaly assessment, security posture governance, and fleet telemetry — combining fuzzy inference scoring, multi-agent consensus, elected coordination, and a bounded auditable JSONL record of everything the runtime sees and decides. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 ![Tracey](src/nmtracey.png)
 
 Tracey is an asynchronous swarm runtime for anomaly assessment, posture governance, and controlled response. It combines event ingestion, adaptive fuzzy scoring, multi-agent consensus, elected coordination, bounded JSONL audit storage, and optional update/loader lifecycles for rolling binary replacement.
