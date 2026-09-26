@@ -79,7 +79,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          cargo_bin="${HOME}/.cargo/bin"
+          if [[ -x "${cargo_bin}/rustup" ]]; then
+            echo "${cargo_bin}" >> "${GITHUB_PATH}"
+            export PATH="${cargo_bin}:${PATH}"
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- \
+                  -y \
+                  --no-modify-path \
+                  --profile minimal \
+                  --default-toolchain none
+            echo "${cargo_bin}" >> "${GITHUB_PATH}"
+            export PATH="${cargo_bin}:${PATH}"
+          fi
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
           rustup default stable
 
       - name: Cache cargo registry and build output
