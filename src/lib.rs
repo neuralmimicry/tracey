@@ -1,6 +1,7 @@
 //! Shared Tracey runtime library used by the core agent and loader binaries.
 
 pub mod aer;
+pub mod ai_lab;
 pub mod assets;
 pub mod auth;
 pub mod autoscaler;
@@ -392,6 +393,7 @@ pub async fn run_tracey(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     continuum_telemetry: Some(continuum_telemetry.clone()),
                     resource_forecast: Some(resource_forecast.clone()),
                     loader_threats: loader_threat_status.clone(),
+                    ai_lab: ai_lab::AiLabStatusSnapshot::from_config(&config.ai_lab),
                 };
                 let status_shutdown = shutdown_listener.clone();
                 tokio::spawn(status::spawn_status(service, listen_addr, status_shutdown));

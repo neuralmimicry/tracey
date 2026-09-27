@@ -68,6 +68,16 @@ That default profile is useful for local evaluation and continuous self-exercise
 
 ## Runtime Entry Points
 
+## AI-Lab Adversary-Emulation Evidence
+
+Tracey now includes an opt-in AI-lab schema and policy layer for authorised
+local red-team experiments. The layer exposes typed `SecurityEvent`,
+`ActionProposal`, `ActionDecision`, and `ActionResult` records, status
+visibility on `/status`, and an `ai-lab` page in `tracey --tui`.
+
+See `docs/AI_LAB_EMULATION.md` for setup, execution, evidence, reporting,
+trust boundaries, and emergency shutdown instructions.
+
 ### `tracey`
 
 Primary runtime entry point.
