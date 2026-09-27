@@ -37,7 +37,7 @@ concurrency:
 jobs:
   version:
     name: Version metadata
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
       build_version: ${{ steps.version.outputs.build_version }}
@@ -67,8 +67,6 @@ jobs:
         include:
           - arch: amd64
             runs_on: '["self-hosted","Linux","X64"]'
-          - arch: arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -154,7 +152,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     outputs:
@@ -281,6 +279,25 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
+          cargo_bin="${HOME}/.cargo/bin"
+          if [[ -x "${cargo_bin}/rustup" ]]; then
+            echo "${cargo_bin}" >> "${GITHUB_PATH}"
+            export PATH="${cargo_bin}:${PATH}"
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            if command -v curl >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+            elif command -v wget >/dev/null 2>&1; then
+              wget -qO- https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+            else
+              echo "::error::rustup is missing and neither curl nor wget is available to install it."
+              exit 1
+            fi
+            echo "${cargo_bin}" >> "${GITHUB_PATH}"
+            export PATH="${cargo_bin}:${PATH}"
+          fi
           rustup toolchain install stable --profile minimal --target "${{ matrix.rust_target }}"
           rustup default stable
 
@@ -420,7 +437,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     steps:
