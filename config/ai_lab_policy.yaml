@@ -1,0 +1,41 @@
+lab_id: tracey-demo-01
+allowed_networks:
+  - 10.77.0.0/24
+allowed_hosts:
+  - attacker-ai
+  - tracey
+  - user-workstation
+  - file-server
+  - web-application
+  - telemetry-server
+  - evidence-sink
+deny_public_addresses: true
+deny_default_route: true
+require_lab_token: true
+require_snapshot_before_execution: true
+default_dry_run: true
+maximum_concurrent_actions: 2
+maximum_scenario_duration_minutes: 20
+maximum_requests_per_second: 2
+stop_on_policy_violation: true
+approval:
+  observation: automatic
+  low: automatic
+  medium: operator
+  high: prohibited
+allowed_actions:
+  - ObserveAsset
+  - ObserveService
+  - TestSeededCredential
+  - RequestSyntheticFile
+  - EmulateLateralConnection
+  - PlaceBenignMarker
+  - StageSyntheticDataset
+  - TransferSyntheticDatasetToSink
+  - StartEvidenceCapture
+  - IncreaseTelemetry
+  - BlockLabConnection
+  - QuarantineLabHost
+  - DisableSeededCredential
+  - IsolateContainer
+  - RestoreSnapshot

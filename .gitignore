@@ -6,3 +6,5 @@ check_errors.txt
 logs/
 tracey.log*
 loader/tracey-loader.manifest.json
+/target-arm64
+/target-cross
