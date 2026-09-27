@@ -37,7 +37,7 @@ concurrency:
 jobs:
   version:
     name: Version metadata
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
       build_version: ${{ steps.version.outputs.build_version }}
@@ -154,7 +154,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     outputs:
@@ -236,42 +236,6 @@ jobs:
             binary_suffix: ""
             deb_arch: arm64
             can_execute: true
-          - os: windows
-            arch: amd64
-            runs_on: '["windows-2025"]'
-            rust_target: x86_64-pc-windows-msvc
-            platform: windows-amd64
-            archive_format: zip
-            binary_suffix: ".exe"
-            deb_arch: ""
-            can_execute: true
-          - os: windows
-            arch: arm64
-            runs_on: '["windows-11-arm"]'
-            rust_target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            archive_format: zip
-            binary_suffix: ".exe"
-            deb_arch: ""
-            can_execute: true
-          - os: ios
-            arch: amd64
-            runs_on: '["macos-15-intel"]'
-            rust_target: x86_64-apple-ios
-            platform: ios-amd64
-            archive_format: tar.gz
-            binary_suffix: ""
-            deb_arch: ""
-            can_execute: false
-          - os: ios
-            arch: arm64
-            runs_on: '["macos-15"]'
-            rust_target: aarch64-apple-ios
-            platform: ios-arm64
-            archive_format: tar.gz
-            binary_suffix: ""
-            deb_arch: ""
-            can_execute: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -420,7 +384,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     steps:
