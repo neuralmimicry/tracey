@@ -14,3 +14,9 @@ RUN set -eux; \
 
 ENTRYPOINT ["tracey"]
 CMD ["--help"]
+
+# OCI metadata (final stage) so GHCR links the package to its source repository.
+LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/tracey" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/tracey" \
+      org.opencontainers.image.description="Swarm anomaly/security runtime: fuzzy inference scoring, multi-agent consensus, fleet telemetry, TraceyGuard/TraceyBan" \
+      org.opencontainers.image.vendor="NeuralMimicry"
