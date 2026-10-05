@@ -37,7 +37,7 @@ concurrency:
 jobs:
   version:
     name: Version metadata
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
       build_version: ${{ steps.version.outputs.build_version }}
@@ -154,7 +154,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     outputs:
@@ -420,7 +420,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     steps:
@@ -470,3 +470,8 @@ jobs:
               --title "Tracey ${BUILD_VERSION}" \
               --notes-file "$notes"
           fi
+
+      - name: Remove downloaded release artifacts from the persistent runner
+        if: always()
+        shell: bash
+        run: rm -rf dist
