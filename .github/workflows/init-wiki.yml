@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   init-wiki:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,7 +25,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -e
-          WIKI_DIR=$(mktemp -d)
+          WIKI_DIR=$(mktemp -d "${RUNNER_TEMP}/wiki.XXXXXX")
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.wiki.git" "${WIKI_DIR}" 2>/dev/null || true
           cd "${WIKI_DIR}"
           if [ ! -d .git ]; then
