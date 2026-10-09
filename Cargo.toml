@@ -24,7 +24,7 @@ libc = "0.2"
 libloading = "0.8"
 regex = "1.11"
 sysinfo = "0.38"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 [dev-dependencies]
