@@ -1,3 +1,4 @@
+use crate::ai_lab::AiLabStatusSnapshot;
 use crate::autoscaler::ContinuumAutoscalerSnapshot;
 use crate::config::{Config, StatusConfig, StorageConfig};
 use crate::continuum_assessment::ContinuumAssessmentSnapshot;
@@ -93,6 +94,7 @@ fn run_dashboard(args: Vec<String>, invocation: &str) -> Result<(), Box<dyn Erro
                     KeyCode::Char('1') => app.set_page(DashboardPage::Overview),
                     KeyCode::Char('2') => app.set_page(DashboardPage::Locations),
                     KeyCode::Char('3') => app.set_page(DashboardPage::Telemetry),
+                    KeyCode::Char('4') => app.set_page(DashboardPage::AiLab),
                     _ => {}
                 }
             }
@@ -452,7 +454,7 @@ fn file_name_of(value: &str) -> String {
 
 fn print_help(config: &Config, invocation: &str) {
     println!(
-        "{invocation}\n\nUsage:\n  {invocation} [--status <url>] [--bearer <token>] [--log-path <path> | --no-log]\n             [--refresh-ms <ms>] [--tail-bytes <bytes>]\n\nDefaults:\n  status url : {}\n  log path   : {}\n  refresh    : {}ms\n  tail bytes : {}\n\nNotes:\n  auto attach: prefers a reachable local tracey agent when --status is omitted\n  transport  : loopback targets default to http, other no-scheme targets default to https\n  header     : shows the active status transport as 🔒 https or 🔓 http\n  overview   : page 1 now includes the closed-loop plan/ramp/optimise/repeat summary\n  location   : page 2 renders the inferred cluster map and location evidence\n  telemetry  : page 3 renders Continuum host, gpu, action, and probe telemetry\n  minimum tty: {}x{}\n\nKeys:\n  q, Esc     quit\n  r          refresh immediately\n  Tab, ←/→   switch page\n  1 / 2 / 3  jump to overview, locations, or telemetry\n",
+        "{invocation}\n\nUsage:\n  {invocation} [--status <url>] [--bearer <token>] [--log-path <path> | --no-log]\n             [--refresh-ms <ms>] [--tail-bytes <bytes>]\n\nDefaults:\n  status url : {}\n  log path   : {}\n  refresh    : {}ms\n  tail bytes : {}\n\nNotes:\n  auto attach: prefers a reachable local tracey agent when --status is omitted\n  transport  : loopback targets default to http, other no-scheme targets default to https\n  header     : shows the active status transport as 🔒 https or 🔓 http\n  overview   : page 1 includes the closed-loop plan/ramp/optimise/repeat summary\n  location   : page 2 renders the inferred cluster map and location evidence\n  telemetry  : page 3 renders Continuum host, gpu, action, and probe telemetry\n  ai-lab     : page 4 renders lab policy and typed action/evidence records\n  minimum tty: {}x{}\n\nKeys:\n  q, Esc       quit\n  r            refresh immediately\n  Tab, ←/→     switch page\n  1 / 2 / 3 / 4 jump to overview, locations, telemetry, or ai-lab\n",
         default_status_url(config),
         config.storage.log_path.display(),
         DEFAULT_REFRESH_MS,
@@ -592,6 +594,7 @@ enum DashboardPage {
     Overview,
     Locations,
     Telemetry,
+    AiLab,
 }
 
 impl DashboardPage {
@@ -599,7 +602,8 @@ impl DashboardPage {
         match self {
             Self::Overview => Self::Locations,
             Self::Locations => Self::Telemetry,
-            Self::Telemetry => Self::Overview,
+            Self::Telemetry => Self::AiLab,
+            Self::AiLab => Self::Overview,
         }
     }
 
@@ -612,14 +616,16 @@ impl DashboardPage {
             Self::Overview => "overview",
             Self::Locations => "locations",
             Self::Telemetry => "telemetry",
+            Self::AiLab => "ai-lab",
         }
     }
 
     fn shortcut(self) -> &'static str {
         match self {
-            Self::Overview => "1/3",
-            Self::Locations => "2/3",
-            Self::Telemetry => "3/3",
+            Self::Overview => "1/4",
+            Self::Locations => "2/4",
+            Self::Telemetry => "3/4",
+            Self::AiLab => "4/4",
         }
     }
 }
@@ -753,6 +759,8 @@ struct StatusSnapshot {
     #[serde(default)]
     continuum_loop: Option<ContinuumLoopSnapshot>,
     #[serde(default)]
+    ai_lab: AiLabStatusSnapshot,
+    #[serde(default)]
     location: AgentLocationSnapshot,
     #[serde(default)]
     peer_locations: Vec<AgentLocationSnapshot>,
@@ -784,6 +792,7 @@ struct LogView {
     gpu_rows: Vec<GpuRow>,
     disk_rows: Vec<DiskRow>,
     activity_rows: Vec<ActivityRow>,
+    ai_lab_rows: Vec<LabActivityRow>,
     last_log_ts_ms: Option<u64>,
 }
 
@@ -820,6 +829,18 @@ struct ActivityRow {
     kind: &'static str,
     item: String,
     score: Option<f64>,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct LabActivityRow {
+    ts_ms: u64,
+    kind: String,
+    scenario_id: String,
+    actor: String,
+    action: String,
+    target: String,
     detail: String,
     tone: Tone,
 }
@@ -879,6 +900,7 @@ fn build_log_view(lines: &[String]) -> LogView {
     let mut gpus: HashMap<String, GpuRow> = HashMap::new();
     let mut disks: HashMap<String, DiskRow> = HashMap::new();
     let mut activity_rows = Vec::new();
+    let mut ai_lab_rows = Vec::new();
     let mut last_log_ts_ms = None;
 
     for line in lines {
@@ -983,6 +1005,12 @@ fn build_log_view(lines: &[String]) -> LogView {
                     });
                 }
             }
+            "security_event" | "action_proposal" | "action_decision" | "action_result" => {
+                if let Some(row) = parse_ai_lab_row(raw.record_type.as_str(), &raw.payload) {
+                    last_log_ts_ms = max_u64(last_log_ts_ms, Some(row.ts_ms));
+                    ai_lab_rows.push(row);
+                }
+            }
             _ => {}
         }
     }
@@ -999,6 +1027,8 @@ fn build_log_view(lines: &[String]) -> LogView {
 
     activity_rows.sort_by(|left, right| right.ts_ms.cmp(&left.ts_ms));
     activity_rows.truncate(MAX_ACTIVITY_ROWS);
+    ai_lab_rows.sort_by(|left, right| right.ts_ms.cmp(&left.ts_ms));
+    ai_lab_rows.truncate(MAX_ACTIVITY_ROWS);
 
     let mut process_rows: Vec<ProcessRow> = processes.into_values().collect();
     process_rows.sort_by(compare_process_rows);
@@ -1025,8 +1055,78 @@ fn build_log_view(lines: &[String]) -> LogView {
         gpu_rows,
         disk_rows,
         activity_rows,
+        ai_lab_rows,
         last_log_ts_ms,
     }
+}
+
+fn parse_ai_lab_row(record_type: &str, payload: &Value) -> Option<LabActivityRow> {
+    let ts_ms = match record_type {
+        "security_event" => json_u64(payload, "timestamp_ms"),
+        "action_decision" => json_u64(payload, "decided_at_ms"),
+        "action_result" => json_u64(payload, "finished_at_ms"),
+        _ => None,
+    }
+    .or_else(|| json_u64(payload, "started_at_ms"))
+    .unwrap_or_else(now_ms);
+    let scenario_id = json_string(payload, "scenario_id").unwrap_or_else(|| "unknown".to_string());
+    let actor = json_string(payload, "actor").unwrap_or_else(|| "-".to_string());
+    let action = json_string(payload, "action")
+        .or_else(|| json_string(payload, "event_type"))
+        .unwrap_or_else(|| record_type.to_string());
+    let target = payload
+        .get("target")
+        .and_then(|target| {
+            json_string(target, "host")
+                .or_else(|| json_string(target, "ip"))
+                .or_else(|| json_string(target, "role"))
+        })
+        .or_else(|| json_string(payload, "host"))
+        .or_else(|| json_string(payload, "destination_ip"))
+        .unwrap_or_else(|| "-".to_string());
+    let detail = json_string(payload, "reason")
+        .or_else(|| json_string(payload, "summary"))
+        .or_else(|| json_string(payload, "rationale"))
+        .or_else(|| {
+            payload
+                .get("attributes")
+                .and_then(|attrs| json_string(attrs, "detail"))
+        })
+        .unwrap_or_else(|| record_type.to_string());
+    let tone = match record_type {
+        "action_decision" if payload.get("permitted").and_then(Value::as_bool) == Some(false) => {
+            Tone::Bad
+        }
+        "action_result" if payload.get("executed").and_then(Value::as_bool) == Some(false) => {
+            Tone::Warn
+        }
+        "security_event" => Tone::Info,
+        _ => Tone::Neutral,
+    };
+
+    Some(LabActivityRow {
+        ts_ms,
+        kind: record_type.replace('_', " "),
+        scenario_id,
+        actor,
+        action,
+        target,
+        detail: truncate(&detail, 80),
+        tone,
+    })
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|value| match value {
+        Value::String(raw) => Some(raw.clone()),
+        Value::Number(raw) => Some(raw.to_string()),
+        Value::Bool(raw) => Some(raw.to_string()),
+        _ => None,
+    })
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1413,6 +1513,7 @@ fn draw_ui(frame: &mut Frame, app: &TraceyTopApp) {
         DashboardPage::Overview => render_overview_page(frame, area, app, theme),
         DashboardPage::Locations => render_locations_page(frame, area, app, theme),
         DashboardPage::Telemetry => render_telemetry_page(frame, area, app, theme),
+        DashboardPage::AiLab => render_ai_lab_page(frame, area, app, theme),
     }
 }
 
@@ -1536,6 +1637,196 @@ fn render_telemetry_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, them
     render_telemetry_execution_panel(frame, bottom[1], app, theme);
 
     render_footer(frame, outer[4], app, theme);
+}
+
+fn render_ai_lab_page(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(10),
+            Constraint::Min(16),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_header(frame, outer[0], app, theme);
+
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(outer[1]);
+    render_ai_lab_policy_panel(frame, top[0], app, theme);
+    render_ai_lab_scope_panel(frame, top[1], app, theme);
+    render_ai_lab_timeline_panel(frame, outer[2], app, theme);
+    render_footer(frame, outer[3], app, theme);
+}
+
+fn render_ai_lab_policy_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let Some(status) = &app.status else {
+        frame.render_widget(
+            Paragraph::new(error_line(theme, "status unavailable"))
+                .block(panel_block(" ai-lab policy ", theme)),
+            area,
+        );
+        return;
+    };
+    let lab = &status.ai_lab;
+    let lines = vec![
+        kv_line(
+            theme,
+            "enabled",
+            if lab.enabled { "true" } else { "false" },
+            Some(if lab.enabled {
+                Tone::Good
+            } else {
+                Tone::Neutral
+            }),
+        ),
+        kv_line(theme, "lab", &lab.lab_id, Some(Tone::Info)),
+        kv_line(
+            theme,
+            "dry-run",
+            if lab.default_dry_run { "true" } else { "false" },
+            Some(if lab.default_dry_run {
+                Tone::Good
+            } else {
+                Tone::Warn
+            }),
+        ),
+        kv_line(
+            theme,
+            "kill switch",
+            if lab.kill_switch_engaged {
+                "engaged"
+            } else {
+                "clear"
+            },
+            Some(if lab.kill_switch_engaged {
+                Tone::Bad
+            } else {
+                Tone::Good
+            }),
+        ),
+        kv_line(theme, "evidence", &lab.evidence_root, None),
+        kv_line(
+            theme,
+            "limits",
+            &format!(
+                "{} concurrent, {} req/s, {} min",
+                lab.maximum_concurrent_actions,
+                lab.maximum_requests_per_second,
+                lab.maximum_scenario_duration_minutes
+            ),
+            None,
+        ),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(" ai-lab policy ", theme))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_ai_lab_scope_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    let Some(status) = &app.status else {
+        frame.render_widget(
+            Paragraph::new(error_line(theme, "status unavailable"))
+                .block(panel_block(" ai-lab scope ", theme)),
+            area,
+        );
+        return;
+    };
+    let lab = &status.ai_lab;
+    let mut lines = Vec::new();
+    lines.push(kv_line(
+        theme,
+        "boundary",
+        &lab.safety_boundary,
+        Some(Tone::Info),
+    ));
+    lines.push(kv_line(
+        theme,
+        "networks",
+        &lab.allowed_networks.join(", "),
+        None,
+    ));
+    lines.push(kv_line(theme, "hosts", &lab.allowed_hosts.join(", "), None));
+    lines.push(kv_line(
+        theme,
+        "actions",
+        &format!("{} reviewed adapters", lab.allowed_actions.len()),
+        None,
+    ));
+    lines.push(Line::from(vec![Span::styled(
+        truncate(&lab.allowed_actions.join(", "), 110),
+        Style::default().fg(theme.text),
+    )]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(" ai-lab scope ", theme))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_ai_lab_timeline_panel(frame: &mut Frame, area: Rect, app: &TraceyTopApp, theme: Theme) {
+    if app.log_view.ai_lab_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No ai-lab records in the attached JSONL log yet.")
+                .block(panel_block(" ai-lab timeline ", theme))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let rows = app
+        .log_view
+        .ai_lab_rows
+        .iter()
+        .take(MAX_ACTIVITY_ROWS)
+        .map(|row| {
+            Row::new(vec![
+                Cell::from(human_age_ms(now_ms().saturating_sub(row.ts_ms))),
+                Cell::from(row.kind.clone()),
+                Cell::from(truncate(&row.scenario_id, 18)),
+                Cell::from(row.actor.clone()),
+                Cell::from(row.action.clone()),
+                Cell::from(row.target.clone()),
+                Cell::from(row.detail.clone()),
+            ])
+            .style(Style::default().fg(tone_color(row.tone, theme)))
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(20),
+            Constraint::Length(12),
+            Constraint::Length(28),
+            Constraint::Length(22),
+            Constraint::Min(24),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "age",
+            "type",
+            "scenario",
+            "actor",
+            "action/event",
+            "target",
+            "detail",
+        ])
+        .style(Style::default().fg(theme.muted)),
+    )
+    .block(panel_block(" ai-lab timeline ", theme));
+    frame.render_widget(table, area);
 }
 
 fn render_telemetry_identity_panel(
@@ -4305,6 +4596,7 @@ mod tests {
             continuum_assessment: None,
             continuum_telemetry: None,
             continuum_loop: None,
+            ai_lab: AiLabStatusSnapshot::default(),
             location: AgentLocationSnapshot::default(),
             peer_locations: Vec::new(),
         }
@@ -4461,7 +4753,7 @@ mod tests {
         })
         .to_string();
 
-        let view = build_log_view(&vec![event_cpu, event_proc, decision]);
+        let view = build_log_view(&[event_cpu, event_proc, decision]);
         assert_eq!(view.last_cpu_pct, Some(42.0));
         assert_eq!(view.process_rows.len(), 1);
         assert_eq!(view.process_rows[0].name, "tracey");
