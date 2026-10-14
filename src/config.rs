@@ -698,6 +698,7 @@ pub struct Config {
     pub continuum_autoscaler: ContinuumAutoscalerConfig,
     pub continuum_assessment: ContinuumAssessmentConfig,
     pub resource_forecast: ResourceForecastConfig,
+    pub ai_lab: crate::ai_lab::AiLabConfig,
     pub loader: LoaderConfig,
     pub status: StatusConfig,
     pub stimuli: StimuliConfig,
@@ -740,6 +741,7 @@ impl Default for Config {
             continuum_autoscaler: ContinuumAutoscalerConfig::default(),
             continuum_assessment: ContinuumAssessmentConfig::default(),
             resource_forecast: ResourceForecastConfig::default(),
+            ai_lab: crate::ai_lab::AiLabConfig::default(),
             loader: LoaderConfig::default(),
             status: StatusConfig::default(),
             stimuli: StimuliConfig::default(),
@@ -1184,6 +1186,27 @@ impl Config {
         if self.resource_forecast.gail.base_url.trim().is_empty() {
             self.resource_forecast.gail.enabled = false;
         }
+
+        self.ai_lab.policy.maximum_concurrent_actions =
+            self.ai_lab.policy.maximum_concurrent_actions.clamp(1, 32);
+        self.ai_lab.policy.maximum_scenario_duration_minutes = self
+            .ai_lab
+            .policy
+            .maximum_scenario_duration_minutes
+            .clamp(1, 240);
+        self.ai_lab.policy.maximum_requests_per_second =
+            self.ai_lab.policy.maximum_requests_per_second.clamp(1, 100);
+        if self.ai_lab.policy.allowed_actions.is_empty() {
+            self.ai_lab.policy.allowed_actions = crate::ai_lab::all_controlled_actions();
+        }
+        self.ai_lab
+            .policy
+            .allowed_networks
+            .retain(|network| network.contains('/'));
+        self.ai_lab
+            .policy
+            .allowed_hosts
+            .retain(|host| !host.trim().is_empty());
 
         if self.status.listen_addr.trim().is_empty() {
             self.status.enabled = false;
@@ -1741,6 +1764,30 @@ impl Config {
             "NM_TRACEY_RESOURCE_FORECAST_GAIL_ROLE",
         ]) {
             self.resource_forecast.gail.role = value;
+        }
+        if let Some(value) = env_bool_any(&["TRACEY_AI_LAB_ENABLED", "NM_TRACEY_AI_LAB_ENABLED"]) {
+            self.ai_lab.enabled = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_AI_LAB_EVIDENCE_ROOT",
+            "NM_TRACEY_AI_LAB_EVIDENCE_ROOT",
+        ]) {
+            self.ai_lab.evidence_root = PathBuf::from(value);
+        }
+        if let Some(value) = env_any(&["TRACEY_AI_LAB_ID", "NM_TRACEY_AI_LAB_ID"]) {
+            self.ai_lab.policy.lab_id = value;
+        }
+        if let Some(value) = env_any(&["TRACEY_AI_LAB_TOKEN", "NM_TRACEY_AI_LAB_TOKEN"]) {
+            self.ai_lab.policy.lab_token = Some(value);
+        }
+        if let Some(value) = env_bool_any(&["TRACEY_AI_LAB_DRY_RUN", "NM_TRACEY_AI_LAB_DRY_RUN"]) {
+            self.ai_lab.policy.default_dry_run = value;
+        }
+        if let Some(value) = env_any(&[
+            "TRACEY_AI_LAB_CONTINUUM_REPORT_URL",
+            "NM_TRACEY_AI_LAB_CONTINUUM_REPORT_URL",
+        ]) {
+            self.ai_lab.continuum_report_url = Some(value);
         }
         if let Some(value) = env_any(&["TRACEY_REFINER_SOURCE", "NM_REFINER_SOURCE"]) {
             self.refiner.source = value;
