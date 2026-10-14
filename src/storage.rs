@@ -32,16 +32,48 @@ pub struct Storage {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StorageRecord {
-    Event { payload: Event },
-    Decision { payload: Decision },
-    Learning { payload: LearningSnapshot },
-    BanUpdate { payload: BanUpdateRecord },
-    AgentPresence { payload: AgentPresence },
-    HostObservation { payload: HostObservation },
-    UnmanagedHost { payload: UnmanagedHost },
-    TuningUpdate { payload: TuningUpdate },
-    UpdateRecord { payload: UpdateRecord },
-    GovernanceUpdate { payload: GovernanceUpdate },
+    Event {
+        payload: Event,
+    },
+    Decision {
+        payload: Decision,
+    },
+    Learning {
+        payload: LearningSnapshot,
+    },
+    BanUpdate {
+        payload: BanUpdateRecord,
+    },
+    AgentPresence {
+        payload: AgentPresence,
+    },
+    HostObservation {
+        payload: HostObservation,
+    },
+    UnmanagedHost {
+        payload: UnmanagedHost,
+    },
+    TuningUpdate {
+        payload: TuningUpdate,
+    },
+    UpdateRecord {
+        payload: UpdateRecord,
+    },
+    GovernanceUpdate {
+        payload: GovernanceUpdate,
+    },
+    SecurityEvent {
+        payload: crate::ai_lab::SecurityEvent,
+    },
+    ActionProposal {
+        payload: crate::ai_lab::ActionProposal,
+    },
+    ActionDecision {
+        payload: crate::ai_lab::ActionDecision,
+    },
+    ActionResult {
+        payload: crate::ai_lab::ActionResult,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,6 +206,34 @@ impl Storage {
         let _ = self
             .tx
             .send(StorageRecord::GovernanceUpdate { payload: update })
+            .await;
+    }
+
+    pub async fn record_security_event(&self, event: crate::ai_lab::SecurityEvent) {
+        let _ = self
+            .tx
+            .send(StorageRecord::SecurityEvent { payload: event })
+            .await;
+    }
+
+    pub async fn record_action_proposal(&self, proposal: crate::ai_lab::ActionProposal) {
+        let _ = self
+            .tx
+            .send(StorageRecord::ActionProposal { payload: proposal })
+            .await;
+    }
+
+    pub async fn record_action_decision(&self, decision: crate::ai_lab::ActionDecision) {
+        let _ = self
+            .tx
+            .send(StorageRecord::ActionDecision { payload: decision })
+            .await;
+    }
+
+    pub async fn record_action_result(&self, result: crate::ai_lab::ActionResult) {
+        let _ = self
+            .tx
+            .send(StorageRecord::ActionResult { payload: result })
             .await;
     }
 }

@@ -1,4 +1,7 @@
+ARG TARGET_PAGE_SIZE=4k
 FROM ubuntu:24.04
+ARG TARGET_PAGE_SIZE
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}"
 
 COPY dist/tracey_*.deb /tmp/tracey/
 
