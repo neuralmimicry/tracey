@@ -56,6 +56,7 @@ pub struct StatusService {
     pub continuum_telemetry: Option<crate::continuum_telemetry::ContinuumTelemetryHandle>,
     pub resource_forecast: Option<crate::resource_forecast::ResourceForecastHandle>,
     pub loader_threats: Option<crate::loader_threat::LoaderThreatStatusHandle>,
+    pub ai_lab: crate::ai_lab::AiLabStatusSnapshot,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +121,8 @@ struct StatusSnapshot {
     continuum_loop: Option<ContinuumLoopSnapshot>,
     #[serde(default)]
     loader_threats: Option<crate::loader_threat::LoaderThreatSnapshot>,
+    #[serde(default)]
+    ai_lab: crate::ai_lab::AiLabStatusSnapshot,
     #[serde(default)]
     probe_watch: Option<crate::probe_watch::ProbeWatchSnapshot>,
     #[serde(default)]
@@ -886,6 +889,7 @@ async fn local_snapshot(service: &StatusService, role: &CoordinatorRole) -> Stat
         resource_forecast,
         continuum_loop,
         loader_threats,
+        ai_lab: service.ai_lab.clone(),
         probe_watch,
         location,
         peer_locations,
@@ -1327,6 +1331,7 @@ fn parse_proxy_snapshot_lossy(body: &str) -> Result<(StatusSnapshot, f64), Strin
                     "loaderSecurity",
                 ],
             ),
+            ai_lab: parse_object_field(map, &["ai_lab", "aiLab"]).unwrap_or_default(),
             probe_watch: parse_object_field(map, &["probe_watch", "probeWatch"]),
             location: parse_object_field(map, &["location", "agent_location"]).unwrap_or_default(),
             peer_locations: parse_array_field(map, &["peer_locations", "peerLocations", "peers"]),
@@ -1481,6 +1486,7 @@ mod tests {
                 continuum_telemetry: None,
                 resource_forecast: None,
                 loader_threats: None,
+                ai_lab: crate::ai_lab::AiLabStatusSnapshot::from_config(&cfg.ai_lab),
             }),
             runtime,
             shutdown,

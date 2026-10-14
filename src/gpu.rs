@@ -4,8 +4,68 @@
 use crate::config::EmbeddedConfig;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::fs;
+
+// GPU management libraries are used only for read-only telemetry.  A device
+// which has stopped responding must not be polled continuously: repeated
+// management-library calls can keep exercising a wedged driver/GSP path while
+// CUDA workloads are trying to recover.  After a backend failure we retain
+// sysfs inventory reporting and pause that backend for a short period.
+const GPU_BACKEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct BackendCircuitBreaker {
+    retry_after: Option<Instant>,
+}
+
+fn backend_is_open(state: &Mutex<BackendCircuitBreaker>) -> bool {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match state.retry_after {
+        Some(retry_after) if Instant::now() < retry_after => false,
+        Some(_) => {
+            state.retry_after = None;
+            true
+        }
+        None => true,
+    }
+}
+
+fn backend_trip(state: &Mutex<BackendCircuitBreaker>, backend: &str, reason: &str) {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.retry_after = Some(Instant::now() + GPU_BACKEND_FAILURE_COOLDOWN);
+    tracing::warn!(
+        backend,
+        cooldown_seconds = GPU_BACKEND_FAILURE_COOLDOWN.as_secs(),
+        reason,
+        "GPU telemetry backend failed; retaining sysfs inventory and backing off"
+    );
+}
+
+fn nvml_circuit_breaker() -> &'static Mutex<BackendCircuitBreaker> {
+    static STATE: OnceLock<Mutex<BackendCircuitBreaker>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(BackendCircuitBreaker::default()))
+}
+
+fn rocm_circuit_breaker() -> &'static Mutex<BackendCircuitBreaker> {
+    static STATE: OnceLock<Mutex<BackendCircuitBreaker>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(BackendCircuitBreaker::default()))
+}
+
+fn nvml_call_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn rocm_call_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Clone, Debug)]
 pub struct GpuBackendConfig {
@@ -86,15 +146,25 @@ pub async fn collect_samples(config: &GpuBackendConfig) -> Vec<GpuSample> {
     }
 
     let max_devices = config.max_devices.max(1);
+    // RSMI initialisation is not a harmless capability check on a host with
+    // no AMD GPU.  Gate it from the PCI/sysfs inventory first.  NVML is gated
+    // the same way, while retaining the permissive fallback if sysfs itself
+    // is unavailable (for example in a restricted container).
+    let vendors = read_sysfs_vendor_presence().await;
+    let nvidia_available = vendors.map(|v| v.nvidia).unwrap_or(true);
+    let amd_available = vendors.map(|v| v.amd).unwrap_or(true);
+    let nvml_enabled = config.nvml_enabled && nvidia_available;
+    let rocm_enabled = config.rocm_enabled && amd_available;
+
     let nvml_task = async {
-        if config.nvml_enabled {
+        if nvml_enabled {
             read_nvml_samples(max_devices).await
         } else {
             Vec::new()
         }
     };
     let rocm_task = async {
-        if config.rocm_enabled {
+        if rocm_enabled {
             read_rocm_samples(max_devices).await
         } else {
             Vec::new()
@@ -159,6 +229,32 @@ struct SysfsGpuDevice {
     name: Option<String>,
     vendor: String,
     card_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SysfsVendorPresence {
+    nvidia: bool,
+    amd: bool,
+}
+
+async fn read_sysfs_vendor_presence() -> Option<SysfsVendorPresence> {
+    let mut dir = fs::read_dir("/sys/class/drm").await.ok()?;
+    let mut presence = SysfsVendorPresence::default();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        match read_trimmed(entry.path().join("device/vendor"))
+            .await
+            .as_deref()
+        {
+            Some("0x10de") => presence.nvidia = true,
+            Some("0x1002") => presence.amd = true,
+            _ => {}
+        }
+    }
+    Some(presence)
 }
 
 impl SysfsGpuDevice {
@@ -449,14 +545,27 @@ fn nvml_samples_sync(max_devices: usize) -> Vec<GpuSample> {
         return Vec::new();
     };
 
+    let breaker = nvml_circuit_breaker();
+    if !backend_is_open(breaker) {
+        return Vec::new();
+    }
+    // NVML calls below are intentionally limited to discovery and telemetry
+    // getters.  Serialising the session prevents concurrent init/query/
+    // shutdown sequences from different collectors.
+    let _call_guard = nvml_call_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     unsafe {
         if (api.init)() != NVML_SUCCESS {
+            backend_trip(breaker, "nvml", "nvmlInit failed");
             return Vec::new();
         }
 
         let mut count: c_uint = 0;
         if (api.count)(&mut count as *mut c_uint) != NVML_SUCCESS {
             let _ = (api.shutdown)();
+            backend_trip(breaker, "nvml", "nvmlDeviceGetCount failed");
             return Vec::new();
         }
 
@@ -576,6 +685,24 @@ fn nvml_samples_sync(max_devices: usize) -> Vec<GpuSample> {
                 }
             });
 
+            // A handle which returns no readable identity or telemetry is a
+            // failed device-management session, not a healthy zero-valued GPU.
+            // Do not keep sending getters to it on every collector interval.
+            if name.is_none()
+                && util_percent.is_none()
+                && temp_c.is_none()
+                && mem_total_bytes.is_none()
+                && mem_used_bytes.is_none()
+                && power_w.is_none()
+                && graphics_clock_mhz.is_none()
+                && memory_clock_mhz.is_none()
+                && fan_speed_percent.is_none()
+                && encoder_util_percent.is_none()
+                && decoder_util_percent.is_none()
+            {
+                continue;
+            }
+
             out.push(GpuSample {
                 id: format!("nvidia:{}", idx),
                 name,
@@ -595,6 +722,9 @@ fn nvml_samples_sync(max_devices: usize) -> Vec<GpuSample> {
         }
 
         let _ = (api.shutdown)();
+        if device_count > 0 && out.is_empty() {
+            backend_trip(breaker, "nvml", "all NVIDIA device handles were unreadable");
+        }
         out
     }
 }
@@ -674,14 +804,24 @@ fn rocm_samples_sync(max_devices: usize) -> Vec<GpuSample> {
         return Vec::new();
     };
 
+    let breaker = rocm_circuit_breaker();
+    if !backend_is_open(breaker) {
+        return Vec::new();
+    }
+    let _call_guard = rocm_call_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     unsafe {
         if (api.init)(0) != RSMI_SUCCESS {
+            backend_trip(breaker, "rocm_smi", "rsmi_init failed");
             return Vec::new();
         }
 
         let mut count: c_uint = 0;
         if (api.count)(&mut count as *mut c_uint) != RSMI_SUCCESS {
             let _ = (api.shutdown)();
+            backend_trip(breaker, "rocm_smi", "rsmi_num_monitor_devices failed");
             return Vec::new();
         }
 
@@ -744,6 +884,15 @@ fn rocm_samples_sync(max_devices: usize) -> Vec<GpuSample> {
                 }
             });
 
+            if name.is_none()
+                && util_percent.is_none()
+                && temp_c.is_none()
+                && mem_total_bytes.is_none()
+                && mem_used_bytes.is_none()
+            {
+                continue;
+            }
+
             out.push(GpuSample {
                 id: format!("amd:{}", idx),
                 name,
@@ -763,6 +912,13 @@ fn rocm_samples_sync(max_devices: usize) -> Vec<GpuSample> {
         }
 
         let _ = (api.shutdown)();
+        if device_count > 0 && out.is_empty() {
+            backend_trip(
+                breaker,
+                "rocm_smi",
+                "all AMD device telemetry was unreadable",
+            );
+        }
         out
     }
 }
