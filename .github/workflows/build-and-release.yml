@@ -498,3 +498,8 @@ jobs:
               --title "Tracey ${BUILD_VERSION}" \
               --notes-file "$notes"
           fi
+
+      - name: Remove downloaded release artifacts from the persistent runner
+        if: always()
+        shell: bash
+        run: rm -rf dist
