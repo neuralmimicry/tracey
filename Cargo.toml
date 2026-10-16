@@ -16,7 +16,7 @@ blake3 = "1.5"
 num_cpus = "1.16"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 tonic = { version = "0.9", features = ["transport"] }
-prost = "0.11"
+prost = "0.14"
 opentelemetry-proto = { version = "0.4", features = ["gen-tonic", "metrics"] }
 axum = "0.7"
 bytes = "1.6"
