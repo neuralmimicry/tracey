@@ -8,3 +8,10 @@ tracey.log*
 loader/tracey-loader.manifest.json
 /target-arm64
 /target-cross
+
+# project_solver ignore additions
+.refiner/
+.research_cache/
+.venv/
+project_solver_output/
+delivery_pipeline_output/
